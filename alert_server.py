@@ -4,6 +4,12 @@ import json
 from datetime import datetime
 from typing import Optional
 
+try:
+    import ssl
+except ImportError:
+    ssl = None
+    logging.warning("SSL module not available. Secure HTTP connections may fail.")
+
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, validator
@@ -169,4 +175,8 @@ async def send_telegram_message(message: str):
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
                 "parse_mode": "HTML",
-                "disable_web_page_previe
+                "disable_web_page_preview": False
+            })
+        logging.info("Telegram message sent.")
+    except Exception as e:
+        logging.exception("Failed to send Telegram message")
