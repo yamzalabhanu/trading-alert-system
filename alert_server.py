@@ -5,8 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 
@@ -21,11 +20,9 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TRADINGVIEW_TOKEN = os.getenv("TRADINGVIEW_TOKEN", "my-secret-token")
 
 # FastAPI App
 app = FastAPI()
-security = HTTPBearer()
 
 # Check for critical environment vars
 for var in ["POLYGON_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "OPENAI_API_KEY"]:
@@ -51,14 +48,9 @@ class TradingViewAlert(BaseModel):
 async def root():
     return {"status": "running"}
 
-# Auth dependency
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != TRADINGVIEW_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
 # Alert endpoint
 @app.post("/alert")
-async def receive_alert(alert: TradingViewAlert, credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def receive_alert(alert: TradingViewAlert):
     logging.info(f"Received alert: {alert}")
 
     indicator_data = await fetch_market_indicators(alert.symbol)
@@ -177,8 +169,4 @@ async def send_telegram_message(message: str):
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
                 "parse_mode": "HTML",
-                "disable_web_page_preview": False
-            })
-        logging.info("Telegram message sent.")
-    except Exception as e:
-        logging.exception("Failed to send Telegram message")
+                "disable_web_page_previe
