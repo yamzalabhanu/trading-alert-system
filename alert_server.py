@@ -73,27 +73,24 @@ async def receive_alert(alert: TradingViewAlert):
 async def fetch_market_indicators(symbol: str) -> str:
     try:
         today = datetime.utcnow().date().isoformat()
-now = datetime.utcnow()
-
-# Don't query minute data for future times
-if now.hour < 9:  # before market open
-    logging.warning("Market not open yet; skipping intraday request.")
-    intraday_data = []
-else:
-    # continue fetching intraday bars
+        now = datetime.utcnow()
 
         async with httpx.AsyncClient() as client:
             prev = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}")
             prev.raise_for_status()
             prev_day = prev.json()["results"][0]
 
-            intra = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&limit=10&apiKey={POLYGON_API_KEY}")
-            if intra.status_code == 403:
-                logging.warning("403: Skipping intraday data (requires premium Polygon access)")
+            if now.hour < 9:
+                logging.warning("Market not open yet; skipping intraday request.")
                 intraday_data = []
             else:
-                intra.raise_for_status()
-                intraday_data = intra.json().get("results", [])
+                intra = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&limit=10&apiKey={POLYGON_API_KEY}")
+                if intra.status_code == 403:
+                    logging.warning("403: Skipping intraday data (requires premium Polygon access)")
+                    intraday_data = []
+                else:
+                    intra.raise_for_status()
+                    intraday_data = intra.json().get("results", [])
 
             return json.dumps({
                 "prev_high": prev_day["h"],
