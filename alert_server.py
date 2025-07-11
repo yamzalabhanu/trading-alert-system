@@ -72,7 +72,16 @@ async def receive_alert(alert: TradingViewAlert):
 # Indicator fetch
 async def fetch_market_indicators(symbol: str) -> str:
     try:
-        today = datetime.utcnow().strftime('%Y-%m-%d')
+        today = datetime.utcnow().date().isoformat()
+now = datetime.utcnow()
+
+# Don't query minute data for future times
+if now.hour < 9:  # before market open
+    logging.warning("Market not open yet; skipping intraday request.")
+    intraday_data = []
+else:
+    # continue fetching intraday bars
+
         async with httpx.AsyncClient() as client:
             prev = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}")
             prev.raise_for_status()
