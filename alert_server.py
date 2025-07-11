@@ -107,7 +107,9 @@ async def analyze_with_llm(symbol: str, direction: str, indicator_data: str) -> 
         if not options:
             return None, "No options data returned."
 
-        filtered = [o for o in options if abs(float(o.get("strikePrice", 0)) - float(indicator_data.get("close", 0))) < 10][:5]
+        parsed_data = json.loads(indicator_data) if indicator_data else {}
+        close_price = float(parsed_data.get("close", 0))
+        filtered = [o for o in options if abs(float(o.get("strikePrice", 0)) - close_price) < 10][:5]
 
         prompt = f"""
 You are a trading assistant.
@@ -119,7 +121,7 @@ Rules:
 - Unusual volume = Trade in trend direction
 
 INDICATORS:
-{indicator_data}
+{json.dumps(parsed_data, indent=2)}
 
 OPTIONS:
 {json.dumps(filtered, indent=2)}
