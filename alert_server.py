@@ -3,6 +3,7 @@ import os
 import json
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 try:
     import ssl
@@ -11,9 +12,10 @@ except ImportError:
     logging.warning("SSL module not available. Secure HTTP connections may fail.")
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
+import pytz
 
 # Load environment variables from .env file
 load_dotenv()
@@ -65,6 +67,7 @@ async def receive_alert(alert: TradingViewAlert):
     if option_decision:
         await send_telegram_alert(option_decision, decision_text, alert.price)
     else:
+        logging.warning(f"No actionable trade returned by LLM for {alert.symbol}")
         await send_telegram_message(f"⚠️ <b>No actionable trade</b> for <b>{alert.symbol}</b>. LLM couldn't recommend a trade.")
 
     return {"status": "ok", "received": alert.dict()}
@@ -72,19 +75,18 @@ async def receive_alert(alert: TradingViewAlert):
 # Indicator fetch
 async def fetch_market_indicators(symbol: str) -> str:
     try:
-        today = datetime.utcnow().date().isoformat()
-        now = datetime.utcnow()
+        eastern = pytz.timezone("America/New_York")
+        now_et = datetime.now(eastern)
+        today = now_et.date().isoformat()
 
-        async with httpx.AsyncClient() as client:
-            prev = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}")
-            prev.raise_for_status()
-            prev_day = prev.json()["results"][0]
-
-            if now.hour < 9:
-                logging.warning("Market not open yet; skipping intraday request.")
-                intraday_data = []
-            else:
-                intra = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&limit=10&apiKey={POLYGON_API_KEY}")
+        if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
+            logging.warning("Market not open yet; skipping intraday request.")
+            intraday_data = []
+        else:
+            async with httpx.AsyncClient() as client:
+                intra = await client.get(
+                    f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&limit=10&apiKey={POLYGON_API_KEY}"
+                )
                 if intra.status_code == 403:
                     logging.warning("403: Skipping intraday data (requires premium Polygon access)")
                     intraday_data = []
@@ -92,13 +94,20 @@ async def fetch_market_indicators(symbol: str) -> str:
                     intra.raise_for_status()
                     intraday_data = intra.json().get("results", [])
 
-            return json.dumps({
-                "prev_high": prev_day["h"],
-                "prev_low": prev_day["l"],
-                "close": prev_day["c"],
-                "volume": prev_day["v"],
-                "intraday_snap": intraday_data[:3]
-            }, indent=2)
+        async with httpx.AsyncClient() as client:
+            prev = await client.get(
+                f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
+            )
+            prev.raise_for_status()
+            prev_day = prev.json()["results"][0]
+
+        return json.dumps({
+            "prev_high": prev_day["h"],
+            "prev_low": prev_day["l"],
+            "close": prev_day["c"],
+            "volume": prev_day["v"],
+            "intraday_snap": intraday_data[:3]
+        }, indent=2)
 
     except Exception as e:
         logging.exception("Failed to fetch market indicators")
@@ -114,13 +123,16 @@ async def analyze_with_llm(symbol: str, direction: str, indicator_data: str) -> 
             options = res.json().get("results", [])
 
         if not options:
+            logging.warning(f"No options returned for {symbol}")
             return None, "No options data returned."
 
         parsed_data = json.loads(indicator_data) if indicator_data else {}
         close_price = float(parsed_data.get("close", 0))
-        filtered = [o for o in options if abs(float(o.get("strikePrice", 0)) - close_price) < 10][:5]
+        threshold = max(10, 0.05 * close_price)
+        filtered = [o for o in options if abs(float(o.get("strikePrice", 0)) - close_price) < threshold][:5]
 
         if not filtered:
+            logging.warning(f"No filtered options found for {symbol}. Close={close_price}, Options={options}")
             return None, "No suitable option contracts matched the filter."
 
         prompt = f"""
@@ -139,6 +151,11 @@ OPTIONS:
 {json.dumps(filtered, indent=2)}
 """
 
+        # Save prompt for debug
+        Path("logs").mkdir(exist_ok=True)
+        prompt_file = Path("logs") / f"{symbol}_prompt.json"
+        prompt_file.write_text(prompt)
+
         async with httpx.AsyncClient() as client:
             resp = await client.post("https://api.openai.com/v1/chat/completions", headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -156,6 +173,9 @@ OPTIONS:
                 return None, f"LLM request failed with status {resp.status_code}"
 
             result = resp.json()
+            response_file = Path("logs") / f"{symbol}_llm_response.json"
+            response_file.write_text(json.dumps(result, indent=2))
+
             explanation = result.get("choices", [{}])[0].get("message", {}).get("content", "LLM failed to return explanation.")
 
             return {
