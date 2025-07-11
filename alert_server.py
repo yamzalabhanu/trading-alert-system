@@ -79,7 +79,12 @@ async def fetch_market_indicators(symbol: str) -> str:
             prev_day = prev.json()["results"][0]
 
             intra = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&limit=10&apiKey={POLYGON_API_KEY}")
-            intraday_data = intra.json().get("results", [])
+            if intra.status_code == 403:
+                logging.warning("403: Skipping intraday data (requires premium Polygon access)")
+                intraday_data = []
+            else:
+                intra.raise_for_status()
+                intraday_data = intra.json().get("results", [])
 
             return json.dumps({
                 "prev_high": prev_day["h"],
@@ -109,6 +114,9 @@ async def analyze_with_llm(symbol: str, direction: str, indicator_data: str) -> 
         close_price = float(parsed_data.get("close", 0))
         filtered = [o for o in options if abs(float(o.get("strikePrice", 0)) - close_price) < 10][:5]
 
+        if not filtered:
+            return None, "No suitable option contracts matched the filter."
+
         prompt = f"""
 You are a trading assistant.
 Rules:
@@ -136,6 +144,11 @@ OPTIONS:
                     {"role": "user", "content": prompt}
                 ]
             })
+
+            if resp.status_code != 200:
+                logging.error(f"OpenAI error {resp.status_code}: {resp.text}")
+                return None, f"LLM request failed with status {resp.status_code}"
+
             result = resp.json()
             explanation = result.get("choices", [{}])[0].get("message", {}).get("content", "LLM failed to return explanation.")
 
