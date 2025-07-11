@@ -1,34 +1,38 @@
-### trading_alert_system/alert_server.py
-
 import logging
 import os
 import json
-import sys
 from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, validator
 from dotenv import load_dotenv
-
-try:
-    import ssl
-except ModuleNotFoundError:
-    ssl = None
-    logging.warning("SSL module not available. HTTPS requests may fail.")
 
 # Load environment variables from .env file
 load_dotenv()
 
-app = FastAPI()
+# Logging
 logging.basicConfig(level=logging.INFO)
 
+# Environment
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TRADINGVIEW_TOKEN = os.getenv("TRADINGVIEW_TOKEN", "my-secret-token")
 
+# FastAPI App
+app = FastAPI()
+security = HTTPBearer()
+
+# Check for critical environment vars
+for var in ["POLYGON_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "OPENAI_API_KEY"]:
+    if not os.getenv(var):
+        logging.warning(f"Missing environment variable: {var}")
+
+# Models
 class TradingViewAlert(BaseModel):
     symbol: str
     price: float
@@ -36,12 +40,25 @@ class TradingViewAlert(BaseModel):
     volume: float
     time: str
 
+    @validator("action")
+    def validate_action(cls, v):
+        if v.upper() not in ["CALL", "PUT"]:
+            raise ValueError("Invalid action type")
+        return v.upper()
+
+# Health
 @app.get("/")
 async def root():
     return {"status": "running"}
 
+# Auth dependency
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != TRADINGVIEW_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+# Alert endpoint
 @app.post("/alert")
-async def receive_alert(alert: TradingViewAlert):
+async def receive_alert(alert: TradingViewAlert, credentials: HTTPAuthorizationCredentials = Depends(security)):
     logging.info(f"Received alert: {alert}")
 
     indicator_data = await fetch_market_indicators(alert.symbol)
@@ -50,113 +67,91 @@ async def receive_alert(alert: TradingViewAlert):
     if option_decision:
         await send_telegram_alert(option_decision, decision_text, alert.price)
     else:
-        await send_telegram_message(f"⚠️ <b>No actionable trade</b> recommended for <b>{alert.symbol}</b> based on current analysis.")
+        await send_telegram_message(f"⚠️ <b>No actionable trade</b> for <b>{alert.symbol}</b>. LLM couldn't recommend a trade.")
 
     return {"status": "ok", "received": alert.dict()}
 
-
+# Indicator fetch
 async def fetch_market_indicators(symbol: str) -> str:
-    if not POLYGON_API_KEY:
-        logging.error("Missing POLYGON_API_KEY.")
-        return ""
-
     try:
         today = datetime.utcnow().strftime('%Y-%m-%d')
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
-            )
-            response.raise_for_status()
-            prev_day = response.json()["results"][0]
+            prev = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}")
+            prev.raise_for_status()
+            prev_day = prev.json()["results"][0]
 
-            intraday_response = await client.get(
-                f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&limit=10&apiKey={POLYGON_API_KEY}"
-            )
-            intraday_data = intraday_response.json().get("results", [])
+            intra = await client.get(f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{today}/{today}?adjusted=true&limit=10&apiKey={POLYGON_API_KEY}")
+            intraday_data = intra.json().get("results", [])
 
-            indicators = {
+            return json.dumps({
                 "prev_high": prev_day["h"],
                 "prev_low": prev_day["l"],
                 "close": prev_day["c"],
                 "volume": prev_day["v"],
                 "intraday_snap": intraday_data[:3]
-            }
-            return json.dumps(indicators, indent=2)
+            }, indent=2)
 
     except Exception as e:
-        logging.exception("Error fetching market indicators")
+        logging.exception("Failed to fetch market indicators")
         return ""
 
-
+# LLM analysis
 async def analyze_with_llm(symbol: str, direction: str, indicator_data: str) -> (Optional[dict], str):
-    if not POLYGON_API_KEY:
-        logging.error("Missing POLYGON_API_KEY.")
-        return None, ""
-
-    polygon_url = f"https://api.polygon.io/v3/reference/options/contracts?underlying_ticker={symbol}&limit=10&apiKey={POLYGON_API_KEY}"
-
     try:
+        polygon_url = f"https://api.polygon.io/v3/reference/options/contracts?underlying_ticker={symbol}&limit=10&apiKey={POLYGON_API_KEY}"
         async with httpx.AsyncClient() as client:
-            polygon_resp = await client.get(polygon_url)
-            polygon_resp.raise_for_status()
-            polygon_data = polygon_resp.json()
-    except Exception as e:
-        logging.exception("Failed to fetch options data from Polygon")
-        return None, ""
+            res = await client.get(polygon_url)
+            res.raise_for_status()
+            options = res.json().get("results", [])
 
-    if not polygon_data.get("results"):
-        logging.warning("No options data from Polygon.")
-        return None, ""
+        if not options:
+            return None, "No options data returned."
 
-    prompt = f"""
-You are a financial trading assistant. Based on the following market indicators and logic, make a decision:
+        filtered = [o for o in options if abs(float(o.get("strikePrice", 0)) - float(indicator_data.get("close", 0))) < 10][:5]
 
-- If stock breaks previous day high and premarket high and confirms second breakout after retest, suggest call.
-- If stock breaks below previous day low and premarket low with second breakdown, suggest put.
-- If breakout above 9 EMA & 20 EMA (second attempt), suggest call.
-- If breakdown below 9 EMA & 20 EMA (second attempt), suggest put.
-- If unusual intraday volume spike, suggest call/put based on overall trend.
+        prompt = f"""
+You are a trading assistant.
+Rules:
+- Breakout + Retest = Call
+- Breakdown + Retest = Put
+- 9/20 EMA Breakout = Call
+- 9/20 EMA Breakdown = Put
+- Unusual volume = Trade in trend direction
 
 INDICATORS:
 {indicator_data}
 
 OPTIONS:
-{json.dumps(polygon_data['results'], indent=2)[:1500]}
+{json.dumps(filtered, indent=2)}
 """
 
-    try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-4",
-                    "messages": [
-                        {"role": "system", "content": "You are a financial trading assistant."},
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-            )
+            resp = await client.post("https://api.openai.com/v1/chat/completions", headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }, json={
+                "model": "gpt-4",
+                "messages": [
+                    {"role": "system", "content": "You are a financial trading assistant."},
+                    {"role": "user", "content": prompt}
+                ]
+            })
             result = resp.json()
-            decision_text = result.get("choices", [{}])[0].get("message", {}).get("content", "LLM did not return any reasoning.")
-            logging.info(f"LLM Decision: {decision_text}")
+            explanation = result.get("choices", [{}])[0].get("message", {}).get("content", "LLM failed to return explanation.")
 
             return {
                 "symbol": symbol,
                 "type": direction.lower(),
-                "strike": 100.0,
-                "expiry": "2024-12-20",
+                "strike": float(filtered[0].get("strikePrice", 100)),
+                "expiry": filtered[0].get("expiration_date", "2024-12-20"),
                 "quantity": 1
-            }, decision_text
+            }, explanation
 
     except Exception as e:
         logging.exception("LLM analysis failed")
-        return None, ""
+        return None, "LLM request failed."
 
-
+# Telegram messaging
 async def send_telegram_alert(option: dict, explanation: str, current_price: float):
     chart_url = f"https://www.tradingview.com/chart/?symbol={option['symbol']}"
     message = (
@@ -167,20 +162,14 @@ async def send_telegram_alert(option: dict, explanation: str, current_price: flo
         f"<b>Expiry:</b> {option['expiry']}\n"
         f"<b>Qty:</b> {option['quantity']}\n"
         f"<b>Current Price:</b> ${current_price}\n"
-        f"<b>Chart:</b> <a href='{chart_url}'>View Chart</a>\n\n"
+        f"<b>Chart:</b> <a href='{chart_url}'>View</a>\n\n"
         f"<b>🔍 Reasoning:</b>\n{explanation}"
     )
     await send_telegram_message(message)
 
-
 async def send_telegram_message(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Missing Telegram bot token or chat ID.")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
     try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         async with httpx.AsyncClient() as client:
             await client.post(url, json={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -191,4 +180,3 @@ async def send_telegram_message(message: str):
         logging.info("Telegram message sent.")
     except Exception as e:
         logging.exception("Failed to send Telegram message")
-
