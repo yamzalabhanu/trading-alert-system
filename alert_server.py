@@ -155,7 +155,7 @@ OPTIONS:
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json"
             }, json={
-                "model": "gpt-3.5-turbo",
+                "model": "gpt-4-turbo",
                 "messages": [
                     {"role": "system", "content": "You are a financial trading assistant."},
                     {"role": "user", "content": prompt}
