@@ -11,7 +11,7 @@ try:
     import ssl
 except ImportError:
     ssl = None
-    logging.warning("SSL module not available. Secure HTTP connections may fail.")
+    logging.warning("SSL module not available. Secure HTTP connections may  fail.")
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
