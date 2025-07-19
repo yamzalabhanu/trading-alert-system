@@ -46,7 +46,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEEPAI_API_KEY = os.getenv("c8d42725-5ed7-44f2-8c82-29c4355a0430")
+DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
 
 # Cooldown map
 cooldowns = {}
@@ -72,6 +72,10 @@ def is_market_open():
 
 # Helper: Fetch news sentiment
 async def get_combined_sentiment(symbol: str):
+    if not DEEPAI_API_KEY:
+        logging.warning("DEEPAI_API_KEY is not set. Skipping sentiment analysis.")
+        return 0
+
     url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit=5&apiKey={POLYGON_API_KEY}"
     async with httpx.AsyncClient() as client:
         res = await client.get(url)
@@ -84,7 +88,7 @@ async def get_combined_sentiment(symbol: str):
                 response = await client.post(
                     "https://api.deepai.org/api/sentiment-analysis",
                     data={"text": title},
-                    headers={"api-key": DEEPAI_API_KEY},
+                    headers={"api-key": str(DEEPAI_API_KEY)},
                 )
                 result = response.json().get("output", ["neutral"])[0]
                 score = {"positive": 1, "neutral": 0, "negative": -1}.get(result, 0)
@@ -133,7 +137,18 @@ async def call_openai(system_msg, user_msg):
 
 # Analyze with LLM
 async def analyze_with_llm(symbol, direction, indicators, sentiment):
-    system_prompt = "You are an options trading assistant..."
+    system_prompt = (
+        "You are an options trading assistant. Given stock market indicators and sentiment, decide if a trade should be taken. "
+        "Respond ONLY with a JSON object in this format: "
+        "{\n"
+        " \"symbol\": \"AAPL\",\n"
+        " \"type\": \"call\",\n"
+        " \"strike\": 210,\n"
+        " \"expiry\": \"2025-07-26\",\n"
+        " \"quantity\": 1,\n"
+        " \"confidence\": 85\n"
+        "}"
+    )
     user_data = {
         "symbol": symbol,
         "direction": direction,
@@ -142,6 +157,10 @@ async def analyze_with_llm(symbol, direction, indicators, sentiment):
     }
     response = await call_openai(system_prompt, json.dumps(user_data))
     logging.info(f"LLM response: {response}")
+
+    if not response:
+        logging.warning("No response from OpenAI")
+        return None
 
     try:
         parsed = json.loads(response)
@@ -152,6 +171,8 @@ async def analyze_with_llm(symbol, direction, indicators, sentiment):
             return parsed
     except Exception as e:
         logging.warning(f"LLM parsing error: {e}")
+        with open(LOG_DIR / f"{symbol}_llm_raw.txt", "a") as raw_log:
+            raw_log.write(f"{datetime.utcnow()}\n{response}\n\n")
     return None
 
 # Telegram
