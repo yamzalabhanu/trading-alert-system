@@ -32,14 +32,14 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
 DISCORD_SENTIMENT_KEY = os.getenv("DISCORD_SENTIMENT_KEY")
 
 # FastAPI App
 app = FastAPI()
 
 # Check for critical environment vars
-for var in ["POLYGON_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "OPENAI_API_KEY", "TWITTER_BEARER_TOKEN"]:
+for var in ["POLYGON_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "OPENAI_API_KEY"]:
     if not os.getenv(var):
         logging.warning(f"Missing environment variable: {var}")
 
@@ -121,24 +121,6 @@ async def retry_request(session, method, url, **kwargs):
             await asyncio.sleep(2 ** attempt)
     raise Exception("Failed after retries")
 
-async def get_twitter_sentiment(symbol: str) -> str:
-    try:
-        url = f"https://api.twitter.com/2/tweets/search/recent?query=${symbol}&max_results=10"
-        headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-        async with httpx.AsyncClient() as client:
-            res = await retry_request(client, "GET", url, headers=headers)
-            tweets = res.json().get("data", [])
-            positive = sum(1 for t in tweets if "buy" in t["text"].lower() or "bullish" in t["text"].lower())
-            negative = sum(1 for t in tweets if "sell" in t["text"].lower() or "bearish" in t["text"].lower())
-            if positive > negative:
-                return "bullish"
-            elif negative > positive:
-                return "bearish"
-            else:
-                return "neutral"
-    except:
-        return "neutral"
-
 async def get_discord_sentiment(symbol: str) -> str:
     try:
         url = f"https://api.sentimenthub.ai/discord/{symbol}?apikey={DISCORD_SENTIMENT_KEY}"
@@ -149,16 +131,31 @@ async def get_discord_sentiment(symbol: str) -> str:
     except:
         return "neutral"
 
-async def get_combined_sentiment(symbol: str) -> str:
-    twitter_sentiment = await get_twitter_sentiment(symbol)
-    discord_sentiment = await get_discord_sentiment(symbol)
-    combined = (twitter_sentiment, discord_sentiment)
-    if combined.count("bullish") >= 2:
-        return "bullish"
-    elif combined.count("bearish") >= 2:
-        return "bearish"
-    else:
+async def get_polygon_news_sentiment(symbol: str) -> str:
+    try:
+        url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit=5&apiKey={POLYGON_API_KEY}"
+        async with httpx.AsyncClient() as client:
+            res = await retry_request(client, "GET", url)
+            if res.status_code == 200:
+                data = res.json()
+                headlines = [item.get("title", "") for item in data.get("results", [])]
+                sentiment_scores = []
+                for title in headlines:
+                    senti = await client.post("https://api.deepai.org/api/sentiment-analysis",
+                                              headers={"api-key": DEEPAI_API_KEY},
+                                              data={"text": title})
+                    result = senti.json()
+                    sentiment_scores.extend(result.get("output", []))
+                return ", ".join(sentiment_scores)
         return "neutral"
+    except:
+        logging.warning("Polygon news sentiment fetch failed")
+        return "neutral"
+
+async def get_combined_sentiment(symbol: str) -> str:
+    discord_sentiment = await get_discord_sentiment(symbol)
+    polygon_sentiment = await get_polygon_news_sentiment(symbol)
+    return f"Discord: {discord_sentiment}\nNews: {polygon_sentiment}"
 
 async def fetch_market_indicators(symbol: str) -> str:
     try:
