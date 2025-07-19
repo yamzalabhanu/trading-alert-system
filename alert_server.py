@@ -112,7 +112,8 @@ async def receive_alert(alert: TradingViewAlert):
 # === Sentiment, Indicators, Market Fetchers ===
 async def get_polygon_sentiment(symbol: str) -> str:
     try:
-        url = f"https://api.polygon.io/v1/meta/symbols/{symbol}/news?limit=5&apiKey={POLYGON_API_KEY}"
+        url = f"https://api.polygon.io/v2/reference/news?ticker=AAPL&limit=5&apiKey={POLYGON_API_KEY}"
+    
         async with httpx.AsyncClient() as client:
             res = await client.get(url)
             res.raise_for_status()
