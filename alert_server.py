@@ -99,7 +99,7 @@ async def receive_alert(alert: TradingViewAlert):
     last_alert_times[cooldown_key] = now
 
     indicator_data = await fetch_market_indicators(alert.symbol)
-    sentiment = await get_polygon_news_sentiment(alert.symbol)
+    sentiment = await get_combined_sentiment(alert.symbol)
 
     option_decision, decision_text = await analyze_with_llm(alert.symbol, alert.action, indicator_data, sentiment)
 
@@ -137,9 +137,13 @@ async def get_polygon_news_sentiment(symbol: str) -> str:
                     sentiment_scores.extend(result.get("output", []))
                 return ", ".join(sentiment_scores)
         return "neutral"
-    except Exception as e:
+    except:
         logging.warning("Polygon news sentiment fetch failed")
         return "neutral"
+
+async def get_combined_sentiment(symbol: str) -> str:
+    polygon_sentiment = await get_polygon_news_sentiment(symbol)
+    return f"News: {polygon_sentiment}"
 
 async def fetch_market_indicators(symbol: str) -> str:
     try:
@@ -183,7 +187,8 @@ Sentiment: {sentiment}
 Indicators:
 {indicator_data}
 """
-        async with httpx.AsyncClient() as client:
+        timeout = httpx.Timeout(15.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post("https://api.openai.com/v1/chat/completions", headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json"
@@ -242,12 +247,15 @@ async def send_telegram_message(message: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         async with httpx.AsyncClient() as client:
-            await client.post(url, json={
+            resp = await client.post(url, json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": False
             })
-        logging.info("Telegram message sent.")
+            if resp.status_code != 200:
+                logging.warning(f"Telegram error: {resp.status_code} - {resp.text}")
+            else:
+                logging.info("Telegram message sent.")
     except Exception as e:
         logging.exception("Failed to send Telegram message")
