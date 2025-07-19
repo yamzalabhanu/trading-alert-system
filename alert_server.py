@@ -6,12 +6,14 @@ from typing import Optional
 from pathlib import Path
 from collections import defaultdict
 import time as time_module
+import html
+import asyncio
 
 try:
     import ssl
 except ImportError:
     ssl = None
-    logging.warning("SSL module not available. Secure HTTP connections may  fail.")
+    logging.warning("SSL module not available. Secure HTTP connections may fail.")
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -30,6 +32,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 DISCORD_SENTIMENT_KEY = os.getenv("DISCORD_SENTIMENT_KEY")
 
 # FastAPI App
@@ -105,39 +108,51 @@ async def receive_alert(alert: TradingViewAlert):
         await send_telegram_alert(option_decision, decision_text, alert.price)
         return {"status": "sent", "symbol": alert.symbol, "confidence": option_decision.get("confidence")}
     else:
-        await send_telegram_message(f"⚠️ <b>No high-confidence trade</b> for <b>{alert.symbol}</b>.<br>Reason: {decision_text}")
+        await send_telegram_message(f"⚠️ <b>No high-confidence trade</b> for <b>{alert.symbol}</b>.<br>Reason: {html.escape(decision_text)}")
         return {"status": "skipped", "symbol": alert.symbol, "reason": decision_text}
 
 # === Sentiment, Indicators, Market Fetchers ===
-async def get_polygon_sentiment(symbol: str) -> str:
+async def retry_request(session, method, url, **kwargs):
+    for attempt in range(3):
+        try:
+            return await session.request(method, url, **kwargs)
+        except httpx.RequestError as e:
+            logging.warning(f"[{attempt+1}/3] Retry failed: {e}")
+            await asyncio.sleep(2 ** attempt)
+    raise Exception("Failed after retries")
+
+async def get_twitter_sentiment(symbol: str) -> str:
     try:
-        url = f"https://api.polygon.io/v2/reference/news?ticker=AAPL&limit=5&apiKey={POLYGON_API_KEY}"
-    
+        url = f"https://api.twitter.com/2/tweets/search/recent?query=${symbol}&max_results=10"
+        headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
         async with httpx.AsyncClient() as client:
-            res = await client.get(url)
-            res.raise_for_status()
-            articles = res.json()
-            sentiment_score = sum(1 if "bullish" in a.get("description", "").lower() else -1 for a in articles)
-            return "bullish" if sentiment_score > 0 else "bearish" if sentiment_score < 0 else "neutral"
+            res = await retry_request(client, "GET", url, headers=headers)
+            tweets = res.json().get("data", [])
+            positive = sum(1 for t in tweets if "buy" in t["text"].lower() or "bullish" in t["text"].lower())
+            negative = sum(1 for t in tweets if "sell" in t["text"].lower() or "bearish" in t["text"].lower())
+            if positive > negative:
+                return "bullish"
+            elif negative > positive:
+                return "bearish"
+            else:
+                return "neutral"
     except:
         return "neutral"
-
 
 async def get_discord_sentiment(symbol: str) -> str:
     try:
         url = f"https://api.sentimenthub.ai/discord/{symbol}?apikey={DISCORD_SENTIMENT_KEY}"
         async with httpx.AsyncClient() as client:
-            res = await client.get(url)
-            res.raise_for_status()
+            res = await retry_request(client, "GET", url)
             data = res.json()
             return data.get("sentiment", "neutral")
     except:
         return "neutral"
 
 async def get_combined_sentiment(symbol: str) -> str:
-    polygon_sentiment = await get_polygon_sentiment(symbol)
+    twitter_sentiment = await get_twitter_sentiment(symbol)
     discord_sentiment = await get_discord_sentiment(symbol)
-    combined = (polygon_sentiment, twitter_sentiment, discord_sentiment)
+    combined = (twitter_sentiment, discord_sentiment)
     if combined.count("bullish") >= 2:
         return "bullish"
     elif combined.count("bearish") >= 2:
@@ -227,7 +242,7 @@ async def send_telegram_alert(option: dict, explanation: str, current_price: flo
         f"<b>Confidence:</b> {option.get('confidence', 'N/A')}\n"
         f"<b>Sentiment:</b> {option.get('sentiment', 'N/A')}\n"
         f"<b>Chart:</b> <a href='{chart_url}'>View</a>\n\n"
-        f"<b>🔍 Reasoning:</b>\n{explanation}"
+        f"<b>🔍 Reasoning:</b>\n{html.escape(explanation)}"
     )
     log_entry = {
         "symbol": option['symbol'],
