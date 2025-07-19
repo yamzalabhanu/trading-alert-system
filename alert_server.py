@@ -32,8 +32,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
-DISCORD_SENTIMENT_KEY = os.getenv("DISCORD_SENTIMENT_KEY")
+DEEPAI_API_KEY = os.getenv("c8d42725-5ed7-44f2-8c82-29c4355a0430")
 
 # FastAPI App
 app = FastAPI()
@@ -100,7 +99,7 @@ async def receive_alert(alert: TradingViewAlert):
     last_alert_times[cooldown_key] = now
 
     indicator_data = await fetch_market_indicators(alert.symbol)
-    sentiment = await get_combined_sentiment(alert.symbol)
+    sentiment = await get_polygon_news_sentiment(alert.symbol)
 
     option_decision, decision_text = await analyze_with_llm(alert.symbol, alert.action, indicator_data, sentiment)
 
@@ -121,16 +120,6 @@ async def retry_request(session, method, url, **kwargs):
             await asyncio.sleep(2 ** attempt)
     raise Exception("Failed after retries")
 
-async def get_discord_sentiment(symbol: str) -> str:
-    try:
-        url = f"https://api.sentimenthub.ai/discord/{symbol}?apikey={DISCORD_SENTIMENT_KEY}"
-        async with httpx.AsyncClient() as client:
-            res = await retry_request(client, "GET", url)
-            data = res.json()
-            return data.get("sentiment", "neutral")
-    except:
-        return "neutral"
-
 async def get_polygon_news_sentiment(symbol: str) -> str:
     try:
         url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit=5&apiKey={POLYGON_API_KEY}"
@@ -148,14 +137,9 @@ async def get_polygon_news_sentiment(symbol: str) -> str:
                     sentiment_scores.extend(result.get("output", []))
                 return ", ".join(sentiment_scores)
         return "neutral"
-    except:
+    except Exception as e:
         logging.warning("Polygon news sentiment fetch failed")
         return "neutral"
-
-async def get_combined_sentiment(symbol: str) -> str:
-    discord_sentiment = await get_discord_sentiment(symbol)
-    polygon_sentiment = await get_polygon_news_sentiment(symbol)
-    return f"Discord: {discord_sentiment}\nNews: {polygon_sentiment}"
 
 async def fetch_market_indicators(symbol: str) -> str:
     try:
