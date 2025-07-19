@@ -30,7 +30,6 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 DISCORD_SENTIMENT_KEY = os.getenv("DISCORD_SENTIMENT_KEY")
 
 # FastAPI App
@@ -123,23 +122,6 @@ async def get_polygon_sentiment(symbol: str) -> str:
     except:
         return "neutral"
 
-async def get_twitter_sentiment(symbol: str) -> str:
-    try:
-        url = f"https://api.twitter.com/2/tweets/search/recent?query=${symbol}&max_results=10"
-        headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-        async with httpx.AsyncClient() as client:
-            res = await client.get(url, headers=headers)
-            tweets = res.json().get("data", [])
-            positive = sum(1 for t in tweets if "buy" in t["text"].lower() or "bullish" in t["text"].lower())
-            negative = sum(1 for t in tweets if "sell" in t["text"].lower() or "bearish" in t["text"].lower())
-            if positive > negative:
-                return "bullish"
-            elif negative > positive:
-                return "bearish"
-            else:
-                return "neutral"
-    except:
-        return "neutral"
 
 async def get_discord_sentiment(symbol: str) -> str:
     try:
@@ -154,7 +136,6 @@ async def get_discord_sentiment(symbol: str) -> str:
 
 async def get_combined_sentiment(symbol: str) -> str:
     polygon_sentiment = await get_polygon_sentiment(symbol)
-    twitter_sentiment = await get_twitter_sentiment(symbol)
     discord_sentiment = await get_discord_sentiment(symbol)
     combined = (polygon_sentiment, twitter_sentiment, discord_sentiment)
     if combined.count("bullish") >= 2:
