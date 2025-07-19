@@ -46,7 +46,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
+DEEPAI_API_KEY = os.getenv("c8d42725-5ed7-44f2-8c82-29c4355a0430")
 
 # Cooldown map
 cooldowns = {}
