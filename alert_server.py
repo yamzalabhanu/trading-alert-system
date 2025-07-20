@@ -128,7 +128,13 @@ async def fetch_market_indicators(symbol):
         "best_option": best_option,
         "ema_pattern": {},
         "rsi_signal": {},
-        "macd_signal": {}
+        "macd_signal": {},
+        "pre_market_high": snapshot.get("todays_change", {}).get("high", None),
+        "pre_market_low": snapshot.get("todays_change", {}).get("low", None),
+        "prev_day_high": prev_json.get("h"),
+        "prev_day_low": prev_json.get("l"),
+        "unusual_volume": snapshot.get("day", {}).get("volume", 0) > 1.5 * snapshot.get("prev_day", {}).get("volume", 0),
+        "unusual_option_flow": bool(sweeps)
     }
 
 async def call_openai(system_msg, user_msg):
@@ -152,9 +158,9 @@ async def call_openai(system_msg, user_msg):
 
 async def analyze_with_llm(symbol, direction, indicators, sentiment):
     system_prompt = (
-        "You are an options trading assistant. Given stock market indicators and sentiment, decide if a trade should be taken. "
+        "You are an options trading assistant. Given stock market indicators, sentiment, pre-market data, previous day levels, unusual volume and option flow, decide if a trade should be taken. "
         "Respond ONLY with a JSON object in this format: "
-        "{\"symbol\": \"AAPL\", \"type\": \"call\", \"strike\": 210, \"expiry\": \"2025-07-26\", \"quantity\": 1, \"confidence\": 85}"
+        '{"symbol": "AAPL", "type": "call", "strike": 210, "expiry": "2025-07-26", "quantity": 1, "confidence": 85}'
     )
     user_data = {
         "symbol": symbol,
@@ -198,10 +204,12 @@ async def send_telegram_alert(decision, indicators):
         sweep_info = "N/A"
     pattern = indicators.get("ema_pattern", {}).get("pattern") or indicators.get("rsi_signal", {}).get("pattern") or indicators.get("macd_signal", {}).get("pattern")
 
-    text = f"<b>{decision['symbol']} {decision['type'].upper()}</b>\n" \
-           f"Strike: {decision['strike']} | Expiry: {decision['expiry']}\n" \
-           f"Quantity: {decision['quantity']} | Confidence: {decision['confidence']}%\n" \
-           f"IV: {iv} | OI: {oi} | Sweep: {sweep_info}\n"
+    text = (
+        f"<b>{decision['symbol']} {decision['type'].upper()}</b>\n"
+        f"Strike: {decision['strike']} | Expiry: {decision['expiry']}\n"
+        f"Quantity: {decision['quantity']} | Confidence: {decision['confidence']}%\n"
+        f"IV: {iv} | OI: {oi} | Sweep: {sweep_info}\n"
+    )
     if pattern:
         text += f"Pattern: {pattern}\n"
 
@@ -224,7 +232,7 @@ async def alert(alert: TradingViewAlert):
         cooldowns[symbol] = now
         return {"status": "alert_sent", "decision": decision}
     else:
-        logging.warning(f"⚠️ Trade not taaken for {symbol}")
+        logging.warning(f"⚠️ Trade not taken for {symbol}")
         return {"status": "rejected"}
 
 @app.get("/")
