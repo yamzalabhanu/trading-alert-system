@@ -93,8 +93,8 @@ async def get_combined_sentiment(symbol: str):
                 scores.append(score)
                 sentiment_logs[symbol].append({"headline": title, "score": score})
         except Exception as e:
-            logging.warning(f"Sentiment fetch error: {e}")
-            sentiment_logs[symbol].append({"headline": title, "score": 0})
+    logging.warning(f"Sentiment fetch error for '{title}': {type(e).__name__}: {e}")
+    sentiment_logs[symbol].append({"headline": title, "score": 0})
     return sum(scores) / len(scores) if scores else 0
 
 async def fetch_market_indicators(symbol):
