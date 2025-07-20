@@ -16,7 +16,7 @@ try:
     import ssl
 except ImportError:
     ssl = None
-    logging.warning("SSL module is not available. Secure connections may fail.")
+    logging.warning("SSL module is not available.. Secure connections may fail.")
 
 try:
     from zoneinfo import ZoneInfo
