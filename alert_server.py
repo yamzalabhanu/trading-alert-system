@@ -118,7 +118,7 @@ async def get_combined_sentiment(symbol: str):
 
     return sum(scores) / len(scores) if scores else 0
 
-# Helper: Fetch market indicators
+# Helper: Fetch market indicators, options flow, and EMA/sweep/IV/OI data
 async def fetch_market_indicators(symbol):
     async with httpx.AsyncClient() as client:
         prev_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
@@ -131,9 +131,29 @@ async def fetch_market_indicators(symbol):
             snap_data = await client.get(snap_url)
             snapshot = snap_data.json().get("ticker", {})
 
+        # Sweep detection
+        sweep_url = f"https://api.polygon.io/v3/universal/snapshot/options?ticker={symbol}&apiKey={POLYGON_API_KEY}"
+        sweep_data = await client.get(sweep_url)
+        sweeps = sweep_data.json().get("results", {})
+
+        # Options IV/OI data
+        options_url = f"https://api.polygon.io/v3/reference/options/contracts?underlying_ticker={symbol}&limit=50&apiKey={POLYGON_API_KEY}"
+        options_data = await client.get(options_url)
+        options_json = options_data.json().get("results", [])
+
+        # Calculate EMA crossover or breakout from previous and snapshot
+        prev_close = prev_json.get("c")
+        last_price = snapshot.get("lastTrade", {}).get("p") if snapshot else None
+        ema_breakout = last_price and prev_close and last_price > prev_close * 1.01
+        ema_breakdown = last_price and prev_close and last_price < prev_close * 0.99
+
     return {
         "previous": prev_json,
-        "snapshot": snapshot
+        "snapshot": snapshot,
+        "sweeps": sweeps,
+        "options_chain": options_json,
+        "ema_breakout": ema_breakout,
+        "ema_breakdown": ema_breakdown
     }
 
 # OpenAI call
@@ -159,16 +179,16 @@ async def call_openai(system_msg, user_msg):
 # Analyze with LLM
 async def analyze_with_llm(symbol, direction, indicators, sentiment):
     system_prompt = (
-        "You are an options trading assistant. Given stock market indicators and sentiment, decide if a trade should be taken. "
-        "Respond ONLY with a JSON object in this format: "
-        "{\n"
-        " \"symbol\": \"AAPL\",\n"
-        " \"type\": \"call\",\n"
-        " \"strike\": 210,\n"
-        " \"expiry\": \"2025-07-26\",\n"
-        " \"quantity\": 1,\n"
-        " \"confidence\": 85\n"
-        "}"
+        "You are an advanced options trading assistant. Based on the rules below, use market indicators, options data, sentiment, and pattern logic to decide if a trade should be taken.\n"
+        "Rules:\n"
+        "- Breakout + Retest = Call\n"
+        "- Breakdown + Retest = Put\n"
+        "- 9/20 EMA Breakout = Call\n"
+        "- 9/20 EMA Breakdown = Put\n"
+        "- Unusual volume = Trade in trend direction\n"
+        "- Consider sweep activity\n"
+        "- Choose strike and expiry based on IV and OI.\n"
+        "Respond ONLY with a JSON object in this format: { \"symbol\": \"AAPL\", \"type\": \"call\", \"strike\": 210, \"expiry\": \"2025-07-26\", \"quantity\": 1, \"confidence\": 85 }"
     )
     user_data = {
         "symbol": symbol,
