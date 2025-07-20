@@ -82,22 +82,26 @@ async def get_combined_sentiment(symbol: str):
         headlines = [item["title"] for item in res.json().get("results", [])]
 
     scores = []
-for title in headlines:
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.deepai.org/api/sentiment-analysis",
-                data={"text": title},
-                headers={"api-key": str(DEEPAI_API_KEY)},
-            )
-            json_response = response.json()
-            logging.info(f"DeepAI response: {json_response}")  # 🔍 Log full response
+    for title in headlines:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.deepai.org/api/sentiment-analysis",
+                    data={"text": title},
+                    headers={"api-key": str(DEEPAI_API_KEY)},
+                )
+                json_response = response.json()
+                logging.info(f"DeepAI response: {json_response}")  # 🔍 Log full response
 
-            result = json_response.get("output", ["neutral"])[0]
-            score = {"positive": 1, "neutral": 0, "negative": -1}.get(result, 0)
-            scores.append(score)
-    except Exception as e:
-        logging.warning(f"Sentiment fetch error: {e}")
+                output = json_response.get("output")
+                if not output or not isinstance(output, list):
+                    raise ValueError("Invalid sentiment response structure")
+
+                result = output[0]
+                score = {"positive": 1, "neutral": 0, "negative": -1}.get(result, 0)
+                scores.append(score)
+        except Exception as e:
+            logging.warning(f"Sentiment fetch error: {e}")
     return sum(scores) / len(scores) if scores else 0
 
 # Helper: Fetch market indicators
