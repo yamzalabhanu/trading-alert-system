@@ -224,7 +224,7 @@ async def alert(alert: TradingViewAlert):
         cooldowns[symbol] = now
         return {"status": "alert_sent", "decision": decision}
     else:
-        logging.warning(f"⚠️ Trade not taken for {symbol}")
+        logging.warning(f"⚠️ Trade not taaken for {symbol}")
         return {"status": "rejected"}
 
 @app.get("/")
