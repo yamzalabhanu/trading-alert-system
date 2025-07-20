@@ -1,7 +1,8 @@
 fastapi
-httpx
 uvicorn
+httpx
 python-dotenv
-pydantic
-pytz
+pandas
+numpy
+
 
