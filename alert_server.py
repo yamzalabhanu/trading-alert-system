@@ -191,7 +191,11 @@ async def send_telegram_message(text: str):
 async def send_telegram_alert(decision, indicators):
     iv = indicators.get("best_option", {}).get("implied_volatility", "N/A")
     oi = indicators.get("best_option", {}).get("open_interest", "N/A")
-    sweep_info = indicators.get("sweeps", {}).get("underlying_asset", {}).get("trend", "N/A")
+    sweeps = indicators.get("sweeps", [])
+    if isinstance(sweeps, list) and sweeps:
+        sweep_info = sweeps[0].get("underlying_asset", {}).get("trend", "N/A")
+    else:
+        sweep_info = "N/A"
     pattern = indicators.get("ema_pattern", {}).get("pattern") or indicators.get("rsi_signal", {}).get("pattern") or indicators.get("macd_signal", {}).get("pattern")
 
     text = f"<b>{decision['symbol']} {decision['type'].upper()}</b>\n" \
