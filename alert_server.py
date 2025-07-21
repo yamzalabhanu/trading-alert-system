@@ -7,7 +7,6 @@ from typing import Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
-import sqlite3
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,23 +20,6 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 cooldowns: Dict[str, datetime] = {}
-
-# SQLite DB setup
-conn = sqlite3.connect("alerts.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT,
-    price REAL,
-    action TEXT,
-    volume INTEGER,
-    alert_time TEXT,
-    summary TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-conn.commit()
 
 class TradingViewAlert(BaseModel):
     symbol: str
@@ -64,7 +46,6 @@ async def get_polygon_context(symbol: str) -> str:
 
     try:
         async with httpx.AsyncClient() as client:
-            # Get previous day close
             prev = await client.get(
                 f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev",
                 params={"adjusted": "true", "apiKey": POLYGON_API_KEY}
@@ -72,7 +53,6 @@ async def get_polygon_context(symbol: str) -> str:
             prev_data = prev.json()
             close = prev_data.get("results", [{}])[0].get("c", "N/A")
 
-            # Get current snapshot
             snap = await client.get(
                 f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}",
                 params={"apiKey": POLYGON_API_KEY}
@@ -91,18 +71,12 @@ async def get_gpt_summary(alert: TradingViewAlert, context: str) -> str:
         return "No GPT summary (API key missing)."
 
     prompt = (
-        f"Summarize this trading alert and assess its value:
-"
-        f"Symbol: {alert.symbol}
-"
-        f"Price: {alert.price}
-"
-        f"Action: {alert.action}
-"
-        f"Volume: {alert.volume}
-"
-        f"Time: {alert.time}
-"
+        f"Summarize this trading alert and assess its value:\n"
+        f"Symbol: {alert.symbol}\n"
+        f"Price: {alert.price}\n"
+        f"Action: {alert.action}\n"
+        f"Volume: {alert.volume}\n"
+        f"Time: {alert.time}\n"
         f"Context: {context}"
     )
 
@@ -142,29 +116,16 @@ async def receive_alert(alert: TradingViewAlert):
         context = await get_polygon_context(alert.symbol)
         summary = await get_gpt_summary(alert, context)
 
-        # Store in DB
-        cursor.execute(
-            "INSERT INTO alerts (symbol, price, action, volume, alert_time, summary) VALUES (?, ?, ?, ?, ?, ?)",
-            (alert.symbol, alert.price, alert.action, alert.volume, alert.time, summary)
-        )
-        conn.commit()
-
         message = (
-            f"📊 *Trading Alert*
-"
-            f"*{alert.symbol}* `{alert.action}` at `${alert.price}`
-"
-            f"Volume: {alert.volume}
-"
-            f"Time: {alert.time}
-"
-            f"Context: {context}
-"
+            f"📊 *Trading Alert*\n"
+            f"*{alert.symbol}* `{alert.action}` at `${alert.price}`\n"
+            f"Volume: {alert.volume}\n"
+            f"Time: {alert.time}\n"
+            f"Context: {context}\n"
             f"*GPT:* {summary}"
         )
 
         await send_to_telegram(message)
-
         return {"status": "success", "summary": summary, "context": context}
     except Exception as e:
         logging.error(f"Error processing alert: {e}")
