@@ -237,3 +237,99 @@ Context: {context}
 @app.get("/status")
 def status():
     return {"status": "running", "alerts_count": len(cooldowns)}
+
+# === Back Test ===
+@app.get("/backtest")
+async def backtest():
+    try:
+        from_zone = datetime.utcnow() - timedelta(days=30)
+        results = []
+        total_return = 0
+        win_count = 0
+        loss_count = 0
+        tested = 0
+        confidences = []
+
+        if not os.path.exists("logs/alerts.log"):
+            return {"error": "No alerts log found."}
+
+        with open("logs/alerts.log", "r") as f:
+            lines = f.readlines()
+
+        for line in lines:
+            alert = json.loads(line.strip())
+            if "symbol" not in alert or "price" not in alert or "time" not in alert:
+                continue
+
+            alert_time = datetime.strptime(alert["time"], "%Y-%m-%d %H:%M")
+            symbol = alert["symbol"]
+            entry_price = alert["price"]
+            action = alert["action"]
+            confidence = int(alert.get("confidence", 50))
+            tested += 1
+            confidences.append(confidence)
+
+            # Fetch next 20 minutes of 1-min bars
+            end_time = alert_time + timedelta(minutes=20)
+            from_str = alert_time.strftime("%Y-%m-%d")
+            to_str = (end_time + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{from_str}/{to_str}"
+                    resp = await client.get(url, params={"adjusted": "true", "limit": 1000, "apiKey": POLYGON_API_KEY})
+                    data = resp.json().get("results", [])
+                    bars = [
+                        b for b in data if alert_time.timestamp()*1000 <= b["t"] <= end_time.timestamp()*1000
+                    ]
+            except Exception as e:
+                logging.warning(f"Polygon data fetch failed: {e}")
+                continue
+
+            if not bars:
+                continue
+
+            prices = [b["c"] for b in bars]
+            max_price = max(prices)
+            min_price = min(prices)
+
+            gain_pct = ((max_price - entry_price) / entry_price) * 100 if action == "CALL" else ((entry_price - min_price) / entry_price) * 100
+            loss_pct = ((entry_price - min_price) / entry_price) * 100 if action == "CALL" else ((max_price - entry_price) / entry_price) * 100
+
+            if gain_pct >= 10:
+                win_count += 1
+                total_return += 10
+            elif loss_pct >= 5:
+                loss_count += 1
+                total_return -= 5
+            else:
+                total_return += (gain_pct if action == "CALL" else -gain_pct)
+
+            results.append({
+                "symbol": symbol,
+                "time": alert["time"],
+                "action": action,
+                "confidence": confidence,
+                "entry": entry_price,
+                "max": max_price,
+                "min": min_price,
+                "gain_pct": round(gain_pct, 2),
+                "loss_pct": round(loss_pct, 2)
+            })
+
+        win_rate = (win_count / tested) * 100 if tested else 0
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0
+        avg_return = total_return / tested if tested else 0
+
+        return {
+            "alerts_tested": tested,
+            "win_rate": round(win_rate, 2),
+            "avg_return_per_alert": round(avg_return, 2),
+            "avg_confidence": round(avg_conf, 2),
+            "total_return": round(total_return, 2),
+            "backtest_log": results[-10:]  # last 10 entries
+        }
+    except Exception as e:
+        logging.error(f"Backtest error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
