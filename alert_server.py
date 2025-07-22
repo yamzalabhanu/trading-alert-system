@@ -188,8 +188,130 @@ async def receive_alert(alert: TradingViewAlert):
             f"*GPT:* {summary}"
         )
 
+        alert_log.append(alert.dict())
+        log_to_google_sheets(alert, context, summary)
         await send_to_telegram(message)
         return {"status": "success", "summary": summary, "context": context}
     except Exception as e:
         logging.error(f"Error processing alert: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+from fastapi_utils.tasks import repeat_every
+
+# Store recent alerts
+alert_log = []
+
+@app.on_event("startup")
+@repeat_every(seconds=86400, time=datetime.utcnow().replace(hour=21, minute=0, second=0, microsecond=0))  # Run daily at 9PM UTC
+async def send_daily_summary():
+    if not OPENAI_API_KEY or not TELEGRAM_BOT_TOKEN:
+        return
+
+    if not alert_log:
+        await send_to_telegram("📊 No alerts received today.")
+        return
+
+    content = "\n".join([
+        f"{a['symbol']} {a['action']} @ {a['price']} ({a['volume']})"
+        for a in alert_log
+    ])
+    prompt = f"Summarize these trading alerts and generate key insights or patterns from today:\n{content}"
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 300
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+            summary = response.json()["choices"][0]["message"]["content"].strip()
+            await send_to_telegram(f"📈 *Daily LLM Summary*\n{summary}")
+    except Exception as e:
+        logging.error(f"Daily summary error: {e}")
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+# Setup Google Sheets
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name("gspread_creds.json", scope)
+sheet = gspread.authorize(creds).open("Trading Alerts").sheet1
+
+# Logging alert to Google Sheets
+def log_to_google_sheets(alert: TradingViewAlert, context: str, summary: str):
+    try:
+        sheet.append_row([
+            alert.time,
+            alert.symbol,
+            alert.action,
+            alert.price,
+            alert.volume,
+            context,
+            summary
+        ])
+    except Exception as e:
+        logging.error(f"Google Sheets logging failed: {e}")
+
+# Enhanced summary includes basic metrics
+@app.on_event("startup")
+@repeat_every(seconds=86400, time=datetime.utcnow().replace(hour=21, minute=0, second=0, microsecond=0))  # Run daily at 9PM UTC
+async def send_daily_summary():
+    if not OPENAI_API_KEY or not TELEGRAM_BOT_TOKEN:
+        return
+
+    if not alert_log:
+        await send_to_telegram("📊 No alerts received today.")
+        return
+
+    total = len(alert_log)
+    calls = len([a for a in alert_log if a['action'].upper() == 'CALL'])
+    puts = len([a for a in alert_log if a['action'].upper() == 'PUT'])
+
+    call_win = sum(1 for a in alert_log if a['action'].upper() == 'CALL' and a['price'] < a['price'] * 1.05)
+    put_win = sum(1 for a in alert_log if a['action'].upper() == 'PUT' and a['price'] > a['price'] * 0.95)
+
+    win_rate = (call_win + put_win) / total * 100 if total > 0 else 0
+    rr_ratio = "N/A (mocked)"
+
+    content = "\n".join([
+        f"{a['symbol']} {a['action']} @ {a['price']} ({a['volume']})"
+        for a in alert_log
+    ])
+    prompt = f"Summarize these trading alerts and generate insights:\n{content}"
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 300
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+            summary = response.json()["choices"][0]["message"]["content"].strip()
+            msg = (
+                f"📈 *Daily LLM Summary*
+"
+                f"Total Alerts: {total}
+Calls: {calls}, Puts: {puts}
+"
+                f"Win Rate (TP est.): {win_rate:.1f}%
+"
+                f"Risk/Reward: {rr_ratio}
+
+"
+                f"{summary}"
+            )
+            await send_to_telegram(msg)
+    except Exception as e:
+        logging.error(f"Daily summary error: {e}")
