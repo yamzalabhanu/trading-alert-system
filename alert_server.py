@@ -40,6 +40,51 @@ async def send_to_telegram(message: str):
     async with httpx.AsyncClient() as client:
         await client.post(url, json=payload)
 
+async def get_technical_patterns(symbol: str) -> str:
+    try:
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/5/minute"
+        params = {
+            "adjusted": "true",
+            "sort": "desc",
+            "limit": 10,
+            "apiKey": POLYGON_API_KEY
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params)
+            bars = r.json().get("results", [])
+            if not bars or len(bars) < 2:
+                return "Insufficient bar data."
+
+            ema9 = sum(b["c"] for b in bars[-9:]) / 9
+            ema20 = sum(b["c"] for b in bars[-20:]) / 20 if len(bars) >= 20 else ema9
+
+            pattern = []
+
+            if ema9 > ema20:
+                pattern.append("EMA9 > EMA20 (Uptrend)")
+            if bars[-1]["c"] > bars[-2]["h"]:
+                pattern.append("Breakout candle (Close > Prev High)")
+            if bars[-1]["v"] > sum(b["v"] for b in bars) / len(bars) * 1.5:
+                pattern.append("Unusual volume spike")
+
+            return ", ".join(pattern) if pattern else "No strong technical pattern detected."
+    except Exception as e:
+        logging.error(f"Technical pattern error: {e}")
+        return "Pattern analysis failed."
+
+async def get_news_sentiment(symbol: str) -> str:
+    try:
+        url = f"https://api.polygon.io/v2/reference/news"
+        params = {"ticker": symbol, "limit": 3, "apiKey": POLYGON_API_KEY}
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params)
+            news_items = r.json().get("results", [])
+            summaries = [f"- {n['title']}" for n in news_items]
+            return "\n".join(summaries) if summaries else "No recent headlines."
+    except Exception as e:
+        logging.error(f"News sentiment error: {e}")
+        return "News fetch failed."
+
 async def get_polygon_context(symbol: str) -> str:
     if not POLYGON_API_KEY:
         return "Polygon data unavailable."
@@ -66,19 +111,9 @@ async def get_polygon_context(symbol: str) -> str:
         logging.error(f"Polygon error: {e}")
         return "Polygon fetch error."
 
-async def get_gpt_summary(alert: TradingViewAlert, context: str) -> str:
+async def get_gpt_summary(alert: TradingViewAlert, context_text: str) -> str:
     if not OPENAI_API_KEY:
         return "No GPT summary (API key missing)."
-
-    prompt = (
-        f"Summarize this trading alert and assess its value:\n"
-        f"Symbol: {alert.symbol}\n"
-        f"Price: {alert.price}\n"
-        f"Action: {alert.action}\n"
-        f"Volume: {alert.volume}\n"
-        f"Time: {alert.time}\n"
-        f"Context: {context}"
-    )
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -86,7 +121,7 @@ async def get_gpt_summary(alert: TradingViewAlert, context: str) -> str:
     }
     payload = {
         "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": context_text}],
         "max_tokens": 100
     }
 
@@ -113,15 +148,43 @@ async def receive_alert(alert: TradingViewAlert):
             return {"status": "cooldown", "message": msg}
 
         cooldowns[symbol_key] = datetime.utcnow()
+
         context = await get_polygon_context(alert.symbol)
-        summary = await get_gpt_summary(alert, context)
+        patterns = await get_technical_patterns(alert.symbol)
+        news = await get_news_sentiment(alert.symbol)
+
+        context_text = f"""
+        Market Context:
+        {context}
+
+        Technical Patterns:
+        {patterns}
+
+        News Headlines:
+        {news}
+
+        Alert Details:
+        Symbol: {alert.symbol}
+        Price: {alert.price}
+        Action: {alert.action}
+        Volume: {alert.volume}
+        Time: {alert.time}
+
+        Provide a brief summary and score the alert strength (0–100).
+        """
+
+        summary = await get_gpt_summary(alert, context_text)
 
         message = (
-            f"📊 *Trading Alert*\n"
-            f"*{alert.symbol}* `{alert.action}` at `${alert.price}`\n"
+            f"📊 *Trading Alert*
+"
+            f"*{alert.symbol}* `{alert.action}` at `${alert.price}`
+"
             f"Volume: {alert.volume}\n"
             f"Time: {alert.time}\n"
             f"Context: {context}\n"
+            f"Patterns: {patterns}\n"
+            f"News: {news}\n"
             f"*GPT:* {summary}"
         )
 
