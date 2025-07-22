@@ -333,3 +333,77 @@ async def backtest():
         logging.error(f"Backtest error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+
+
+#### Display ###
+from fastapi.responses import HTMLResponse
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    try:
+        # Reuse the /backtest logic
+        resp = await backtest()
+        if "error" in resp:
+            return f"<h3>{resp['error']}</h3>"
+
+        alerts = resp["backtest_log"]
+        chart_data = [{
+            "symbol": a["symbol"],
+            "confidence": a["confidence"],
+            "gain_pct": a["gain_pct"],
+            "time": a["time"]
+        } for a in alerts]
+
+        labels = [a["symbol"] + " " + a["time"][-5:] for a in chart_data]
+        confidences = [a["confidence"] for a in chart_data]
+        gains = [a["gain_pct"] for a in chart_data]
+
+        html = f"""
+        <html>
+        <head>
+            <title>Backtest Dashboard</title>
+            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        </head>
+        <body>
+            <h2>📊 Backtest Summary</h2>
+            <ul>
+                <li><b>Alerts Tested:</b> {resp["alerts_tested"]}</li>
+                <li><b>Win Rate:</b> {resp["win_rate"]}%</li>
+                <li><b>Avg Return/Alert:</b> {resp["avg_return_per_alert"]}%</li>
+                <li><b>Avg Confidence:</b> {resp["avg_confidence"]}</li>
+                <li><b>Total Return:</b> {resp["total_return"]}%</li>
+            </ul>
+            <h3>📈 Confidence vs Gain % (Last 10 Alerts)</h3>
+            <div id="chart"></div>
+            <script>
+                var trace1 = {{
+                    x: {labels},
+                    y: {confidences},
+                    name: 'Confidence',
+                    type: 'bar'
+                }};
+                var trace2 = {{
+                    x: {labels},
+                    y: {gains},
+                    name: 'Gain %',
+                    type: 'bar'
+                }};
+                var data = [trace1, trace2];
+                var layout = {{
+                    barmode: 'group',
+                    title: 'Last 10 Alerts: Confidence vs Gain %',
+                    xaxis: {{ title: 'Symbol/Time' }},
+                    yaxis: {{ title: 'Value' }}
+                }};
+                Plotly.newPlot('chart', data, layout);
+            </script>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html)
+    except Exception as e:
+        logging.error(f"Dashboard error: {e}")
+        return HTMLResponse(content=f"<h3>Error generating dashboard: {e}</h3>")
+
