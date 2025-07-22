@@ -110,3 +110,14 @@ async def get_gpt_summary(alert: TradingViewAlert, enriched: Dict[str, str]) -> 
     except Exception as e:
         logging.error(f"GPT error: {e}")
         return {"summary": "GPT summary error", "confidence": "N/A", "recommendation": "N/A"}
+
+# === Webhook ===
+@app.post("/webhook/alerts")
+async def receive_alert(alert: TradingViewAlert):
+    try:
+        msg = f"\n📢 *Trading Alert Received*\n*{alert.symbol}* `{alert.action}` at `${alert.price}`\nVolume: {alert.volume}\nTime: {alert.time}"
+        await send_to_telegram(msg)
+        return {"status": "received"}
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
