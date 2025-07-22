@@ -11,6 +11,8 @@ import numpy as np
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from dateutil import parser as date_parser
+
 
 # === Load environment ===
 load_dotenv()
@@ -176,7 +178,7 @@ async def get_gpt_summary(alert: TradingViewAlert, context: str) -> Dict[str, st
 @app.post("/webhook/alerts")
 async def receive_alert(alert: TradingViewAlert):
     try:
-        alert_dt = datetime.strptime(alert.time, "%Y-%m-%d %H:%M")
+        alert_dt = date_parser.isoparse(alert.time)
         key = f"{alert.symbol}_{alert.action}"
         if key in cooldowns and datetime.utcnow() - cooldowns[key] < timedelta(minutes=5):
             msg = f"⚠️ Cooldown active for {alert.symbol} {alert.action}."
