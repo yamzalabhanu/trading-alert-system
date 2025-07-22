@@ -102,13 +102,13 @@ def calculate_indicators(df: pd.DataFrame) -> Dict[str, bool]:
 
     latest = df.iloc[-1]
     return {
-        "ema_bullish": latest['ema9'] > latest['ema20'],
-        "ema_bearish": latest['ema9'] < latest['ema20'],
-        "above_vwap": latest['c'] > latest['vwap'],
-        "below_vwap": latest['c'] < latest['vwap'],
-        "rsi": latest['rsi'],
-        "macd": latest['macd'],
-        "macd_signal": latest['macd_signal']
+        "ema_bullish": bool(latest['ema9'] > latest['ema20']),
+        "ema_bearish": bool(latest['ema9'] < latest['ema20']),
+        "above_vwap": bool(latest['c'] > latest['vwap']),
+        "below_vwap": bool(latest['c'] < latest['vwap']),
+        "rsi": float(latest['rsi']),
+        "macd": float(latest['macd']),
+        "macd_signal": float(latest['macd_signal'])
     }
 
 # === Polygon context ===
@@ -219,13 +219,14 @@ Context: {context}
         await send_to_telegram(msg)
 
         os.makedirs("logs", exist_ok=True)
+        log_data = {
+            **alert.dict(),
+            "confirmed": bool(confirm),
+            "confidence": str(confidence),
+            "summary": str(summary)
+        }
         with open("logs/alerts.log", "a") as f:
-            f.write(json.dumps({
-                **alert.dict(),
-                "confirmed": confirm,
-                "confidence": confidence,
-                "summary": summary
-            }) + "\n")
+            f.write(json.dumps(log_data) + "\n")
 
         return {"status": "success", "confirmed": confirm, "confidence": confidence, "summary": summary}
     except Exception as e:
