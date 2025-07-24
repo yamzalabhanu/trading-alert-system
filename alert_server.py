@@ -79,22 +79,35 @@ async def get_sentiment_analysis(tickers: List[str]) -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
         for ticker in tickers:
             try:
-                news = await get_finnhub("/company-news", {"symbol": ticker, "from": datetime.now().strftime('%Y-%m-%d'), "to": datetime.now().strftime('%Y-%m-%d')})
-                headlines = [item["headline"] for item in news[:5]]
+                news = await get_finnhub("/company-news", {
+                    "symbol": ticker,
+                    "from": datetime.now().strftime('%Y-%m-%d'),
+                    "to": datetime.now().strftime('%Y-%m-%d')
+                })
+
+                if not news:
+                    continue
+
+                headlines = [item.get("headline", "") for item in news[:5] if item.get("headline")]
+                if not headlines:
+                    continue
 
                 sentiment_scores = []
                 for headline in headlines:
-                    deepai_url = "https://api.deepai.org/api/sentiment-analysis"
-                    deepai_resp = await client.post(
-                        deepai_url,
-                        data={"text": headline},
-                        headers={"api-key": DEEPAI_API_KEY}
-                    )
-                    deepai_result = deepai_resp.json()
-                    if "output" in deepai_result:
-                        sentiments = deepai_result["output"]
-                        score = sentiments.count("Positive") - sentiments.count("Negative")
-                        sentiment_scores.append(score)
+                    try:
+                        deepai_url = "https://api.deepai.org/api/sentiment-analysis"
+                        deepai_resp = await client.post(
+                            deepai_url,
+                            data={"text": headline},
+                            headers={"api-key": DEEPAI_API_KEY}
+                        )
+                        deepai_result = deepai_resp.json()
+                        if "output" in deepai_result:
+                            sentiments = deepai_result["output"]
+                            score = sentiments.count("Positive") - sentiments.count("Negative")
+                            sentiment_scores.append(score)
+                    except Exception as de:
+                        logging.warning(f"DeepAI error for headline '{headline[:50]}...': {de}")
 
                 net = sum(sentiment_scores)
                 if net > 1:
@@ -117,7 +130,8 @@ async def gpt_summary(prompt: str) -> str:
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post("https://api.openai.com/v1/chat/completions", headers=BASE_HEADERS, json=payload)
-            return res.json()["choices"][0]["message"]["content"].strip()
+            data = res.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "GPT response incomplete.").strip()
     except Exception as e:
         logging.error(f"GPT summary error: {e}")
         return "GPT analysis unavailable."
@@ -129,16 +143,15 @@ async def run_all_scans():
     results = [f"🕒 *Scan Time:* `{now}`\n"]
 
     tickers = [
-        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR", "CRWV", "NVDA", "AMD",
-        "AVGO", "MSFT", "BABA", "UBER", "MSTR", "COIN", "HOOD", "CLSK", "MARA", "CORZ",
-        "IONQ", "SOUN", "RGTI", "QBTS", "UNH", "XYZ", "PYPL", "XOM", "CVX"
+        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL"
+        
     ]
 
     results.append(f"📈 *Watchlist Symbols*: {', '.join(tickers)}")
 
     sentiment = await get_sentiment_analysis(tickers)
-    results.append(f"🐂 *Bullish*: {', '.join(sentiment['bullish'])}")
-    results.append(f"🐻 *Bearish*: {', '.join(sentiment['bearish'])}")
+    results.append(f"🐂 *Bullish*: {', '.join(sentiment['bullish']) or 'None'}")
+    results.append(f"🐻 *Bearish*: {', '.join(sentiment['bearish']) or 'None'}")
 
     headlines = await get_top_news()
     results.append("📰 *Top Headlines:*\n" + '\n'.join([f"- {h}" for h in headlines]))
