@@ -60,7 +60,7 @@ async def get_polygon(endpoint: str, params: dict) -> dict:
 
 async def gpt_summary(prompt: str) -> str:
     payload = {
-        "model": "gpt-4",
+        "model": "gpt-3.5",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 1000
     }
