@@ -2,15 +2,19 @@ import os
 import httpx
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, time
 from typing import List
-
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo for <3.9
+
 # === Load environment variables ===
 load_dotenv()
-l
+
 DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -155,16 +159,27 @@ async def run_all_scans():
     logging.info(f"Scan completed in {duration:.2f} seconds.")
     return {"message": "Scan and summary sent", "duration": duration, "results": results}
 
-# === Background Worker Loop (Render-compatible) ===
+# === Background Worker Loop (Only in U.S. Market Hours) ===
 @app.on_event("startup")
 async def start_background_loop():
     async def loop():
+        eastern = ZoneInfo("America/New_York")
+        market_open = time(9, 30)
+        market_close = time(16, 0)
+
         while True:
-            try:
-                await run_all_scans()
-                await asyncio.sleep(300)  # every 5 minutes
-            except Exception as e:
-                logging.error(f"Scan loop error: {e}")
-                await asyncio.sleep(60)
+            now = datetime.now(tz=eastern)
+            is_weekday = now.weekday() < 5
+
+            if is_weekday and market_open <= now.time() <= market_close:
+                logging.info(f"Market open — running scan at {now.strftime('%H:%M:%S')} ET")
+                try:
+                    await run_all_scans()
+                except Exception as e:
+                    logging.error(f"Scan loop error: {e}")
+            else:
+                logging.info(f"Outside market hours ({now.strftime('%H:%M:%S')} ET) — skipping scan.")
+
+            await asyncio.sleep(300)  # 5 minutes
 
     asyncio.create_task(loop())
