@@ -8,7 +8,6 @@ from typing import List
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
-# Fallback to no SSL in limited environments
 try:
     import ssl
 except ImportError:
@@ -20,22 +19,17 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-# === Load environment variables ===
 load_dotenv()
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# === App & Logging ===
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 BASE_HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-# === Telegram ===
 def escape_markdown(text: str) -> str:
     return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
@@ -54,19 +48,6 @@ async def send_telegram(message: str):
         except Exception as e:
             logging.error(f"Telegram send error: {e}")
 
-# === Finnhub Wrappers ===
-async def get_finnhub(endpoint: str, params: dict) -> dict:
-    base_url = f"https://finnhub.io/api/v1{endpoint}"
-    params["token"] = FINNHUB_API_KEY
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.get(base_url, params=params)
-            return res.json()
-    except Exception as e:
-        logging.error(f"Finnhub API error ({endpoint}): {e}")
-        return {}
-
-# === Polygon Option Flow ===
 async def get_polygon(endpoint: str, params: dict) -> dict:
     params["apiKey"] = POLYGON_API_KEY
     try:
@@ -77,60 +58,6 @@ async def get_polygon(endpoint: str, params: dict) -> dict:
         logging.warning(f"Polygon API error: {endpoint} | {e}")
         return {}
 
-# === Market News ===
-async def get_top_news(limit: int = 10) -> List[str]:
-    news = await get_finnhub("/news", {"category": "general"})
-    return [item['headline'] for item in news[:limit]]
-
-# === Sentiment Analysis ===
-async def get_sentiment_analysis(tickers: List[str]) -> dict:
-    bullish, bearish = [], []
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        for ticker in tickers:
-            try:
-                news = await get_finnhub("/company-news", {
-                    "symbol": ticker,
-                    "from": datetime.now().strftime('%Y-%m-%d'),
-                    "to": datetime.now().strftime('%Y-%m-%d')
-                })
-
-                if not news:
-                    continue
-
-                headlines = [item.get("headline", "") for item in news[:5] if item.get("headline")]
-                if not headlines:
-                    continue
-
-                sentiment_scores = []
-                for headline in headlines:
-                    try:
-                        deepai_url = "https://api.deepai.org/api/sentiment-analysis"
-                        deepai_resp = await client.post(
-                            deepai_url,
-                            data={"text": headline},
-                            headers={"api-key": DEEPAI_API_KEY}
-                        )
-                        deepai_result = deepai_resp.json()
-                        if "output" in deepai_result:
-                            sentiments = deepai_result["output"]
-                            score = sentiments.count("Positive") - sentiments.count("Negative")
-                            sentiment_scores.append(score)
-                    except Exception as de:
-                        logging.warning(f"DeepAI error for headline '{headline[:50]}...': {de}")
-
-                net = sum(sentiment_scores)
-                if net > 1:
-                    bullish.append(ticker)
-                elif net < -1:
-                    bearish.append(ticker)
-
-            except Exception as e:
-                logging.warning(f"Sentiment error for {ticker}: {e}")
-
-    return {"bullish": bullish, "bearish": bearish}
-
-# === GPT Summary ===
 async def gpt_summary(prompt: str) -> str:
     payload = {
         "model": "gpt-4",
@@ -148,7 +75,6 @@ async def gpt_summary(prompt: str) -> str:
         logging.error(f"GPT summary error: {e}")
         return "GPT analysis unavailable."
 
-# === Main Scan Logic ===
 @app.get("/scan")
 async def run_all_scans():
     now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -162,14 +88,6 @@ async def run_all_scans():
 
     results.append(f"📈 *Watchlist Symbols*: {', '.join(tickers)}")
 
-    sentiment = await get_sentiment_analysis(tickers)
-    results.append(f"🐂 *Bullish*: {', '.join(sentiment['bullish']) or 'None'}")
-    results.append(f"🐻 *Bearish*: {', '.join(sentiment['bearish']) or 'None'}")
-
-    headlines = await get_top_news()
-    results.append("📰 *Top Headlines:*\n" + '\n'.join([f"- {h}" for h in headlines]))
-
-    # === Polygon Options Flow ===
     option_flow = []
     unusual = []
     for symbol in tickers:
@@ -194,7 +112,6 @@ async def run_all_scans():
 
     return {"status": "complete", "summary": gpt_msg}
 
-# === Background Loop: Only During U.S. Market Hours ===
 @app.on_event("startup")
 async def start_background_loop():
     async def loop():
