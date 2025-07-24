@@ -7,16 +7,24 @@ from typing import List
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
+# Fallback to no SSL in limited environments
+try:
+    import ssl
+except ImportError:
+    ssl = None
+    logging.warning("SSL module is not available. Secure HTTP may fail in this environment.")
+
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:
-    from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo for <3.9
+    from backports.zoneinfo import ZoneInfo
 
 # === Load environment variables ===
 load_dotenv()
 
-DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -36,8 +44,20 @@ async def send_telegram(message: str):
         except Exception as e:
             logging.error(f"Telegram send error: {e}")
 
-# === Polygon API Wrapper ===
-async def get_polygon_data(endpoint: str, params: dict) -> dict:
+# === Finnhub Wrappers ===
+async def get_finnhub(endpoint: str, params: dict) -> dict:
+    base_url = f"https://finnhub.io/api/v1{endpoint}"
+    params["token"] = FINNHUB_API_KEY
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(base_url, params=params)
+            return res.json()
+    except Exception as e:
+        logging.error(f"Finnhub API error ({endpoint}): {e}")
+        return {}
+
+# === Polygon Option Flow ===
+async def get_polygon(endpoint: str, params: dict) -> dict:
     params["apiKey"] = POLYGON_API_KEY
     try:
         async with httpx.AsyncClient() as client:
@@ -46,6 +66,46 @@ async def get_polygon_data(endpoint: str, params: dict) -> dict:
     except Exception as e:
         logging.warning(f"Polygon API error: {endpoint} | {e}")
         return {}
+
+# === Market News ===
+async def get_top_news(limit: int = 10) -> List[str]:
+    news = await get_finnhub("/news", {"category": "general"})
+    return [item['headline'] for item in news[:limit]]
+
+# === Sentiment Analysis ===
+async def get_sentiment_analysis(tickers: List[str]) -> dict:
+    bullish, bearish = [], []
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for ticker in tickers:
+            try:
+                news = await get_finnhub("/company-news", {"symbol": ticker, "from": datetime.now().strftime('%Y-%m-%d'), "to": datetime.now().strftime('%Y-%m-%d')})
+                headlines = [item["headline"] for item in news[:5]]
+
+                sentiment_scores = []
+                for headline in headlines:
+                    deepai_url = "https://api.deepai.org/api/sentiment-analysis"
+                    deepai_resp = await client.post(
+                        deepai_url,
+                        data={"text": headline},
+                        headers={"api-key": DEEPAI_API_KEY}
+                    )
+                    deepai_result = deepai_resp.json()
+                    if "output" in deepai_result:
+                        sentiments = deepai_result["output"]
+                        score = sentiments.count("Positive") - sentiments.count("Negative")
+                        sentiment_scores.append(score)
+
+                net = sum(sentiment_scores)
+                if net > 1:
+                    bullish.append(ticker)
+                elif net < -1:
+                    bearish.append(ticker)
+
+            except Exception as e:
+                logging.warning(f"Sentiment error for {ticker}: {e}")
+
+    return {"bullish": bullish, "bearish": bearish}
 
 # === GPT Summary ===
 async def gpt_summary(prompt: str) -> str:
@@ -62,104 +122,41 @@ async def gpt_summary(prompt: str) -> str:
         logging.error(f"GPT summary error: {e}")
         return "GPT analysis unavailable."
 
-# === Sentiment Analysis ===
-async def get_sentiment_analysis(tickers: List[str]) -> dict:
-    bullish, bearish = [], []
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        for ticker in tickers:
-            try:
-                news_url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=5&apiKey={POLYGON_API_KEY}"
-                news_resp = await client.get(news_url)
-                news_data = news_resp.json()
-                headlines = [item["title"] for item in news_data.get("results", [])]
-
-                sentiment_scores = []
-                for headline in headlines:
-                    deepai_url = "https://api.deepai.org/api/sentiment-analysis"
-                    deepai_resp = await client.post(
-                        deepai_url,
-                        data={"text": headline},
-                        headers={"api-key": DEEPAI_API_KEY}
-                    )
-                    deepai_result = deepai_resp.json()
-                    if "output" in deepai_result:
-                        sentiments = deepai_result["output"]
-                        score = sentiments.count("Positive") - sentiments.count("Negative")
-                        sentiment_scores.append(score)
-
-                net_sentiment = sum(sentiment_scores)
-                if net_sentiment > 1:
-                    bullish.append(ticker)
-                elif net_sentiment < -1:
-                    bearish.append(ticker)
-
-            except Exception as e:
-                logging.warning(f"Sentiment error for {ticker}: {e}")
-
-    return {"bullish": bullish, "bearish": bearish}
-
-# === /sentiment endpoint ===
-@app.get("/sentiment")
-async def sentiment_summary():
-    tickers = [
-        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR", "CRWV", "NVDA", "AMD",
-        "AVGO", "MSFT", "BABA", "UBER", "MSTR", "COIN", "HOOD", "CLSK", "MARA", "CORZ",
-        "IONQ", "SOUN", "RGTI", "QBTS", "UNH", "XYZ", "PYPL", "XOM", "CVX"
-    ]
-    return await get_sentiment_analysis(tickers)
-
-# === /scan endpoint (also used by background worker) ===
+# === Main Scan Logic ===
 @app.get("/scan")
 async def run_all_scans():
-    start_time = datetime.utcnow()
-    now_str = start_time.strftime('%Y-%m-%d %H:%M:%S UTC')
-    results = [f"🕒 *Scan Time:* `{now_str}`\n"]
+    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    results = [f"🕒 *Scan Time:* `{now}`\n"]
 
-    # 1. Top Gainers
-    gainers = await get_polygon_data("/v2/snapshot/locale/us/markets/stocks/gainers", {})
-    gainers_list = [t['ticker'] for t in gainers.get("tickers", [])[:30]]
-    results.append(f"📈 *Top Gainers*: {', '.join(gainers_list)}")
+    gainers = await get_finnhub("/stock/symbol", {"exchange": "US"})
+    top_tickers = [s['symbol'] for s in gainers[:20]] if gainers else []
+    results.append(f"📈 *Active Symbols*: {', '.join(top_tickers)}")
 
-    # 2. High Volume Spikes
-    actives = await get_polygon_data("/v2/snapshot/locale/us/markets/stocks/most_active", {})
-    spikes = [t for t in actives.get("tickers", []) if t.get("volume", 0) > 50000]
-    results.append(f"🔊 *High Volume Spikes*: {', '.join([s['ticker'] for s in spikes])}")
+    sentiment = await get_sentiment_analysis(top_tickers[:15])
+    results.append(f"🐂 *Bullish*: {', '.join(sentiment['bullish'])}")
+    results.append(f"🐻 *Bearish*: {', '.join(sentiment['bearish'])}")
 
-    # 3. Option Flow
-    option_tickers = gainers_list
-    flow_results = []
-    for ticker in option_tickers[:20]:
-        opt_flow = await get_polygon_data("/v3/reference/options/contracts", {"underlying_ticker": ticker, "limit": 2})
-        for item in opt_flow.get("results", []):
-            flow_results.append(item.get("ticker", "N/A"))
-    results.append(f"🧾 *Options Flow Examples*: {', '.join(flow_results)}")
+    headlines = await get_top_news()
+    results.append("📰 *Top Headlines:*\n" + '\n'.join([f"- {h}" for h in headlines]))
 
-    # 4. Sentiment
-    sentiment = await get_sentiment_analysis(option_tickers[:20])
-    results.append(f"🐂 *Bullish Sentiment*: {', '.join(sentiment['bullish'])}")
-    results.append(f"🐻 *Bearish Sentiment*: {', '.join(sentiment['bearish'])}")
+    # === Polygon Options Flow ===
+    option_flow = []
+    for symbol in top_tickers[:10]:
+        opt = await get_polygon("/v3/reference/options/contracts", {"underlying_ticker": symbol, "limit": 2})
+        for o in opt.get("results", []):
+            option_flow.append(o.get("ticker"))
+    if option_flow:
+        results.append("🧾 *Options Flow:* " + ', '.join(option_flow))
 
-    # 5. Upgrades / Downgrades
-    news = await get_polygon_data("/v2/reference/news", {"limit": 30})
-    upgrades = [n['title'] for n in news.get("results", []) if "upgrade" in n['title'].lower() or "downgrade" in n['title'].lower()]
-    results.append(f"📢 *Upgrades/Downgrades*: {', '.join(upgrades[:10])}")
+    summary_input = "\n".join(results)
+    gpt_msg = await gpt_summary(f"Summarize today's market scan:\n{summary_input}")
 
-    # 6. GPT Summary
-    full_summary = "\n".join(results)
-    gpt_msg = await gpt_summary(f"Analyze and summarize these trading signals:\n{full_summary}")
-
-    combined_message = f"{full_summary}\n\n📊 *AI Summary*:\n{gpt_msg}"
-    if len(combined_message) > 4000:
-        combined_message = f"{full_summary[:3900]}...\n\n📊 *AI Summary*:\n{gpt_msg[:500]}..."
-
+    combined_message = f"{summary_input}\n\n📊 *AI Summary:*\n{gpt_msg}"
     await send_telegram(combined_message)
 
-    duration = (datetime.utcnow() - start_time).total_seconds()
-    logging.info(f"Scan completed in {duration:.2f} seconds.")
-    return {"message": "Scan and summary sent", "duration": duration, "results": results}
+    return {"status": "complete", "summary": gpt_msg}
 
-# === Background Worker Loop (Only in U.S. Market Hours) ===
+# === Background Loop: Only During U.S. Market Hours ===
 @app.on_event("startup")
 async def start_background_loop():
     async def loop():
@@ -169,17 +166,15 @@ async def start_background_loop():
 
         while True:
             now = datetime.now(tz=eastern)
-            is_weekday = now.weekday() < 5
-
-            if is_weekday and market_open <= now.time() <= market_close:
-                logging.info(f"Market open — running scan at {now.strftime('%H:%M:%S')} ET")
+            if now.weekday() < 5 and market_open <= now.time() <= market_close:
+                logging.info(f"Market open — running scan at {now}")
                 try:
                     await run_all_scans()
                 except Exception as e:
-                    logging.error(f"Scan loop error: {e}")
+                    logging.error(f"Error in scan loop: {e}")
             else:
-                logging.info(f"Outside market hours ({now.strftime('%H:%M:%S')} ET) — skipping scan.")
+                logging.info(f"Outside market hours ({now.time()}) — skipping scan.")
 
-            await asyncio.sleep(30000)  # 5 minutes
+            await asyncio.sleep(300)
 
     asyncio.create_task(loop())
