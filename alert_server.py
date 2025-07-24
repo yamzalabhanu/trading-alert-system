@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 BASE_HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
 def escape_markdown(text: str) -> str:
-    return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 async def send_telegram(message: str):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -81,44 +81,47 @@ async def run_all_scans():
     results = [f"🕒 *Scan Time:* `{now}`\n"]
 
     tickers = [
-        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR",
-        "CRWV", "NVDA", "AMD", "AVGO", "MSFT", "BABA", "UBER",
-        "MSTR", "COIN", "HOOD", "CLSK", "MARA", "CORZ",
-        "IONQ", "SOUN", "RGTI", "QBTS", "UNH", "XYZ", "PYPL", "XOM", "CVX"
+        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL"
     ]
 
     results.append(f"📈 *Watchlist Symbols*: {', '.join(tickers)}")
 
     option_flow = []
-    detailed_contracts = []
     for symbol in tickers:
         opt = await get_polygon("/v3/reference/options/contracts", {"underlying_ticker": symbol, "limit": 30})
+        calls = []
+        puts = []
         for o in opt.get("results", []):
-            symbol = o.get("underlying_ticker")
             contract = o.get("ticker")
             expiry = o.get("expiration_date")
             strike = o.get("strike_price")
             iv = o.get("implied_volatility", 0)
             oi = o.get("open_interest", 0)
             side = o.get("contract_type")
-
             score = iv * oi if iv and oi else 0
-            detailed_contracts.append(f"{contract} | Type: {side} | Strike: {strike} | Exp: {expiry} | IVxOI: {score:.0f}")
-            option_flow.append({"symbol": symbol, "contract": contract, "side": side, "iv": iv, "oi": oi, "score": score, "strike": strike, "expiry": expiry})
+            entry = {"symbol": symbol, "contract": contract, "side": side, "iv": iv, "oi": oi, "score": score, "strike": strike, "expiry": expiry}
+            if side == "call":
+                calls.append(entry)
+            elif side == "put":
+                puts.append(entry)
 
-    top_contracts = sorted(option_flow, key=lambda x: x["score"], reverse=True)[:10]
+        option_flow.extend(sorted(calls, key=lambda x: x["score"], reverse=True)[:2])
+        option_flow.extend(sorted(puts, key=lambda x: x["score"], reverse=True)[:2])
 
-    results.append("🧾 *Top Unusual Options Activity:*\n" + "\n".join(detailed_contracts[:10]))
+    detailed_lines = [
+        f"{x['contract']} | Type: {x['side']} | Strike: {x['strike']} | Exp: {x['expiry']} | IVxOI: {x['score']:.0f}"
+        for x in option_flow
+    ]
+    results.append("🧾 *Top Options Activity (Top 2 Calls and Puts per Ticker):*\n" + "\n".join(detailed_lines))
 
     prompt = (
         "You are a professional options trader. Analyze the following list of options contracts for unusual activity. "
         "Identify top candidates for BUY or SELL, based on high IV×OI, strike positioning, and near expiration. "
         "Format the response in simple, actionable bullet points for a trading alert. Include reasoning.\n\n"
-        + "\n".join([f"{x['symbol']} {x['side']} expiring on {x['expiry']} @ {x['strike']} → Buy/Sell. Reason: high IV×OI, etc." for x in top_contracts])
+        + "\n".join([f"{x['symbol']} {x['side']} expiring on {x['expiry']} @ {x['strike']} → Buy/Sell. Reason: high IV×OI, etc." for x in option_flow])
     )
 
     gpt_msg = await gpt_summary(prompt)
-
     combined_message = f"{chr(10).join(results)}\n\n📊 *LLM Recommendation:*\n{gpt_msg}"
     await send_telegram(combined_message)
 
