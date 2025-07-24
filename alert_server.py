@@ -3,7 +3,7 @@ import httpx
 import asyncio
 import logging
 import re
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import List
 from fastapi import FastAPI
 from dotenv import load_dotenv
@@ -30,8 +30,15 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 BASE_HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
+MIN_OI = 1000
+MIN_VOLUME = 500
+IV_PERCENTILE_THRESHOLD = 0.75
+ATM_PROXIMITY_PCT = 0.02  # Within 2% of price
+
+
 def escape_markdown(text: str) -> str:
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+
 
 async def send_telegram(message: str):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -48,6 +55,7 @@ async def send_telegram(message: str):
         except Exception as e:
             logging.error(f"Telegram send error: {e}")
 
+
 async def get_polygon(endpoint: str, params: dict) -> dict:
     params["apiKey"] = POLYGON_API_KEY
     try:
@@ -57,6 +65,7 @@ async def get_polygon(endpoint: str, params: dict) -> dict:
     except Exception as e:
         logging.warning(f"Polygon API error: {endpoint} | {e}")
         return {}
+
 
 async def gpt_summary(prompt: str) -> str:
     payload = {
@@ -75,31 +84,59 @@ async def gpt_summary(prompt: str) -> str:
         logging.error(f"GPT summary error: {e}")
         return "GPT analysis unavailable."
 
+
 @app.get("/scan")
 async def run_all_scans():
     now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     results = [f"🕒 *Scan Time:* `{now}`\n"]
 
     tickers = [
-        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL"
+        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR"
     ]
 
     results.append(f"📈 *Watchlist Symbols*: {', '.join(tickers)}")
 
     option_flow = []
+    today = datetime.utcnow().date()
+    week_ahead = today + timedelta(days=7)
+
     for symbol in tickers:
-        opt = await get_polygon("/v3/reference/options/contracts", {"underlying_ticker": symbol, "limit": 30})
+        opt = await get_polygon("/v3/reference/options/contracts", {"underlying_ticker": symbol, "limit": 100})
         calls = []
         puts = []
         for o in opt.get("results", []):
-            contract = o.get("ticker")
             expiry = o.get("expiration_date")
+            if not expiry:
+                continue
+            expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+            if expiry_date > week_ahead:
+                continue
+
+            contract = o.get("ticker")
             strike = o.get("strike_price")
             iv = o.get("implied_volatility", 0)
             oi = o.get("open_interest", 0)
+            vol = o.get("volume", 0)
             side = o.get("contract_type")
+            price = o.get("underlying_price", 0)
             score = iv * oi if iv and oi else 0
-            entry = {"symbol": symbol, "contract": contract, "side": side, "iv": iv, "oi": oi, "score": score, "strike": strike, "expiry": expiry}
+            atm = abs(strike - price) / price < ATM_PROXIMITY_PCT if price else False
+
+            if oi < MIN_OI or vol < MIN_VOLUME:
+                continue
+
+            entry = {
+                "symbol": symbol,
+                "contract": contract,
+                "side": side,
+                "iv": iv,
+                "oi": oi,
+                "vol": vol,
+                "score": score,
+                "strike": strike,
+                "expiry": expiry,
+                "atm": atm
+            }
             if side == "call":
                 calls.append(entry)
             elif side == "put":
@@ -109,16 +146,23 @@ async def run_all_scans():
         option_flow.extend(sorted(puts, key=lambda x: x["score"], reverse=True)[:2])
 
     detailed_lines = [
-        f"{x['contract']} | Type: {x['side']} | Strike: {x['strike']} | Exp: {x['expiry']} | IVxOI: {x['score']:.0f}"
+        f"{x['symbol']} | {x['contract']} | {x['side']} | Exp: {x['expiry']} | Strike: {x['strike']} | IVxOI: {x['score']:.0f} | Vol: {x['vol']} | OI: {x['oi']}"
         for x in option_flow
     ]
-    results.append("🧾 *Top Options Activity (Top 2 Calls and Puts per Ticker):*\n" + "\n".join(detailed_lines))
+    results.append("🧾 *Top Weekly Options Activity (Top 2 Calls and Puts per Ticker):*\n" + "\n".join(detailed_lines))
 
     prompt = (
-        "You are a professional options trader. Analyze the following list of options contracts for unusual activity. "
-        "Identify top candidates for BUY or SELL, based on high IV×OI, strike positioning, and near expiration. "
-        "Format the response in simple, actionable bullet points for a trading alert. Include reasoning.\n\n"
-        + "\n".join([f"{x['symbol']} {x['side']} expiring on {x['expiry']} @ {x['strike']} → Buy/Sell. Reason: high IV×OI, etc." for x in option_flow])
+        "You are a professional options trader. Analyze the following list of weekly options contracts for unusual activity. "
+        "Identify top candidates for BUY or SELL, based on high IV×OI, IV percentile, ATM proximity, strike positioning, and near expiration. "
+        "Consider volume/open interest trends and breakout potential. Only include contracts with open interest ≥ 1000 and volume ≥ 500. "
+        "Prioritize ATM or slightly ITM contracts. Format the response as clear, actionable bullet points for a trading alert with reasoning.\n\n"
+        "Format example:\n"
+        "- [SYMBOL] [CALL/PUT] expiring on [DATE] @ [STRIKE] → Buy/Sell. Reason: [e.g., high IV, strong OI, ATM, breakout, volume spike]\n\n"
+        "Options Flow Data:\n"
+        + "\n".join([
+            f"{x['symbol']} {x['side'].upper()} expiring on {x['expiry']} @ {x['strike']} → Buy/Sell. Reason: IVxOI: {x['score']:.0f}, IV: {x['iv']}, Vol: {x['vol']}, OI: {x['oi']}, ATM: {x['atm']}"
+            for x in option_flow
+        ])
     )
 
     gpt_msg = await gpt_summary(prompt)
@@ -126,6 +170,7 @@ async def run_all_scans():
     await send_telegram(combined_message)
 
     return {"status": "complete", "summary": gpt_msg}
+
 
 @app.on_event("startup")
 async def start_background_loop():
