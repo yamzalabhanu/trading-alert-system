@@ -2,6 +2,7 @@ import os
 import httpx
 import asyncio
 import logging
+import re
 from datetime import datetime, time
 from typing import List
 from fastapi import FastAPI
@@ -35,12 +36,21 @@ logging.basicConfig(level=logging.INFO)
 BASE_HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
 # === Telegram ===
+def escape_markdown(text: str) -> str:
+    return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+
 async def send_telegram(message: str):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        if len(message) > 4000:
+            message = message[:3990] + "\n...truncated"
         try:
             async with httpx.AsyncClient() as client:
-                await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": escape_markdown(message),
+                    "parse_mode": "MarkdownV2"
+                })
         except Exception as e:
             logging.error(f"Telegram send error: {e}")
 
@@ -130,6 +140,8 @@ async def gpt_summary(prompt: str) -> str:
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post("https://api.openai.com/v1/chat/completions", headers=BASE_HEADERS, json=payload)
+            if res.status_code != 200:
+                logging.error(f"GPT API error {res.status_code}: {res.text}")
             data = res.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "GPT response incomplete.").strip()
     except Exception as e:
@@ -143,8 +155,9 @@ async def run_all_scans():
     results = [f"🕒 *Scan Time:* `{now}`\n"]
 
     tickers = [
-        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL"
-        
+        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR", "CRWV", "NVDA", "AMD",
+        "AVGO", "MSFT", "BABA", "UBER", "MSTR", "COIN", "HOOD", "CLSK", "MARA", "CORZ",
+        "IONQ", "SOUN", "RGTI", "QBTS", "UNH", "XYZ", "PYPL", "XOM", "CVX"
     ]
 
     results.append(f"📈 *Watchlist Symbols*: {', '.join(tickers)}")
