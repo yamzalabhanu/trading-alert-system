@@ -128,11 +128,15 @@ async def run_all_scans():
     now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     results = [f"🕒 *Scan Time:* `{now}`\n"]
 
-    gainers = await get_finnhub("/stock/symbol", {"exchange": "US"})
-    top_tickers = [s['symbol'] for s in gainers[:20]] if gainers else []
-    results.append(f"📈 *Active Symbols*: {', '.join(top_tickers)}")
+    tickers = [
+        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR", "CRWV", "NVDA", "AMD",
+        "AVGO", "MSFT", "BABA", "UBER", "MSTR", "COIN", "HOOD", "CLSK", "MARA", "CORZ",
+        "IONQ", "SOUN", "RGTI", "QBTS", "UNH", "XYZ", "PYPL", "XOM", "CVX"
+    ]
 
-    sentiment = await get_sentiment_analysis(top_tickers[:15])
+    results.append(f"📈 *Watchlist Symbols*: {', '.join(tickers)}")
+
+    sentiment = await get_sentiment_analysis(tickers)
     results.append(f"🐂 *Bullish*: {', '.join(sentiment['bullish'])}")
     results.append(f"🐻 *Bearish*: {', '.join(sentiment['bearish'])}")
 
@@ -141,12 +145,20 @@ async def run_all_scans():
 
     # === Polygon Options Flow ===
     option_flow = []
-    for symbol in top_tickers[:10]:
-        opt = await get_polygon("/v3/reference/options/contracts", {"underlying_ticker": symbol, "limit": 2})
+    unusual = []
+    for symbol in tickers:
+        opt = await get_polygon("/v3/reference/options/contracts", {"underlying_ticker": symbol, "limit": 30})
         for o in opt.get("results", []):
             option_flow.append(o.get("ticker"))
+            if o.get("implied_volatility", 0) and o.get("open_interest", 0):
+                score = o.get("implied_volatility") * o.get("open_interest")
+                if score > 5000:
+                    unusual.append(f"{o.get('ticker')} (IVxOI={score:.0f})")
+
     if option_flow:
         results.append("🧾 *Options Flow:* " + ', '.join(option_flow))
+    if unusual:
+        results.append("⚠️ *Unusual Activity:* " + ', '.join(unusual))
 
     summary_input = "\n".join(results)
     gpt_msg = await gpt_summary(f"Summarize today's market scan:\n{summary_input}")
