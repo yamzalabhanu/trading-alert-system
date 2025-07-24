@@ -180,6 +180,6 @@ async def start_background_loop():
             else:
                 logging.info(f"Outside market hours ({now.strftime('%H:%M:%S')} ET) — skipping scan.")
 
-            await asyncio.sleep(300)  # 5 minutes
+            await asyncio.sleep(30000)  # 5 minutes
 
     asyncio.create_task(loop())
