@@ -35,7 +35,6 @@ MIN_VOLUME = 500
 IV_PERCENTILE_THRESHOLD = 0.75
 ATM_PROXIMITY_PCT = 0.02  # Within 2% of price
 
-
 def escape_markdown(text: str) -> str:
     return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
@@ -91,7 +90,10 @@ async def run_all_scans():
     results = [f"🕒 *Scan Time:* `{now}`\n"]
 
     tickers = [
-        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR"
+        "AAPL", "TSLA", "AMZN", "GOOG", "META", "CRCL", "PLTR",
+        "CRWV", "NVDA", "AMD", "AVGO", "MSFT", "BABA", "UBER",
+        "MSTR", "COIN", "HOOD", "CLSK", "MARA", "CORZ",
+        "IONQ", "SOUN", "RGTI", "QBTS", "UNH", "XYZ", "PYPL", "XOM", "CVX"
     ]
 
     results.append(f"📈 *Watchlist Symbols*: {', '.join(tickers)}")
