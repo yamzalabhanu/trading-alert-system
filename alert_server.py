@@ -25,34 +25,55 @@ class Alert(BaseModel):
 async def handle_alert(alert: Alert):
     logging.info(f"Received alert: {alert.symbol} @ {alert.price}")
 
-    # Fetch real-time Polygon data
-    async with httpx.AsyncClient() as client:
-        snapshot_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{alert.symbol.upper()}?apiKey={POLYGON_API_KEY}"
-        snapshot = (await client.get(snapshot_url)).json()
+    try:
+        # === Get Polygon snapshot ===
+        async with httpx.AsyncClient() as client:
+            polygon_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{alert.symbol.upper()}?apiKey={POLYGON_API_KEY}"
+            snapshot_resp = await client.get(polygon_url)
+            if snapshot_resp.status_code != 200:
+                logging.warning(f"Polygon snapshot error: {snapshot_resp.status_code}")
+                snapshot_data = {"error": f"Polygon returned {snapshot_resp.status_code}"}
+            else:
+                snapshot_data = snapshot_resp.json()
 
-    # Compose GPT input
-    gpt_prompt = f"""
-    Evaluate the following signal for {alert.symbol}:
-    Signal: {alert.signal.upper()}
-    Price: {alert.price}
-    Current Snapshot: {snapshot}
-    Should the trade be taken? Respond with reason and confidence.
-    """
+        # === Compose OpenAI prompt ===
+        gpt_prompt = f"""
+Evaluate this trading signal:
+Symbol: {alert.symbol}
+Signal: {alert.signal.upper()}
+Triggered Price: {alert.price}
 
-    # OpenAI Evaluation
-    openai_url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    gpt_response = await client.post(openai_url, json={
-        "model": "gpt-4",
-        "messages": [{"role": "user", "content": gpt_prompt}],
-        "temperature": 0.3
-    }, headers=headers)
+Market Snapshot: {snapshot_data}
 
-    reply = gpt_response.json()["choices"][0]["message"]["content"]
+Respond with: 
+- Trade decision (Yes/No)
+- Confidence score (0–100)
+- 1-line reasoning
+        """
 
-    # Send to Telegram
-    tg_msg = f"📈 {alert.signal.upper()} Alert: {alert.symbol} @ ${alert.price:.2f}\n\nGPT Review:\n{reply}"
-    tg_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    await client.post(tg_url, json={"chat_id": TELEGRAM_CHAT_ID, "text": tg_msg})
+        # === Call OpenAI GPT ===
+        async with httpx.AsyncClient() as client:
+            gpt_resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": gpt_prompt}],
+                    "temperature": 0.3
+                }
+            )
+            gpt_reply = gpt_resp.json()["choices"][0]["message"]["content"]
 
-    return {"status": "ok", "review": reply}
+        # === Send to Telegram ===
+        tg_msg = f"📈 *{alert.signal.upper()} ALERT* for `{alert.symbol}` @ `${alert.price}`\n\n📊 GPT Review:\n{gpt_reply}"
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": tg_msg, "parse_mode": "Markdown"}
+            )
+
+        return {"status": "ok", "gpt_review": gpt_reply}
+
+    except Exception as e:
+        logging.exception("Webhook processing failed")
+        raise HTTPException(status_code=500, detail=str(e))
