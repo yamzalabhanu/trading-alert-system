@@ -2,7 +2,7 @@
 import os
 import httpx
 import logging
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -26,15 +26,20 @@ async def handle_alert(alert: Alert):
     logging.info(f"Received alert: {alert.symbol} @ {alert.price}")
 
     try:
-        # === Get Polygon snapshot ===
+        # === Get Polygon Last Price Snapshot ===
         async with httpx.AsyncClient() as client:
-            polygon_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{alert.symbol.upper()}?apiKey={POLYGON_API_KEY}"
-            snapshot_resp = await client.get(polygon_url)
-            if snapshot_resp.status_code != 200:
-                logging.warning(f"Polygon snapshot error: {snapshot_resp.status_code}")
-                snapshot_data = {"error": f"Polygon returned {snapshot_resp.status_code}"}
+            polygon_url = f"https://api.polygon.io/v1/last/stocks/{alert.symbol.upper()}?apiKey={POLYGON_API_KEY}"
+            polygon_resp = await client.get(polygon_url)
+
+            if polygon_resp.status_code != 200:
+                logging.warning(f"Polygon last trade error: {polygon_resp.status_code}")
+                snapshot_data = {"error": f"Polygon returned {polygon_resp.status_code}"}
             else:
-                snapshot_data = snapshot_resp.json()
+                last_data = polygon_resp.json()
+                snapshot_data = {
+                    "last_price": last_data.get("last", {}).get("price"),
+                    "symbol": last_data.get("symbol")
+                }
 
         # === Compose OpenAI prompt ===
         gpt_prompt = f"""
@@ -43,9 +48,11 @@ Symbol: {alert.symbol}
 Signal: {alert.signal.upper()}
 Triggered Price: {alert.price}
 
-Market Snapshot: {snapshot_data}
+Market Snapshot:
+- Last Trade Price: {snapshot_data.get("last_price")}
+- Symbol: {snapshot_data.get("symbol")}
 
-Respond with: 
+Respond with:
 - Trade decision (Yes/No)
 - Confidence score (0–100)
 - 1-line reasoning
