@@ -1,7 +1,18 @@
 # main.py
 import os
-import httpx
 import logging
+
+try:
+    import ssl
+except ImportError:
+    ssl = None
+    logging.warning("SSL module is not available. Secure HTTPS requests may fail.")
+
+try:
+    import httpx
+except ImportError as e:
+    raise ImportError("httpx module is required but could not be loaded. Check if ssl support is available.") from e
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -21,36 +32,57 @@ class Alert(BaseModel):
     price: float
     signal: str
 
+async def get_polygon_data(symbol: str):
+    base = f"https://api.polygon.io"
+    headers = {"Authorization": f"Bearer {POLYGON_API_KEY}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            options_url = f"{base}/v3/universal/snapshot/options/{symbol.upper()}"
+            options_resp = await client.get(options_url, headers=headers)
+            options_data = options_resp.json() if options_resp.status_code == 200 else {}
+
+            ema_url = f"{base}/v1/indicators/ema/{symbol.upper()}?timespan=minute&window=14&adjusted=true&series_type=close&apiKey={POLYGON_API_KEY}"
+            ema_resp = await client.get(ema_url)
+            ema_data = ema_resp.json() if ema_resp.status_code == 200 else {}
+
+            rsi_url = f"{base}/v1/indicators/rsi/{symbol.upper()}?timespan=minute&window=14&adjusted=true&series_type=close&apiKey={POLYGON_API_KEY}"
+            rsi_resp = await client.get(rsi_url)
+            rsi_data = rsi_resp.json() if rsi_resp.status_code == 200 else {}
+
+            macd_url = f"{base}/v1/indicators/macd/{symbol.upper()}?timespan=minute&adjusted=true&series_type=close&apiKey={POLYGON_API_KEY}"
+            macd_resp = await client.get(macd_url)
+            macd_data = macd_resp.json() if macd_resp.status_code == 200 else {}
+    except Exception as e:
+        logging.warning(f"Polygon fetch failed: {e}")
+        return {"options": {}, "ema": {}, "rsi": {}, "macd": {}}
+
+    return {
+        "options": options_data,
+        "ema": ema_data,
+        "rsi": rsi_data,
+        "macd": macd_data
+    }
+
 @app.post("/webhook")
 async def handle_alert(alert: Alert):
     logging.info(f"Received alert: {alert.symbol} @ {alert.price}")
 
     try:
-        # === Get Polygon Last Price Snapshot ===
-        async with httpx.AsyncClient() as client:
-            polygon_url = f"https://api.polygon.io/v1/last/stocks/{alert.symbol.upper()}?apiKey={POLYGON_API_KEY}"
-            polygon_resp = await client.get(polygon_url)
+        polygon_data = await get_polygon_data(alert.symbol)
 
-            if polygon_resp.status_code != 200:
-                logging.warning(f"Polygon last trade error: {polygon_resp.status_code}")
-                snapshot_data = {"error": f"Polygon returned {polygon_resp.status_code}"}
-            else:
-                last_data = polygon_resp.json()
-                snapshot_data = {
-                    "last_price": last_data.get("last", {}).get("price"),
-                    "symbol": last_data.get("symbol")
-                }
-
-        # === Compose OpenAI prompt ===
         gpt_prompt = f"""
 Evaluate this trading signal:
 Symbol: {alert.symbol}
 Signal: {alert.signal.upper()}
 Triggered Price: {alert.price}
 
-Market Snapshot:
-- Last Trade Price: {snapshot_data.get("last_price")}
-- Symbol: {snapshot_data.get("symbol")}
+Options Flow Snapshot:
+{polygon_data['options']}
+
+Technical Indicators:
+EMA: {polygon_data['ema']}
+RSI: {polygon_data['rsi']}
+MACD: {polygon_data['macd']}
 
 Respond with:
 - Trade decision (Yes/No)
@@ -58,7 +90,6 @@ Respond with:
 - 1-line reasoning
         """
 
-        # === Call OpenAI GPT ===
         async with httpx.AsyncClient() as client:
             gpt_resp = await client.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -71,7 +102,6 @@ Respond with:
             )
             gpt_reply = gpt_resp.json()["choices"][0]["message"]["content"]
 
-        # === Send to Telegram ===
         tg_msg = f"📈 *{alert.signal.upper()} ALERT* for `{alert.symbol}` @ `${alert.price}`\n\n📊 GPT Review:\n{gpt_reply}"
         async with httpx.AsyncClient() as client:
             await client.post(
