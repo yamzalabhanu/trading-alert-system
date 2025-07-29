@@ -145,6 +145,81 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
         logging.warning(f"Failed to fetch option Greeks: {e}")
         return {}
 
+# === Webhook Endpoint ===
+
+@app.post("/webhook")
+async def handle_alert(alert: Alert):
+    logging.info(f"Received alert: {alert.symbol} @ {alert.price}")
+
+    if is_in_cooldown(alert.symbol, alert.signal):
+        logging.info(f"⏱️ Cooldown active for {alert.symbol} - {alert.signal}")
+        return {"status": "cooldown"}
+
+    try:
+        await validate_symbol_and_market(alert.symbol, allow_closed=True)
+        polygon_data = await get_polygon_data(alert.symbol)
+        greeks = await get_option_greeks(alert.symbol)
+
+        gpt_prompt = f"""
+Evaluate this intraday options signal:
+Symbol: {alert.symbol}
+Signal: {alert.signal.upper()}
+Triggered Price: {alert.price}
+
+Unusual Options Flow:
+{polygon_data['unusual']}
+
+Technical Indicators:
+EMA: {polygon_data['ema']}
+RSI: {polygon_data['rsi']}
+MACD: {polygon_data['macd']}
+
+Option Greeks:
+Delta: {greeks.get('delta')}
+Gamma: {greeks.get('gamma')}
+Theta: {greeks.get('theta')}
+IV: {greeks.get('iv')}
+
+Respond with:
+- Trade decision (Yes/No)
+- Confidence score (0–100)
+- Brief reasoning (1 sentence)
+"""
+
+        async with httpx.AsyncClient() as client:
+            gpt_resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": gpt_prompt}],
+                    "temperature": 0.3
+                }
+            )
+            gpt_reply = gpt_resp.json()["choices"][0]["message"]["content"]
+
+        gpt_decision = "unknown"
+        if "yes" in gpt_reply.lower():
+            gpt_decision = "buy"
+        elif "no" in gpt_reply.lower():
+            gpt_decision = "skip"
+
+        tg_msg = ("📈 *{} ALERT* for `{}` @ `${}`\n\n📊 GPT Review:\n{}"
+                  .format(alert.signal.upper(), alert.symbol, alert.price, gpt_reply))
+        await httpx.AsyncClient().post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": tg_msg, "parse_mode": "Markdown"}
+        )
+
+        update_cooldown(alert.symbol, alert.signal)
+        log_signal(alert.symbol, alert.signal, gpt_decision)
+
+        return {"status": "ok", "gpt_review": gpt_reply}
+
+    except Exception as e:
+        logging.exception("Webhook processing failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # === Background Cron & Summary ===
 
 async def schedule_daily_summary():
