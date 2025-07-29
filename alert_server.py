@@ -266,7 +266,7 @@ async def startup_event():
     loop.create_task(schedule_daily_summary())
 
 async def scan_unusual_activity():
-    symbols_to_check = ["AAPL", "TSLA", "AMD", "MSFT", "NVDA"]
+    symbols_to_check = ["AAPL", "TSLA", "AMD", "MSFT", "NVDA", "GOOG", "PLTR", "CRCL", "CRWV", "AMZN", "HOOD", "IONQ", "OKLA", "COIN", "MSTR", "UNH", "PDD", "BABA", "XOM", "CVX"]
     logging.info("📡 Simulating unusual activity based on volume and OI spikes...")
     
     while True:
