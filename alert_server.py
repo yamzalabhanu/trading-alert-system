@@ -191,20 +191,28 @@ async def startup_event():
     loop.create_task(schedule_daily_summary())
 
 async def scan_unusual_activity():
-    url = f"https://api.polygon.io/v3/unusual_options_activity?apiKey={POLYGON_API_KEY}"
+    symbols_to_check = ["AAPL", "TSLA", "AMD", "MSFT", "NVDA"]
+    logging.info("📡 Simulating unusual activity based on volume and OI spikes...")
+    
     while True:
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(url)
-                data = {}
-                try:
-                    data = resp.json()
-                except Exception as parse_error:
-                    logging.warning(f"Unusual response not JSON: {parse_error}")
-                for item in data.get("results", [])[:5]:
-                    symbol = item.get("underlying_ticker") or item.get("ticker")
-                    if symbol:
-                        await client.post("http://localhost:8000/webhook", json={"symbol": symbol, "price": 0, "signal": "flow", "allow_closed": True})
+                for symbol in symbols_to_check:
+                    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}?apiKey={POLYGON_API_KEY}"
+                    try:
+                        resp = await client.get(url)
+                        data = resp.json().get("results", [])
+                        high_volume_contracts = [opt for opt in data if opt.get("volume", 0) > 500 and opt.get("open_interest", 0) > 1000]
+
+                        if high_volume_contracts:
+                            logging.info(f"🔥 Unusual contracts found for {symbol}: {len(high_volume_contracts)}")
+                            await client.post(
+                                "http://localhost:8000/webhook",
+                                json={"symbol": symbol, "price": 0, "signal": "flow", "allow_closed": True}
+                            )
+                    except Exception as e:
+                        logging.warning(f"Error checking {symbol}: {e}")
         except Exception as e:
             logging.warning(f"Unusual scan error: {e}")
+
         await asyncio.sleep(300)
