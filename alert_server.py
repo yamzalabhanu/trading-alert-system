@@ -146,6 +146,50 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
         return {}
 
 # === Background Cron & Summary ===
+
+async def schedule_daily_summary():
+    while True:
+        now = datetime.now(ZoneInfo("America/New_York"))
+        if now.hour == 16 and now.minute == 15:
+            await send_daily_summary()
+            await asyncio.sleep(60)
+        await asyncio.sleep(30)
+
+async def send_daily_summary():
+    try:
+        now = datetime.now(ZoneInfo("America/New_York"))
+        summary = f"📊 *Daily Summary Report* ({now.strftime('%Y-%m-%d')}):
+
+"
+
+        if not signal_log:
+            summary += "_No trading signals today._"
+        else:
+            counter = Counter((log["symbol"], log["signal"]) for log in signal_log)
+            gpt_counter = defaultdict(int)
+            for log in signal_log:
+                gpt_counter[log["gpt"].lower()] += 1
+
+            summary += "🔝 *Top Symbols:*
+"
+            for (sym, sig), count in counter.most_common(5):
+                summary += f"- `{sym}` ({sig.upper()}): {count} signals
+"
+
+            summary += "
+🧠 *GPT Decisions:*
+"
+            for decision, count in gpt_counter.items():
+                summary += f"- {decision.title()}: {count}
+"
+
+        await httpx.AsyncClient().post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": summary, "parse_mode": "Markdown"}
+        )
+        signal_log.clear()
+    except Exception as e:
+        logging.warning(f"Daily summary failed: {e}")
 @app.on_event("startup")
 async def startup_event():
     loop = asyncio.get_event_loop()
