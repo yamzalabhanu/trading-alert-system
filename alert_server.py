@@ -7,12 +7,7 @@ from typing import List, Dict
 import pandas as pd
 from fastapi import FastAPI
 from dotenv import load_dotenv
-import openai
-
-try:
-    import httpx
-except ImportError:
-    raise ImportError("httpx is required but could not be imported. Ensure the 'ssl' module is available in your Python environment.")
+import httpx
 
 # === Load Env ===
 load_dotenv()
@@ -24,27 +19,38 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # === App Setup ===
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # === Predefined Tickers ===
 TICKERS = ["AAPL", "TSLA", "AMD", "NVDA", "MSFT"]
 
-# === Fetch from Polygon ===
+# === Fetch from Polygon (mock unusual activity using options snapshot filter) ===
 async def fetch_unusual_activity(symbol: str) -> pd.DataFrame:
-    url = f"https://api.polygon.io/v3/unusual_options_activity/stocks/{symbol}?apiKey={POLYGON_API_KEY}"
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
-        if response.status_code != 200:
-            logging.warning(f"Failed to fetch unusual activity for {symbol}: {response.text}")
-            return pd.DataFrame()
-        data = response.json().get("results", [])
-        return pd.DataFrame(data)
+    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}?apiKey={POLYGON_API_KEY}"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json().get("results", {}).get("options", [])
+            df = pd.DataFrame(data)
+            if df.empty:
+                return df
+
+            # Filter: high volume and open interest (mocking 'unusual')
+            df = df[df.get("volume", 0) > 500]
+            df = df[df.get("open_interest", 0) > 1000]
+            return df.sort_values(by=["volume"], ascending=False).head(10)
+    except httpx.HTTPError as e:
+        logging.warning(f"HTTP error fetching {symbol}: {str(e)}")
+        return pd.DataFrame()
+    except Exception as e:
+        logging.error(f"Unexpected error fetching {symbol}: {str(e)}")
+        return pd.DataFrame()
 
 # === Prompt Formatter ===
 def format_prompt(data: Dict[str, pd.DataFrame]) -> str:
     prompt = """
 You are an expert options trader.
-Based on the following unusual options activity data, suggest 3–5 high-conviction call/put trades for intraday or swing setups.
+Based on the following options activity data, suggest 3–5 high-conviction call/put trades for intraday or swing setups.
 Respond in this format:
 - Ticker
 - Trade type (Call/Put)
@@ -56,22 +62,31 @@ Respond in this format:
     for symbol, df in data.items():
         if df.empty:
             continue
-        prompt += f"\n--- {symbol} Unusual Activity ---\n"
-        prompt += df.head(10).to_string(index=False) + "\n"
+        prompt += f"\n--- {symbol} Snapshot Options ---\n"
+        prompt += df.to_string(index=False) + "\n"
     return prompt.strip()
 
-# === GPT Analysis ===
+# === GPT Analysis (mocked if openai is unavailable) ===
 async def ask_openai(prompt: str) -> str:
-    response = await openai_client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You're a professional options trader."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=1000,
-        temperature=0.5
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        import openai
+        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = await openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You're a professional options trader."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.5
+        )
+        return response.choices[0].message.content.strip()
+    except ModuleNotFoundError:
+        logging.error("OpenAI module not installed. Returning mock summary.")
+        return "Mock GPT response: Based on the data, consider bullish trades on high-volume, high-OI tickers."
+    except Exception as e:
+        logging.error(f"OpenAI request failed: {str(e)}")
+        return "OpenAI API failed to return a response."
 
 # === Telegram Alert ===
 async def send_to_telegram(message: str):
@@ -81,8 +96,11 @@ async def send_to_telegram(message: str):
         "text": message[:4096],
         "parse_mode": "Markdown"
     }
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(url, json=payload)
+    except Exception as e:
+        logging.error(f"Telegram message failed: {str(e)}")
 
 # === Route ===
 @app.get("/scan")
