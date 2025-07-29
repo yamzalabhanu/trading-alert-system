@@ -30,8 +30,9 @@ async def fetch_unusual_activity(symbol: str) -> pd.DataFrame:
         async with httpx.AsyncClient() as client:
             response = await client.get(url)
             response.raise_for_status()
-            data = response.json().get("results", {}).get("options", [])
-            df = pd.DataFrame(data)
+            data = response.json()
+            options = data.get("results", {}).get("options", data if isinstance(data, dict) else data)
+            df = pd.DataFrame(options)
             if df.empty:
                 return df
 
@@ -112,5 +113,6 @@ async def scan_and_alert():
 
     prompt = format_prompt(results)
     summary = await ask_openai(prompt)
-    await send_to_telegram(f"\ud83d\udcca *Options Trade Ideas*\n\n{summary}")
+    formatted_summary = f"\U0001F4CA *Options Trade Ideas*\n\n{summary.encode('utf-8', 'replace').decode('utf-8')}"
+    await send_to_telegram(formatted_summary)
     return {"status": "sent", "tickers_scanned": TICKERS}
