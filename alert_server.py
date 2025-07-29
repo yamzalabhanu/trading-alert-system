@@ -158,9 +158,7 @@ async def schedule_daily_summary():
 async def send_daily_summary():
     try:
         now = datetime.now(ZoneInfo("America/New_York"))
-        summary = f"📊 *Daily Summary Report* ({now.strftime('%Y-%m-%d')}):
-
-"
+        summary = f"📊 *Daily Summary Report* ({now.strftime('%Y-%m-%d')}):\n\n"
 
         if not signal_log:
             summary += "_No trading signals today._"
@@ -170,18 +168,13 @@ async def send_daily_summary():
             for log in signal_log:
                 gpt_counter[log["gpt"].lower()] += 1
 
-            summary += "🔝 *Top Symbols:*
-"
+            summary += "🔝 *Top Symbols:*\n"
             for (sym, sig), count in counter.most_common(5):
-                summary += f"- `{sym}` ({sig.upper()}): {count} signals
-"
+                summary += f"- `{sym}` ({sig.upper()}): {count} signals\n"
 
-            summary += "
-🧠 *GPT Decisions:*
-"
+            summary += "\n🧠 *GPT Decisions:*\n"
             for decision, count in gpt_counter.items():
-                summary += f"- {decision.title()}: {count}
-"
+                summary += f"- {decision.title()}: {count}\n"
 
         await httpx.AsyncClient().post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -190,6 +183,7 @@ async def send_daily_summary():
         signal_log.clear()
     except Exception as e:
         logging.warning(f"Daily summary failed: {e}")
+
 @app.on_event("startup")
 async def startup_event():
     loop = asyncio.get_event_loop()
