@@ -61,7 +61,7 @@ def log_signal(symbol: str, signal: str, gpt_decision: str):
     })
 
 # === Validation ===
-async def validate_symbol_and_market(symbol: str):
+async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
     async with httpx.AsyncClient() as client:
         ref_url = f"https://api.polygon.io/v3/reference/tickers/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
         ref_resp = await client.get(ref_url)
@@ -70,7 +70,7 @@ async def validate_symbol_and_market(symbol: str):
 
         status_url = f"https://api.polygon.io/v1/marketstatus/now?apiKey={POLYGON_API_KEY}"
         status_resp = await client.get(status_url)
-        if status_resp.status_code != 200 or not status_resp.json().get("market", "").lower() == "open":
+        if not allow_closed and (status_resp.status_code != 200 or not status_resp.json().get("market", "").lower() == "open"):
             raise HTTPException(status_code=403, detail="Market is closed")
 
 # === Polygon Data Fetch ===
@@ -145,75 +145,6 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
         logging.warning(f"Failed to fetch option Greeks: {e}")
         return {}
 
-# === Webhook ===
-@app.post("/webhook")
-async def handle_alert(alert: Alert):
-    logging.info(f"Received alert: {alert.symbol} @ {alert.price}")
-
-    if is_in_cooldown(alert.symbol, alert.signal):
-        logging.info(f"⏱️ Cooldown active for {alert.symbol} - {alert.signal}")
-        return {"status": "cooldown"}
-
-    try:
-        await validate_symbol_and_market(alert.symbol)
-        polygon_data = await get_polygon_data(alert.symbol)
-        greeks = await get_option_greeks(alert.symbol)
-
-        gpt_prompt = f"""
-Evaluate this intraday options signal:
-Symbol: {alert.symbol}
-Signal: {alert.signal.upper()}
-Triggered Price: {alert.price}
-
-Unusual Options Flow:
-{polygon_data['unusual']}
-
-Technical Indicators:
-EMA: {polygon_data['ema']}
-RSI: {polygon_data['rsi']}
-MACD: {polygon_data['macd']}
-
-Option Greeks:
-Delta: {greeks.get('delta')}
-Gamma: {greeks.get('gamma')}
-Theta: {greeks.get('theta')}
-IV: {greeks.get('iv')}
-
-Respond with:
-- Trade decision (Yes/No)
-- Confidence score (0–100)
-- Brief reasoning (1 sentence)
-"""
-
-        async with httpx.AsyncClient() as client:
-            gpt_resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "gpt-4", "messages": [{"role": "user", "content": gpt_prompt}], "temperature": 0.3}
-            )
-            gpt_reply = gpt_resp.json()["choices"][0]["message"]["content"]
-
-        gpt_decision = "unknown"
-        if "yes" in gpt_reply.lower():
-            gpt_decision = "buy"
-        elif "no" in gpt_reply.lower():
-            gpt_decision = "skip"
-
-        tg_msg = f"📈 *{alert.signal.upper()} ALERT* for `{alert.symbol}` @ `${alert.price}`\n\n📊 GPT Review:\n{gpt_reply}"
-        await httpx.AsyncClient().post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": tg_msg, "parse_mode": "Markdown"}
-        )
-
-        update_cooldown(alert.symbol, alert.signal)
-        log_signal(alert.symbol, alert.signal, gpt_decision)
-
-        return {"status": "ok", "gpt_review": gpt_reply}
-
-    except Exception as e:
-        logging.exception("Webhook processing failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
 # === Background Cron & Summary ===
 @app.on_event("startup")
 async def startup_event():
@@ -222,52 +153,20 @@ async def startup_event():
     loop.create_task(schedule_daily_summary())
 
 async def scan_unusual_activity():
-    url = f"https://api.polygon.io/v3/unusual_activity/stocks?apiKey={POLYGON_API_KEY}"
+    url = f"https://api.polygon.io/v3/unusual_options_activity?apiKey={POLYGON_API_KEY}"
     while True:
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url)
-                for item in resp.json().get("results", [])[:5]:
-                    symbol = item.get("ticker")
+                data = {}
+                try:
+                    data = resp.json()
+                except Exception as parse_error:
+                    logging.warning(f"Unusual response not JSON: {parse_error}")
+                for item in data.get("results", [])[:5]:
+                    symbol = item.get("underlying_ticker") or item.get("ticker")
                     if symbol:
-                        await client.post("http://localhost:8000/webhook", json={"symbol": symbol, "price": 0, "signal": "flow"})
+                        await client.post("http://localhost:8000/webhook", json={"symbol": symbol, "price": 0, "signal": "flow", "allow_closed": True})
         except Exception as e:
             logging.warning(f"Unusual scan error: {e}")
         await asyncio.sleep(300)
-
-async def schedule_daily_summary():
-    while True:
-        now = datetime.now(ZoneInfo("America/New_York"))
-        if now.hour == 16 and now.minute == 15:
-            await send_daily_summary()
-            await asyncio.sleep(60)
-        await asyncio.sleep(30)
-
-async def send_daily_summary():
-    try:
-        now = datetime.now(ZoneInfo("America/New_York"))
-        summary = f"📊 *Daily Summary Report* ({now.strftime('%Y-%m-%d')}):\n\n"
-
-        if not signal_log:
-            summary += "_No trading signals today._"
-        else:
-            counter = Counter((log["symbol"], log["signal"]) for log in signal_log)
-            gpt_counter = defaultdict(int)
-            for log in signal_log:
-                gpt_counter[log["gpt"].lower()] += 1
-
-            summary += "🔝 *Top Symbols:*\n"
-            for (sym, sig), count in counter.most_common(5):
-                summary += f"- `{sym}` ({sig.upper()}): {count} signals\n"
-
-            summary += "\n🧠 *GPT Decisions:*\n"
-            for decision, count in gpt_counter.items():
-                summary += f"- {decision.title()}: {count}\n"
-
-        await httpx.AsyncClient().post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": summary, "parse_mode": "Markdown"}
-        )
-        signal_log.clear()
-    except Exception as e:
-        logging.warning(f"Daily summary failed: {e}")
