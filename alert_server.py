@@ -2,7 +2,7 @@
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 from collections import Counter, defaultdict
 import asyncio
 
@@ -61,6 +61,46 @@ def log_signal(symbol: str, signal: str, gpt_decision: str):
     })
 
 # === Validation ===
+
+# 🔼 Trendline Breakout Detection (Linear Regression)
+from numpy.polynomial.polynomial import Polynomial
+import numpy as np
+
+async def detect_trendline_breakout(symbol: str, price: float) -> str:
+    try:
+        end = datetime.utcnow().date()
+        start = end - timedelta(days=10)
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/5/minute/{start}/{end}?adjusted=true&sort=asc&apiKey={POLYGON_API_KEY}"
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url)
+            data = resp.json().get("results", [])[-50:]  # Last 50 points
+
+        if len(data) < 20:
+            return "insufficient data"
+
+        closes = np.array([bar["c"] for bar in data])
+        x = np.arange(len(closes))
+
+        # Fit linear trendline (degree=1)
+        p = Polynomial.fit(x, closes, 1)
+        trend = p(x)
+
+        # Check if the latest price is a breakout (above trend + std)
+        std_dev = np.std(closes - trend)
+        latest = closes[-1]
+        upper = trend[-1] + std_dev
+        lower = trend[-1] - std_dev
+
+        if latest > upper:
+            return "breakout"
+        elif latest < lower:
+            return "breakdown"
+        else:
+            return "neutral"
+    except Exception as e:
+        logging.warning(f"Trendline breakout detection failed: {e}")
+        return "error"
 async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
     async with httpx.AsyncClient() as client:
         ref_url = f"https://api.polygon.io/v3/reference/tickers/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
@@ -73,77 +113,55 @@ async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
         if not allow_closed and (status_resp.status_code != 200 or not status_resp.json().get("market", "").lower() == "open"):
             raise HTTPException(status_code=403, detail="Market is closed")
 
-# === Polygon Data Fetch ===
-async def get_polygon_data(symbol: str) -> Dict[str, Any]:
-    symbol = symbol.upper()
-    if symbol in cache:
-        logging.info(f"[CACHE HIT] {symbol}")
-        return cache[symbol]
-
-    base = "https://api.polygon.io"
-    headers = {"Authorization": f"Bearer {POLYGON_API_KEY}"}
-
-    try:
-        async with httpx.AsyncClient() as client:
-            unusual_url = f"{base}/v3/unusual_activity/stocks/{symbol}"
-            ema_url = f"{base}/v1/indicators/ema/{symbol}?timespan=minute&window=14&adjusted=true&series_type=close&apiKey={POLYGON_API_KEY}"
-            rsi_url = f"{base}/v1/indicators/rsi/{symbol}?timespan=minute&window=14&adjusted=true&series_type=close&apiKey={POLYGON_API_KEY}"
-            macd_url = f"{base}/v1/indicators/macd/{symbol}?timespan=minute&adjusted=true&series_type=close&apiKey={POLYGON_API_KEY}"
-
-            r = await client.get(unusual_url, headers=headers)
-            unusual = r.json() if r.status_code == 200 else {}
-
-            r = await client.get(ema_url)
-            ema = r.json() if r.status_code == 200 else {}
-
-            r = await client.get(rsi_url)
-            rsi = r.json() if r.status_code == 200 else {}
-
-            r = await client.get(macd_url)
-            macd = r.json() if r.status_code == 200 else {}
-
-        result = {"unusual": unusual, "ema": ema, "rsi": rsi, "macd": macd}
-        cache[symbol] = result
-        return result
-
-    except Exception as e:
-        logging.warning(f"Polygon fetch failed: {e}")
-        return {"unusual": {}, "ema": {}, "rsi": {}, "macd": {}}
-
-# === Option Greeks ===
-async def get_option_greeks(symbol: str) -> Dict[str, Any]:
+# === Fetch Full Options Chain ===
+async def fetch_filtered_options(symbol: str, current_price: float) -> List[Dict[str, Any]]:
     url = f"https://api.polygon.io/v3/snapshot/options/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url)
-            data = resp.json().get("results", [])
+            options = resp.json().get("results", [])
 
-        nearest = None
-        current_price = None
+        this_week = datetime.utcnow().isocalendar().week
+        next_week = this_week + 1
+        current_year = datetime.utcnow().year
 
-        for option in data:
-            if option.get("details", {}).get("contract_type") != "call":
+        filtered = []
+        for opt in options:
+            details = opt.get("details", {})
+            contract_type = details.get("contract_type")
+            expiry_date = details.get("expiration_date")
+            strike = details.get("strike_price")
+
+            if not expiry_date or not strike:
                 continue
-            if not current_price:
-                current_price = option.get("underlying_asset", {}).get("last", {}).get("price", 0)
-            strike = option.get("details", {}).get("strike_price", 0)
-            if current_price and abs(strike - current_price) < abs((nearest or {}).get("details", {}).get("strike_price", 0) - current_price):
-                nearest = option
 
-        if not nearest:
-            return {}
+            expiry_week = datetime.fromisoformat(expiry_date).isocalendar().week
+            expiry_year = datetime.fromisoformat(expiry_date).year
 
-        greeks = nearest.get("greeks", {})
-        iv = nearest.get("implied_volatility", {}).get("midpoint", None)
-        return {
-            "delta": greeks.get("delta"),
-            "gamma": greeks.get("gamma"),
-            "theta": greeks.get("theta"),
-            "iv": iv,
-        }
+            if expiry_year != current_year or expiry_week not in (this_week, next_week):
+                continue
+
+            if contract_type == "call" and strike >= current_price * 1.05:
+                opt["bid"] = opt.get("last_quote", {}).get("bid")
+                opt["ask"] = opt.get("last_quote", {}).get("ask")
+                opt["oi"] = opt.get("open_interest")
+                opt["volume"] = opt.get("volume")
+                opt["delta"] = opt.get("greeks", {}).get("delta")
+                if opt["volume"] and opt["volume"] >= 100 and opt["oi"] and opt["oi"] >= 500 and opt["delta"] and 0.4 <= abs(opt["delta"]) <= 0.8:
+                    filtered.append(opt)
+            elif contract_type == "put" and strike <= current_price * 0.95:
+                opt["bid"] = opt.get("last_quote", {}).get("bid")
+                opt["ask"] = opt.get("last_quote", {}).get("ask")
+                opt["oi"] = opt.get("open_interest")
+                opt["volume"] = opt.get("volume")
+                opt["delta"] = opt.get("greeks", {}).get("delta")
+                if opt["volume"] and opt["volume"] >= 100 and opt["oi"] and opt["oi"] >= 500 and opt["delta"] and abs(opt["delta"]) >= 0.7:
+                    filtered.append(opt)
+
+        return filtered
     except Exception as e:
-        logging.warning(f"Failed to fetch option Greeks: {e}")
-        return {}
+        logging.warning(f"Failed to fetch full options chain: {e}")
+        return []
 
 # === Webhook Endpoint ===
 
@@ -158,13 +176,18 @@ async def handle_alert(alert: Alert):
     try:
         await validate_symbol_and_market(alert.symbol, allow_closed=True)
         polygon_data = await get_polygon_data(alert.symbol)
+        trend_status = await detect_trendline_breakout(alert.symbol, alert.price)
         greeks = await get_option_greeks(alert.symbol)
+        enriched_options = await fetch_filtered_options(alert.symbol, alert.price)
 
         gpt_prompt = f"""
 Evaluate this intraday options signal:
 Symbol: {alert.symbol}
-Signal: {alert.signal.upper()}
+Signal: {alert.signal.upper()} ({trend_status})
 Triggered Price: {alert.price}
+
+Filtered Option Contracts (ATM calls > 5% strike, ITM puts < 95%):
+{enriched_options}
 
 Unusual Options Flow:
 {polygon_data['unusual']}
@@ -184,6 +207,7 @@ Respond with:
 - Trade decision (Yes/No)
 - Confidence score (0–100)
 - Brief reasoning (1 sentence)
+- If Yes, suggest top 1–2 contracts (strike, expiry, volume, delta, bid/ask)
 """
 
         async with httpx.AsyncClient() as client:
@@ -213,6 +237,7 @@ Respond with:
 
         update_cooldown(alert.symbol, alert.signal)
         log_signal(alert.symbol, alert.signal, gpt_decision)
+        await track_backtest_outcome(alert.symbol, alert.price, datetime.utcnow(), gpt_decision)
 
         return {"status": "ok", "gpt_review": gpt_reply}
 
@@ -221,6 +246,54 @@ Respond with:
         raise HTTPException(status_code=500, detail=str(e))
 
 # === Background Cron & Summary ===
+
+# 🔍 Real-time Unusual Options Activity Scanner
+async def scan_unusual_activity():
+    watchlist = ["AAPL", "TSLA", "AMD", "MSFT", "NVDA", "GOOG", "PLTR", "CRCL", "CRWV", "AMZN", "HOOD", "IONQ", "OKLO", "COIN", "MSTR", "UNH", "PDD", "BABA", "XOM", "CVX"]
+    while True:
+        try:
+            now = datetime.now(ZoneInfo("America/New_York"))
+            if now.hour < 9 or (now.hour == 9 and now.minute < 30) or now.hour >= 16:
+                await asyncio.sleep(60)
+                continue
+
+            async with httpx.AsyncClient() as client:
+                for symbol in watchlist:
+                    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}?apiKey={POLYGON_API_KEY}"
+                    r = await client.get(url)
+                    data = r.json().get("results", [])
+                    spikes = [opt for opt in data if opt.get("volume", 0) > 5000 and opt.get("open_interest", 0) > 5000]
+                    if spikes:
+                        logging.info(f"Unusual option volume detected for {symbol} ({len(spikes)} contracts)")
+                        await handle_alert(Alert(symbol=symbol, price=0, signal="flow"))
+        except Exception as e:
+            logging.warning(f"Unusual activity scan error: {e}")
+        await asyncio.sleep(300)
+
+# 📉 Backtesting Tracker
+backtest_log: List[Dict[str, Any]] = []
+
+async def track_backtest_outcome(symbol: str, entry_price: float, signal_time: datetime, decision: str):
+    try:
+        async with httpx.AsyncClient() as client:
+            end_time = signal_time + timedelta(days=1)
+            date_str = signal_time.strftime("%Y-%m-%d")
+            url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/5/minute/{date_str}/{date_str}?apiKey={POLYGON_API_KEY}"
+            r = await client.get(url)
+            data = r.json().get("results", [])
+            next_open = next((bar["o"] for bar in data if bar["t"] > signal_time.timestamp() * 1000), None)
+
+        pnl = round(((next_open - entry_price) / entry_price) * 100, 2) if next_open else None
+        backtest_log.append({
+            "symbol": symbol,
+            "decision": decision,
+            "entry": entry_price,
+            "exit": next_open,
+            "pnl%": pnl,
+            "timestamp": signal_time.isoformat()
+        })
+    except Exception as e:
+        logging.warning(f"Backtest tracking failed: {e}")
 
 async def schedule_daily_summary():
     while True:
@@ -262,32 +335,7 @@ async def send_daily_summary():
 @app.on_event("startup")
 async def startup_event():
     loop = asyncio.get_event_loop()
-    loop.create_task(scan_unusual_activity())
     loop.create_task(schedule_daily_summary())
-
-async def scan_unusual_activity():
-    symbols_to_check = ["AAPL", "TSLA", "AMD", "MSFT", "NVDA", "GOOG", "PLTR", "CRCL", "CRWV", "AMZN", "HOOD", "IONQ", "OKLA", "COIN", "MSTR", "UNH", "PDD", "BABA", "XOM", "CVX"]
-    logging.info("📡 Simulating unusual activity based on volume and OI spikes...")
-    
-    while True:
-        try:
-            async with httpx.AsyncClient() as client:
-                for symbol in symbols_to_check:
-                    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}?apiKey={POLYGON_API_KEY}"
-                    try:
-                        resp = await client.get(url)
-                        data = resp.json().get("results", [])
-                        high_volume_contracts = [opt for opt in data if opt.get("volume", 0) > 500 and opt.get("open_interest", 0) > 1000]
-
-                        if high_volume_contracts:
-                            logging.info(f"🔥 Unusual contracts found for {symbol}: {len(high_volume_contracts)}")
-                            await client.post(
-                                "http://localhost:8000/webhook",
-                                json={"symbol": symbol, "price": 0, "signal": "flow", "allow_closed": True}
-                            )
-                    except Exception as e:
-                        logging.warning(f"Error checking {symbol}: {e}")
-        except Exception as e:
-            logging.warning(f"Unusual scan error: {e}")
-
-        await asyncio.sleep(300)
+    loop.create_task(scan_unusual_activity())
+    loop = asyncio.get_event_loop()
+    loop.create_task(schedule_daily_summary())
