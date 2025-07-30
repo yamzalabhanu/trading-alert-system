@@ -66,7 +66,8 @@ async def call_openai_chat(prompt: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "gpt-3.5",
+         "model": "gpt-3.5-turbo",
+
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3
     }
