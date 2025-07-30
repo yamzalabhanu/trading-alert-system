@@ -60,6 +60,33 @@ def log_signal(symbol: str, signal: str, gpt_decision: str):
         "timestamp": datetime.now(ZoneInfo("America/New_York"))
     })
 
+async def call_openai_chat(prompt: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+
+            if resp.status_code == 429:
+                logging.warning("⚠️ OpenAI rate limit hit.")
+                return "⚠️ GPT rate limit hit. No decision made."
+
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "⚠️ GPT returned no content.")
+    except Exception as e:
+        logging.error(f"OpenAI GPT error: {e}")
+        return "⚠️ GPT unavailable due to an internal error."
+
+
 # === Validation ===
 async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
     async with httpx.AsyncClient() as client:
@@ -196,7 +223,8 @@ Respond with:
                     "temperature": 0.3
                 }
             )
-            gpt_reply = gpt_resp.json()["choices"][0]["message"]["content"]
+            gpt_reply = await call_openai_chat(gpt_prompt)
+
 
         gpt_decision = "unknown"
         if "yes" in gpt_reply.lower():
