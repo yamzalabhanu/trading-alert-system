@@ -38,10 +38,14 @@ COOLDOWN_WINDOW = timedelta(minutes=10)
 signal_log: list = []
 
 # === Models ===
+	
 class Alert(BaseModel):
     symbol: str
     price: float
     signal: str
+    strike: int | None = None          # roundedStrike from Pine Script
+    expiry: str | None = None          # Expiry date string like "2025-08-01"
+
 
 # === Cooldown & Logs ===
 def is_in_cooldown(symbol: str, signal: str) -> bool:
@@ -52,13 +56,16 @@ def is_in_cooldown(symbol: str, signal: str) -> bool:
 def update_cooldown(symbol: str, signal: str):
     cooldown_tracker[(symbol.upper(), signal.lower())] = datetime.utcnow()
 
-def log_signal(symbol: str, signal: str, gpt_decision: str):
+def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None = None, expiry: str | None = None):
     signal_log.append({
         "symbol": symbol.upper(),
         "signal": signal.lower(),
         "gpt": gpt_decision,
+        "strike": strike,
+        "expiry": expiry,
         "timestamp": datetime.now(ZoneInfo("America/New_York"))
     })
+
 
 async def call_openai_chat(prompt: str) -> str:
     headers = {
@@ -233,15 +240,23 @@ Respond with:
         elif "no" in gpt_reply.lower():
             gpt_decision = "skip"
 
-        tg_msg = ("📈 *{} ALERT* for `{}` @ `${}`\n\n📊 GPT Review:\n{}"
-                  .format(alert.signal.upper(), alert.symbol, alert.price, gpt_reply))
+		option_info = ""
+		if alert.strike and alert.expiry:
+			option_info = f"\n🎯 Option: {'CALL' if alert.signal.lower() == 'buy' else 'PUT'} ${alert.strike} Exp: {alert.expiry}"
+
+		tg_msg = (
+			f"📈 *{alert.signal.upper()} ALERT* for `{alert.symbol}` @ `${alert.price}`"
+			f"{option_info}\n\n📊 GPT Review:\n{gpt_reply}"
+		)
+
         await httpx.AsyncClient().post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": tg_msg, "parse_mode": "Markdown"}
         )
 
         update_cooldown(alert.symbol, alert.signal)
-        log_signal(alert.symbol, alert.signal, gpt_decision)
+        log_signal(alert.symbol, alert.signal, gpt_decision, alert.strike, alert.expiry)
+
 
         return {"status": "ok", "gpt_review": gpt_reply}
 
