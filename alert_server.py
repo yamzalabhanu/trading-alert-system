@@ -13,7 +13,7 @@ except ImportError:
     ssl = None
     logging.warning("SSL module is not available. Secure HTTP may fail in this environment.")
 
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from cachetools import TTLCache
@@ -21,9 +21,6 @@ from zoneinfo import ZoneInfo
 import httpx
 import redis
 import json
-import schedule
-import time
-import threading
 
 # === Load Config ===
 load_dotenv()
@@ -71,15 +68,13 @@ def is_in_cooldown(symbol: str, signal: str) -> bool:
 def update_cooldown(symbol: str, signal: str):
     cooldown_tracker[(symbol.upper(), signal.lower())] = datetime.utcnow()
 
-def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None = None, expiry: str | None = None, confidence: int | None = None, reasoning: str | None = None):
+def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None = None, expiry: str | None = None):
     entry = {
         "symbol": symbol.upper(),
         "signal": signal.lower(),
         "gpt": gpt_decision,
         "strike": strike,
         "expiry": expiry,
-        "confidence": confidence,
-        "reason": reasoning,
         "timestamp": datetime.now(ZoneInfo("America/New_York")).isoformat()
     }
     signal_log.append(entry)
@@ -87,75 +82,6 @@ def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None =
         redis_client.rpush("trade_logs", json.dumps(entry))
     except Exception as e:
         logging.warning(f"Redis logging failed: {e}")
-
-# === Summary API for Last 24h Trades ===
-@app.get("/summary")
-async def get_trade_summary(symbol: str | None = Query(None), min_confidence: int | None = Query(None)):
-    try:
-        now = datetime.now(ZoneInfo("America/New_York"))
-        since = now - timedelta(hours=24)
-        trades = redis_client.lrange("trade_logs", 0, -1)
-        filtered = []
-        for t in trades:
-            trade = json.loads(t)
-            timestamp = datetime.fromisoformat(trade["timestamp"])
-            if timestamp >= since:
-                if symbol and trade["symbol"] != symbol.upper():
-                    continue
-                if min_confidence and (trade.get("confidence") or 0) < min_confidence:
-                    continue
-                filtered.append(trade)
-
-        count_by_symbol = Counter(t["symbol"] for t in filtered)
-        count_by_signal = Counter(t["signal"] for t in filtered)
-        count_by_decision = Counter(t["gpt"] for t in filtered)
-
-        return {
-            "since": since.isoformat(),
-            "total_trades": len(filtered),
-            "by_symbol": count_by_symbol,
-            "by_signal": count_by_signal,
-            "by_decision": count_by_decision,
-            "logs": filtered
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch trade summary: {e}")
-
-# === Scheduled Telegram Summary ===
-def send_telegram_summary():
-    try:
-        now = datetime.now(ZoneInfo("America/New_York"))
-        since = now - timedelta(hours=24)
-        trades = redis_client.lrange("trade_logs", 0, -1)
-        filtered = [json.loads(t) for t in trades if datetime.fromisoformat(json.loads(t)["timestamp"]) >= since]
-        if not filtered:
-            return
-
-        count_by_symbol = Counter(t["symbol"] for t in filtered)
-        count_by_signal = Counter(t["signal"] for t in filtered)
-        count_by_decision = Counter(t["gpt"] for t in filtered)
-
-        msg = f"📊 *Daily Trade Summary*\n\n🕒 From: {since.strftime('%Y-%m-%d %H:%M')} ET\n📈 Total: {len(filtered)} trades\n\n"
-        msg += "*By Symbol:*\n" + "\n".join([f"- {k}: {v}" for k, v in count_by_symbol.items()]) + "\n\n"
-        msg += "*By Signal:*\n" + "\n".join([f"- {k}: {v}" for k, v in count_by_signal.items()]) + "\n\n"
-        msg += "*By Decision:*\n" + "\n".join([f"- {k}: {v}" for k, v in count_by_decision.items()])
-
-        httpx.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "Markdown"
-        })
-    except Exception as e:
-        logging.warning(f"Daily summary failed: {e}")
-
-# === Background Scheduler ===
-def schedule_summary():
-    schedule.every().day.at("16:15").do(send_telegram_summary)
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
-
-threading.Thread(target=schedule_summary, daemon=True).start()
 
 # === Symbol and Market Validation ===
 async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
@@ -165,10 +91,11 @@ async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
     url = f"https://api.polygon.io/v3/reference/tickers/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
     market_url = f"https://api.polygon.io/v1/marketstatus/now?apiKey={POLYGON_API_KEY}"
     try:
-        ref_resp, market_resp = await asyncio.gather(
-            shared_client.get(url),
-            shared_client.get(market_url)
-        )
+        async with shared_client as client:
+            ref_resp, market_resp = await asyncio.gather(
+                client.get(url),
+                client.get(market_url)
+            )
         if ref_resp.status_code != 200:
             raise HTTPException(status_code=404, detail="Symbol not found on Polygon")
         if not allow_closed:
@@ -213,7 +140,6 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
         logging.warning(f"Failed to fetch option greeks: {e}")
         return {}
 
-# === Helper: Parse Alert String ===
 # === Helper: Parse Alert String ===
 def parse_tradingview_message(msg: str) -> Alert:
     try:
@@ -340,4 +266,3 @@ Respond with:
     except Exception as e:
         logging.exception("Webhook processing failed")
         raise HTTPException(status_code=500, detail=str(e))
-
