@@ -13,7 +13,7 @@ except ImportError:
     ssl = None
     logging.warning("SSL module is not available. Secure HTTP may fail in this environment.")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from cachetools import TTLCache
@@ -59,97 +59,48 @@ class Alert(BaseModel):
     triggers: str | None = None
     indicators: Dict[str, Any] | None = None
 
-# === Cooldown ===
-def is_in_cooldown(symbol: str, signal: str) -> bool:
-    key = (symbol.upper(), signal.lower())
-    last_alert = cooldown_tracker.get(key)
-    return last_alert and datetime.utcnow() - last_alert < COOLDOWN_WINDOW
-
-def update_cooldown(symbol: str, signal: str):
-    cooldown_tracker[(symbol.upper(), signal.lower())] = datetime.utcnow()
-
-def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None = None, expiry: str | None = None):
-    entry = {
-        "symbol": symbol.upper(),
-        "signal": signal.lower(),
-        "gpt": gpt_decision,
-        "strike": strike,
-        "expiry": expiry,
-        "timestamp": datetime.now(ZoneInfo("America/New_York")).isoformat()
-    }
-    signal_log.append(entry)
+# === Helper: Parse Alert String ===
+def parse_tradingview_message(msg: str) -> Alert:
     try:
-        redis_client.rpush("trade_logs", json.dumps(entry))
+        pattern_legacy = r"Action:\s*(BUY|SELL).*?Symbol:\s*(\w+).*?Price:\s*([\d.]+).*?Option:\s*(CALL|PUT).*?Strike:\s*(\d+).*?Expiry:\s*(\d{4}-\d{2}-\d{2})"
+        pattern_simple = r"(CALL|PUT) Signal:\s*(\w+) at ([\d.]+)\s*Strike:\s*(\d+)\s*Expiry:\s*(\d{4}-\d{2}-\d{2})"
+
+        legacy = re.search(pattern_legacy, msg)
+        if legacy:
+            signal, symbol, price, option_type, strike, expiry = legacy.groups()
+            return Alert(
+                signal=signal.lower(),
+                symbol=symbol.upper(),
+                price=float(price),
+                strike=int(strike),
+                expiry=expiry
+            )
+
+        simple = re.search(pattern_simple, msg)
+        if simple:
+            option_type, symbol, price, strike, expiry = simple.groups()
+            return Alert(
+                signal="buy" if option_type.upper() == "CALL" else "sell",
+                symbol=symbol.upper(),
+                price=float(price),
+                strike=int(strike),
+                expiry=expiry
+            )
+
+        raise ValueError("Unrecognized alert message format")
+
     except Exception as e:
-        logging.warning(f"Redis logging failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to parse alert: {e}")
 
-async def call_openai_chat(prompt: str, cache_key: str) -> str:
-    if cache_key in gpt_cache:
-        return gpt_cache[cache_key]
+# === Ingest Raw Message ===
+@app.post("/webhook/raw")
+async def handle_raw_message(request: Request):
+    body = await request.body()
+    text = body.decode("utf-8")
+    alert = parse_tradingview_message(text)
+    return await handle_alert(alert)
 
-    payload = {
-        "model": "gpt-4-turbo",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3
-    }
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    try:
-        resp = await shared_client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-        if resp.status_code == 429:
-            return "⚠️ GPT rate limit hit."
-        resp.raise_for_status()
-        reply = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "⚠️ No content")
-        gpt_cache[cache_key] = reply
-        return reply
-    except Exception as e:
-        logging.error(f"OpenAI GPT error: {e}")
-        return "⚠️ GPT error."
-
-async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
-    key = f"market_status_{symbol}"
-    if key in cache:
-        return
-    ref_url = f"https://api.polygon.io/v3/reference/tickers/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
-    status_url = f"https://api.polygon.io/v1/marketstatus/now?apiKey={POLYGON_API_KEY}"
-    ref_resp, status_resp = await asyncio.gather(
-        shared_client.get(ref_url), shared_client.get(status_url)
-    )
-    if ref_resp.status_code != 200:
-        raise HTTPException(status_code=400, detail="Invalid symbol")
-    if not allow_closed and status_resp.status_code == 200:
-        if status_resp.json().get("market", "").lower() != "open":
-            raise HTTPException(status_code=403, detail="Market closed")
-    cache[key] = True
-
-async def get_option_greeks(symbol: str) -> Dict[str, Any]:
-    key = f"greeks_{symbol}"
-    if key in cache:
-        return cache[key]
-    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}?apiKey={POLYGON_API_KEY}"
-    try:
-        resp = await shared_client.get(url)
-        data = resp.json().get("results", [])
-        nearest = None
-        current_price = None
-        for option in data:
-            if option.get("details", {}).get("contract_type") != "call": continue
-            if not current_price:
-                current_price = option.get("underlying_asset", {}).get("last", {}).get("price", 0)
-            strike = option.get("details", {}).get("strike_price", 0)
-            if current_price and abs(strike - current_price) < abs((nearest or {}).get("details", {}).get("strike_price", 0) - current_price):
-                nearest = option
-        greeks = nearest.get("greeks", {}) if nearest else {}
-        iv = nearest.get("implied_volatility", {}).get("midpoint") if nearest else None
-        result = {"delta": greeks.get("delta"), "gamma": greeks.get("gamma"), "theta": greeks.get("theta"), "iv": iv}
-        cache[key] = result
-        return result
-    except Exception as e:
-        logging.warning(f"Greeks error: {e}")
-        return {}
-
+# === Existing /webhook stays unchanged ===
 @app.post("/webhook")
 async def handle_alert(alert: Alert):
     logging.info(f"Received alert: {alert.symbol} @ {alert.price}")
