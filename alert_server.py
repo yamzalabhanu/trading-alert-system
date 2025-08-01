@@ -3,7 +3,7 @@ import os
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List, Optional
 from collections import Counter, defaultdict
 import asyncio
 
@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import redis
 import json
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # === Load Config ===
 load_dotenv()
@@ -59,6 +61,20 @@ class Alert(BaseModel):
     triggers: str | None = None
     indicators: Dict[str, Any] | None = None
 
+class Outcome(BaseModel):
+    symbol: str
+    signal: str
+    entry_price: float
+    exit_price: float
+    entry_time: str
+    exit_time: str
+    profit: float | None = None
+    profit_pct: float | None = None
+    outcome: str  # "win" or "loss"
+
+# === Initialize Scheduler ===
+scheduler = AsyncIOScheduler(timezone=ZoneInfo("America/New_York"))
+
 # === Cooldown Helpers ===
 def is_in_cooldown(symbol: str, signal: str) -> bool:
     key = (symbol.upper(), signal.lower())
@@ -68,11 +84,27 @@ def is_in_cooldown(symbol: str, signal: str) -> bool:
 def update_cooldown(symbol: str, signal: str):
     cooldown_tracker[(symbol.upper(), signal.lower())] = datetime.utcnow()
 
-def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None = None, expiry: str | None = None):
+# === Enhanced Signal Logging ===
+def log_signal(symbol: str, signal: str, gpt_reply: str, strike: int | None = None, expiry: str | None = None):
+    # Parse confidence from GPT reply
+    confidence = 0
+    match = re.search(r"confidence[:=]?\s*(\d+)", gpt_reply.lower())
+    if match:
+        confidence = int(match.group(1))
+    
+    # Extract reasoning
+    reason = "No reason provided"
+    if "reason:" in gpt_reply.lower():
+        reason = gpt_reply.split("Reason:")[-1].strip()
+    elif "-" in gpt_reply:
+        reason = gpt_reply.split("-")[-1].strip()
+    
     entry = {
         "symbol": symbol.upper(),
         "signal": signal.lower(),
-        "gpt": gpt_decision,
+        "gpt_reply": gpt_reply,
+        "confidence": confidence,
+        "reason": reason,
         "strike": strike,
         "expiry": expiry,
         "timestamp": datetime.now(ZoneInfo("America/New_York")).isoformat()
@@ -82,6 +114,22 @@ def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None =
         redis_client.rpush("trade_logs", json.dumps(entry))
     except Exception as e:
         logging.warning(f"Redis logging failed: {e}")
+
+# === Initialize Logs from Redis ===
+try:
+    # Load trade signals
+    redis_signals = redis_client.lrange("trade_logs", 0, -1)
+    for entry in redis_signals:
+        signal_log.append(json.loads(entry))
+    logging.info(f"Loaded {len(signal_log)} historical signals from Redis")
+    
+    # Load outcomes
+    redis_outcomes = redis_client.lrange("outcome_logs", 0, -1)
+    for entry in redis_outcomes:
+        outcome_log.append(json.loads(entry))
+    logging.info(f"Loaded {len(outcome_log)} historical outcomes from Redis")
+except Exception as e:
+    logging.error(f"Failed loading logs from Redis: {e}")
 
 # === Symbol and Market Validation ===
 async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
@@ -186,6 +234,228 @@ def parse_tradingview_message(msg: str) -> Alert:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse alert: {e}")
 
+# === OpenAI API Call ===
+async def call_openai_chat(prompt: str, cache_key: str) -> str:
+    if cache_key in gpt_cache:
+        return gpt_cache[cache_key]
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 150,
+            "temperature": 0.3
+        }
+        
+        async with shared_client as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=data,
+                headers=headers,
+                timeout=10.0
+            )
+            response.raise_for_status()
+            result = response.json()
+            reply = result["choices"][0]["message"]["content"].strip()
+            gpt_cache[cache_key] = reply
+            return reply
+    except Exception as e:
+        logging.error(f"OpenAI API error: {e}")
+        return "Error: Unable to evaluate signal"
+
+# === Outcome Logging Endpoint ===
+@app.post("/log_outcome")
+async def log_outcome(outcome: Outcome):
+    # Calculate profit metrics
+    outcome.profit = outcome.exit_price - outcome.entry_price
+    outcome.profit_pct = (outcome.profit / outcome.entry_price) * 100
+    
+    # Prepare log entry
+    log_entry = outcome.dict()
+    log_entry["timestamp"] = datetime.now(ZoneInfo("America/New_York")).isoformat()
+    
+    # Store in Redis and in-memory log
+    outcome_log.append(log_entry)
+    try:
+        redis_client.rpush("outcome_logs", json.dumps(log_entry))
+    except Exception as e:
+        logging.warning(f"Redis outcome logging failed: {e}")
+    
+    return {"status": "logged"}
+
+# === Filtered Signal Retrieval ===
+@app.get("/signals")
+async def get_filtered_signals(
+    symbol: Optional[str] = None, 
+    min_confidence: Optional[int] = None,
+    max_confidence: Optional[int] = None,
+    limit: int = 50
+) -> List[Dict]:
+    filtered = signal_log
+    
+    if symbol:
+        filtered = [s for s in filtered if s["symbol"] == symbol.upper()]
+    
+    if min_confidence is not None:
+        filtered = [s for s in filtered if s.get("confidence", 0) >= min_confidence]
+    
+    if max_confidence is not None:
+        filtered = [s for s in filtered if s.get("confidence", 0) <= max_confidence]
+    
+    return filtered[-limit:]
+
+# === Filtered Outcome Retrieval ===
+@app.get("/outcomes")
+async def get_filtered_outcomes(
+    symbol: Optional[str] = None,
+    min_profit_pct: Optional[float] = None,
+    max_profit_pct: Optional[float] = None,
+    outcome_type: Optional[str] = None,
+    limit: int = 50
+) -> List[Dict]:
+    filtered = outcome_log
+    
+    if symbol:
+        filtered = [o for o in filtered if o["symbol"] == symbol.upper()]
+    
+    if min_profit_pct is not None:
+        filtered = [o for o in filtered if o.get("profit_pct", 0) >= min_profit_pct]
+    
+    if max_profit_pct is not None:
+        filtered = [o for o in filtered if o.get("profit_pct", 0) <= max_profit_pct]
+    
+    if outcome_type:
+        filtered = [o for o in filtered if o.get("outcome", "").lower() == outcome_type.lower()]
+    
+    return filtered[-limit:]
+
+# === Performance Statistics ===
+@app.get("/stats")
+async def get_performance_stats():
+    if not outcome_log:
+        return {"message": "No outcomes logged yet"}
+    
+    # Calculate performance metrics
+    wins = [o for o in outcome_log if o["outcome"] == "win"]
+    losses = [o for o in outcome_log if o["outcome"] == "loss"]
+    
+    win_rate = len(wins) / len(outcome_log) * 100
+    avg_profit = sum(o["profit"] for o in outcome_log) / len(outcome_log)
+    avg_win = sum(o["profit"] for o in wins) / len(wins) if wins else 0
+    avg_loss = sum(o["profit"] for o in losses) / len(losses) if losses else 0
+    
+    # Calculate best/worst performers
+    symbol_perf = defaultdict(list)
+    for o in outcome_log:
+        symbol_perf[o["symbol"]].append(o["profit_pct"])
+    
+    best_symbol = ""
+    worst_symbol = ""
+    if symbol_perf:
+        symbol_avg = {s: sum(p) / len(p) for s, p in symbol_perf.items()}
+        best_symbol = max(symbol_avg, key=symbol_avg.get)
+        worst_symbol = min(symbol_avg, key=symbol_avg.get)
+    
+    # Confidence performance correlation
+    conf_perf = []
+    for o in outcome_log:
+        # Find matching signal
+        signal = next((s for s in signal_log 
+                      if s["symbol"] == o["symbol"] 
+                      and s["timestamp"] == o["entry_time"]), None)
+        if signal:
+            conf_perf.append({
+                "confidence": signal.get("confidence", 0),
+                "profit_pct": o.get("profit_pct", 0)
+            })
+    
+    avg_conf_profit = sum(cp["profit_pct"] for cp in conf_perf) / len(conf_perf) if conf_perf else 0
+    
+    return {
+        "total_trades": len(outcome_log),
+        "win_rate": round(win_rate, 2),
+        "avg_profit": round(avg_profit, 4),
+        "avg_win": round(avg_win, 4),
+        "avg_loss": round(avg_loss, 4),
+        "best_symbol": best_symbol,
+        "worst_symbol": worst_symbol,
+        "confidence_correlation": {
+            "trades_with_confidence": len(conf_perf),
+            "avg_confidence": round(sum(cp["confidence"] for cp in conf_perf) / len(conf_perf), 1) if conf_perf else 0,
+            "avg_profit_at_confidence": round(avg_conf_profit, 2)
+        }
+    }
+
+# === Daily Summary Task ===
+async def send_daily_summary():
+    try:
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        today_str = today.isoformat()
+        
+        # Filter today's signals
+        today_signals = [s for s in signal_log if s["timestamp"].startswith(today_str)]
+        
+        # Filter today's outcomes
+        today_outcomes = [o for o in outcome_log if o["exit_time"].startswith(today_str)]
+        
+        # Generate summary
+        if not today_signals and not today_outcomes:
+            return
+        
+        summary = f"📊 *Daily Summary* - {today_str}\n\n"
+        summary += f"📨 Signals Received: *{len(today_signals)}*\n"
+        
+        if today_signals:
+            signal_counter = Counter(s["symbol"] for s in today_signals)
+            top_symbols = ", ".join([f"{sym} ({count})" for sym, count in signal_counter.most_common(3)])
+            summary += f"🏆 Top Symbols: {top_symbols}\n"
+            
+            avg_confidence = sum(s.get("confidence", 0) for s in today_signals) / len(today_signals)
+            summary += f"🎯 Avg Confidence: *{avg_confidence:.1f}%*\n"
+            
+            # Find highest confidence signal
+            if today_signals:
+                best_signal = max(today_signals, key=lambda x: x.get("confidence", 0))
+                summary += f"💎 Best Signal: {best_signal['symbol']} ({best_signal['confidence']}%)\n"
+        
+        summary += f"\n💼 Trades Executed: *{len(today_outcomes)}*\n"
+        
+        if today_outcomes:
+            wins = [o for o in today_outcomes if o["outcome"] == "win"]
+            losses = [o for o in today_outcomes if o["outcome"] == "loss"]
+            
+            win_rate = len(wins) / len(today_outcomes) * 100 if today_outcomes else 0
+            summary += f"✅ Wins: *{len(wins)}* | ❌ Losses: *{len(losses)}*\n"
+            summary += f"📈 Win Rate: *{win_rate:.1f}%*\n"
+            
+            total_profit = sum(o["profit"] for o in today_outcomes)
+            summary += f"💰 Net P&L: *${total_profit:.2f}*\n"
+            
+            best_trade = max(today_outcomes, key=lambda x: x["profit_pct"], default=None)
+            if best_trade:
+                summary += f"🚀 Best Trade: {best_trade['symbol']} +{best_trade['profit_pct']:.1f}%\n"
+        
+        await shared_client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": summary,
+                "parse_mode": "Markdown"
+            }
+        )
+        
+    except Exception as e:
+        logging.error(f"Failed to send daily summary: {e}")
+
+# === Start Scheduler ===
+@scheduler.scheduled_job(CronTrigger(hour=16, minute=15, timezone="America/New_York"))
+def scheduled_daily_summary():
+    asyncio.create_task(send_daily_summary())
+
 # === Ingest Raw Message ===
 @app.post("/webhook/raw")
 async def handle_raw_message(request: Request):
@@ -259,10 +529,27 @@ Respond with:
         await shared_client.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": tg_msg, "parse_mode": "Markdown"})
 
         update_cooldown(alert.symbol, alert.signal)
-        log_signal(alert.symbol, alert.signal, gpt_decision, alert.strike, alert.expiry)
+        log_signal(alert.symbol, alert.signal, gpt_reply, alert.strike, alert.expiry)
 
         return {"status": "ok", "gpt_review": gpt_reply}
 
     except Exception as e:
         logging.exception("Webhook processing failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+# === Startup Event ===
+@app.on_event("startup")
+async def startup_event():
+    scheduler.start()
+    logging.info("Scheduler started - Daily summaries scheduled at 4:15 PM ET")
+    logging.info(f"System initialized with {len(signal_log)} signals and {len(outcome_log)} outcomes")
+
+# === Health Check ===
+@app.get("/")
+async def health_check():
+    return {
+        "status": "running",
+        "signals": len(signal_log),
+        "outcomes": len(outcome_log),
+        "cooldown_entries": len(cooldown_tracker)
+    }
