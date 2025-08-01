@@ -107,6 +107,39 @@ async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Validation failed: {e}")
 
+# === Option Greeks from Polygon Snapshot ===
+async def get_option_greeks(symbol: str) -> Dict[str, Any]:
+    try:
+        url = f"https://api.polygon.io/v3/snapshot/options/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
+        resp = await shared_client.get(url)
+        data = resp.json()
+        options = data.get("results", {}).get("options", [])
+        if not options:
+            return {}
+
+        # Filter to nearest expiry >= today
+        today = datetime.utcnow().date()
+        valid = [o for o in options if "details" in o and o["details"].get("expiration_date")]
+        valid = [o for o in valid if datetime.strptime(o["details"]["expiration_date"], "%Y-%m-%d").date() >= today]
+
+        # Find nearest ATM call
+        underlying_price = data.get("results", {}).get("underlying_asset", {}).get("last", {}).get("price", 0)
+        valid = sorted(valid, key=lambda o: abs(o["details"]["strike_price"] - underlying_price))
+
+        for opt in valid:
+            greeks = opt.get("greeks", {})
+            return {
+                "delta": greeks.get("delta"),
+                "gamma": greeks.get("gamma"),
+                "theta": greeks.get("theta"),
+                "iv": greeks.get("iv")
+            }
+
+        return {}
+    except Exception as e:
+        logging.warning(f"Failed to fetch option greeks: {e}")
+        return {}
+
 # === Helper: Parse Alert String ===
 def parse_tradingview_message(msg: str) -> Alert:
     try:
