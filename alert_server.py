@@ -83,6 +83,30 @@ def log_signal(symbol: str, signal: str, gpt_decision: str, strike: int | None =
     except Exception as e:
         logging.warning(f"Redis logging failed: {e}")
 
+# === Symbol and Market Validation ===
+async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
+    key = f"{symbol}_valid"
+    if key in cache:
+        return
+    url = f"https://api.polygon.io/v3/reference/tickers/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
+    market_url = f"https://api.polygon.io/v1/marketstatus/now?apiKey={POLYGON_API_KEY}"
+    try:
+        async with shared_client as client:
+            ref_resp, market_resp = await asyncio.gather(
+                client.get(url),
+                client.get(market_url)
+            )
+        if ref_resp.status_code != 200:
+            raise HTTPException(status_code=404, detail="Symbol not found on Polygon")
+        if not allow_closed:
+            market = market_resp.json()
+            if market.get("market", {}).get("isOpen") is False:
+                raise HTTPException(status_code=400, detail="Market is closed")
+
+        cache[key] = True
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Validation failed: {e}")
+
 # === Helper: Parse Alert String ===
 def parse_tradingview_message(msg: str) -> Alert:
     try:
