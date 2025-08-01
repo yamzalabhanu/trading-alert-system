@@ -1,8 +1,11 @@
 fastapi
 uvicorn
-httpx
 python-dotenv
-pandas
-numpy
 cachetools
+httpx
 redis
+pydantic
+python-multipart
+apscheduler
+pytz
+tzdata
