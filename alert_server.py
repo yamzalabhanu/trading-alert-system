@@ -330,23 +330,58 @@ Respond with:
 
 # === Outcome Logging Endpoint ===
 @app.post("/log_outcome")
-async def log_outcome(outcome: Outcome):
-    # Calculate profit metrics
-    outcome.profit = outcome.exit_price - outcome.entry_price
-    outcome.profit_pct = (outcome.profit / outcome.entry_price) * 100
-    
-    # Prepare log entry
-    log_entry = outcome.dict()
-    log_entry["timestamp"] = datetime.now(ZoneInfo("America/New_York")).isoformat()
-    
-    # Store in Redis and in-memory log
-    outcome_log.append(log_entry)
+async def log_outcome(request: Request):
     try:
-        redis_client.rpush("outcome_logs", json.dumps(log_entry))
-    except Exception as e:
-        logging.warning(f"Redis outcome logging failed: {e}")
+        # Try to parse as JSON first
+        try:
+            outcome_data = await request.json()
+            outcome = Outcome(**outcome_data)
+        except json.JSONDecodeError:
+            # If JSON fails, try parsing as TradingView alert format
+            body = await request.body()
+            text = body.decode("utf-8")
+            
+            # Parse TradingView format: "CALL/PUT Signal: SYMBOL at PRICE"
+            pattern = r"(CALL|PUT)\s+Signal:\s+(\w+)\s+at\s+([\d.]+)"
+            match = re.search(pattern, text)
+            if not match:
+                raise HTTPException(status_code=400, detail="Invalid alert format")
+            
+            signal_type, symbol, price = match.groups()
+            current_time = datetime.now(ZoneInfo("America/New_York")).isoformat()
+            
+            outcome = Outcome(
+                symbol=symbol.upper(),
+                signal=signal_type.lower(),
+                entry_price=float(price),
+                exit_price=float(price),  # Assuming same price for simplicity
+                entry_time=current_time,
+                exit_time=current_time,
+                outcome="win"  # Default to win, can be adjusted
+            )
+
+        # Calculate profit metrics
+        outcome.profit = outcome.exit_price - outcome.entry_price
+        outcome.profit_pct = (outcome.profit / outcome.entry_price) * 100 if outcome.entry_price != 0 else 0
+        
+        # Prepare log entry
+        log_entry = outcome.dict()
+        log_entry["timestamp"] = datetime.now(ZoneInfo("America/New_York")).isoformat()
+        
+        # Store in Redis and in-memory log
+        outcome_log.append(log_entry)
+        try:
+            redis_client.rpush("outcome_logs", json.dumps(log_entry))
+        except Exception as e:
+            logging.warning(f"Redis outcome logging failed: {e}")
+        
+        return {"status": "logged", "data": log_entry}
     
-    return {"status": "logged"}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Validation error: {str(e)}")
+    except Exception as e:
+        logging.error(f"Error logging outcome: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # === Filtered Signal Retrieval ===
 @app.get("/signals")
