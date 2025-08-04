@@ -188,49 +188,30 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
         logging.warning(f"Failed to fetch option greeks: {e}")
         return {}
 
-# === Helper: Parse Alert String ===
+# === Helper: Parse TradingView Alert String ===
 def parse_tradingview_message(msg: str) -> Alert:
     try:
-        pattern_legacy = r"Action:\s*(BUY|SELL).*?Symbol:\s*(\w+).*?Price:\s*([\d.]+).*?Option:\s*(CALL|PUT).*?Strike:\s*(\d+).*?Expiry:\s*(\d{4}-\d{2}-\d{2})"
-        pattern_simple = r"(CALL|PUT) Signal:\s*(\w+) at ([\d.]+)\s*Strike:\s*(\d+)\s*Expiry:\s*(\d{4}-\d{2}-\d{2})"
-        pattern_unix_expiry = r"(CALL|PUT) Signal:\s*(\w+) at ([\d.]+)\s*Strike:\s*(\d+)\s*Expiry:\s*(\d{10,})"
-
-        legacy = re.search(pattern_legacy, msg)
-        if legacy:
-            signal, symbol, price, option_type, strike, expiry = legacy.groups()
-            return Alert(
-                signal=signal.lower(),
-                symbol=symbol.upper(),
-                price=float(price),
-                strike=int(strike),
-                expiry=expiry
-            )
-
-        simple = re.search(pattern_simple, msg.replace("\n", " "))
-        if simple:
-            option_type, symbol, price, strike, expiry = simple.groups()
-            return Alert(
-                signal="buy" if option_type.upper() == "CALL" else "sell",
-                symbol=symbol.upper(),
-                price=float(price),
-                strike=int(strike),
-                expiry=expiry
-            )
-
-        unix_expiry = re.search(pattern_unix_expiry, msg.replace("\n", " "))
-        if unix_expiry:
-            option_type, symbol, price, strike, expiry_unix = unix_expiry.groups()
-            expiry_dt = datetime.utcfromtimestamp(int(expiry_unix) / 1000).strftime("%Y-%m-%d")
-            return Alert(
-                signal="buy" if option_type.upper() == "CALL" else "sell",
-                symbol=symbol.upper(),
-                price=float(price),
-                strike=int(strike),
-                expiry=expiry_dt
-            )
-
-        raise ValueError("Unrecognized alert message format")
-
+        # New format: "CALL Signal: {{ticker}} at {{close}} Strike: {{plot_0}} Expiry: {{plot_1}}"
+        pattern = r"(CALL|PUT)\s*Signal:\s*([A-Z]+)\s*at\s*([\d.]+)\s*Strike:\s*([\d.]+)\s*Expiry:\s*([\d-]+|\d{10,})"
+        match = re.search(pattern, msg.replace("\n", " ").strip())
+        
+        if not match:
+            raise ValueError("Unrecognized alert message format")
+            
+        option_type, symbol, price, strike, expiry = match.groups()
+        
+        # Handle Unix timestamp expiry if provided
+        if expiry.isdigit() and len(expiry) >= 10:
+            expiry_dt = datetime.utcfromtimestamp(int(expiry) / 1000)
+            expiry = expiry_dt.strftime("%Y-%m-%d")
+        
+        return Alert(
+            signal="buy" if option_type.upper() == "CALL" else "sell",
+            symbol=symbol.upper(),
+            price=float(price),
+            strike=int(float(strike)),  # Handle decimal strikes
+            expiry=expiry
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse alert: {e}")
 
@@ -266,6 +247,86 @@ async def call_openai_chat(prompt: str, cache_key: str) -> str:
     except Exception as e:
         logging.error(f"OpenAI API error: {e}")
         return "Error: Unable to evaluate signal"
+
+# === Process Alert (Common Logic) ===
+async def process_alert(alert: Alert):
+    if is_in_cooldown(alert.symbol, alert.signal):
+        return {"status": "cooldown"}
+    
+    try:
+        await validate_symbol_and_market(alert.symbol, allow_closed=True)
+        greeks = await get_option_greeks(alert.symbol)
+
+        # Pre-GPT scoring
+        score = 0
+        if alert.indicators:
+            if alert.indicators.get("ADX", 0) > 25: score += 1
+            if alert.indicators.get("RSI", 0) > 60 and alert.signal == "buy": score += 1
+            if alert.indicators.get("RSI", 0) < 40 and alert.signal == "sell": score += 1
+        
+        # Minimum score requirement
+        if score < 1:
+            return {"status": "filtered", "reason": "low local score"}
+
+        cache_key = f"gpt_{alert.symbol}_{alert.signal}_{alert.strike}_{alert.expiry}"
+        gpt_prompt = f"""
+Evaluate this options signal:
+Symbol: {alert.symbol}
+Signal: {alert.signal.upper()}
+Price: {alert.price}
+Strike: {alert.strike}
+Expiry: {alert.expiry}
+
+Option Greeks:
+Delta: {greeks.get('delta')}
+Gamma: {greeks.get('gamma')}
+Theta: {greeks.get('theta')}
+IV: {greeks.get('iv')}
+
+Respond with:
+- Trade decision (Yes/No)
+- Confidence score (0-100)
+- Reason (1 sentence)
+"""
+        gpt_reply = await call_openai_chat(gpt_prompt, cache_key)
+
+        gpt_decision = "skip"
+        confidence = 0
+        if "yes" in gpt_reply.lower():
+            gpt_decision = "buy"
+            match = re.search(r"confidence[:=]?(\s*)(\d+)", gpt_reply.lower())
+            if match: confidence = int(match.group(2))
+        
+        if gpt_decision != "buy" or confidence < 70:
+            return {"status": "filtered", "reason": f"decision={gpt_decision}, confidence={confidence}"}
+
+        # Format Telegram message
+        option_type = "CALL" if alert.signal.lower() == "buy" else "PUT"
+        option_info = f"\n🎯 {option_type} ${alert.strike} Exp: {alert.expiry}" if alert.strike else ""
+        
+        tg_msg = (
+            f"📈 *{alert.signal.upper()} ALERT* for `{alert.symbol}` @ `${alert.price}`"
+            f"{option_info}\n\n"
+            f"📊 GPT Review:\n{gpt_reply}"
+        )
+        
+        await shared_client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": tg_msg,
+                "parse_mode": "Markdown"
+            }
+        )
+
+        update_cooldown(alert.symbol, alert.signal)
+        log_signal(alert.symbol, alert.signal, gpt_reply, alert.strike, alert.expiry)
+
+        return {"status": "ok", "gpt_review": gpt_reply}
+
+    except Exception as e:
+        logging.exception("Alert processing failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # === Outcome Logging Endpoint ===
 @app.post("/log_outcome")
@@ -451,91 +512,28 @@ async def send_daily_summary():
     except Exception as e:
         logging.error(f"Failed to send daily summary: {e}")
 
-# === Start Scheduler ===
-@scheduler.scheduled_job(CronTrigger(hour=16, minute=15, timezone="America/New_York"))
-def scheduled_daily_summary():
-    asyncio.create_task(send_daily_summary())
-
-# === Ingest Raw Message ===
-@app.post("/webhook/raw")
-async def handle_raw_message(request: Request):
-    body = await request.body()
-    text = body.decode("utf-8")
-    alert = parse_tradingview_message(text)
-    return await handle_alert(alert)
+# === Webhook for TradingView Alert ===
+@app.post("/webhook/tradingview")
+async def handle_tradingview_alert(request: Request):
+    try:
+        body = await request.body()
+        text = body.decode("utf-8")
+        alert = parse_tradingview_message(text)
+        return await process_alert(alert)
+    except Exception as e:
+        logging.error(f"Error processing TradingView alert: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 # === Webhook for JSON Alert Input ===
 @app.post("/webhook")
 async def handle_alert(alert: Alert):
     logging.info(f"Received alert: {alert.symbol} @ {alert.price}")
-    if is_in_cooldown(alert.symbol, alert.signal):
-        return {"status": "cooldown"}
-    try:
-        await validate_symbol_and_market(alert.symbol, allow_closed=True)
-        greeks = await get_option_greeks(alert.symbol)
+    return await process_alert(alert)
 
-        # Pre-GPT scoring
-        score = 0
-        if "VWAP Reclaim" in (alert.triggers or ""): score += 2
-        if "EMA Crossover" in (alert.triggers or ""): score += 2
-        if "ORB Breakout" in (alert.triggers or ""): score += 2
-        if alert.indicators:
-            if alert.indicators.get("ADX", 0) > 25: score += 1
-            if alert.indicators.get("RSI", 0) > 60 and alert.indicators.get("Supertrend") == "bullish": score += 1
-        if score < 5:
-            return {"status": "filtered", "reason": "low local score"}
-
-        cache_key = f"gpt_{alert.symbol}_{alert.signal}_{alert.strike}_{alert.expiry}"
-        gpt_prompt = f"""
-Evaluate this intraday options signal:
-Symbol: {alert.symbol}
-Signal: {alert.signal.upper()}
-Price: {alert.price}
-
-Triggers:
-{alert.triggers}
-
-Indicators:
-{alert.indicators}
-
-Option Details:
-Strike: {alert.strike}
-Expiry: {alert.expiry}
-
-Option Greeks:
-Delta: {greeks.get('delta')}
-Gamma: {greeks.get('gamma')}
-Theta: {greeks.get('theta')}
-IV: {greeks.get('iv')}
-
-Respond with:
-- Trade decision (Yes/No)
-- Confidence score (0–100)
-- Reason (1 sentence)
-"""
-        gpt_reply = await call_openai_chat(gpt_prompt, cache_key)
-
-        gpt_decision = "skip"
-        confidence = 0
-        if "yes" in gpt_reply.lower():
-            gpt_decision = "buy"
-            match = re.search(r"confidence[:=]?(\s*)(\d+)", gpt_reply.lower())
-            if match: confidence = int(match.group(2))
-        if gpt_decision != "buy" or confidence < 80:
-            return {"status": "filtered", "reason": f"decision={gpt_decision}, confidence={confidence}"}
-
-        option_info = f"\n🎯 Option: {'CALL' if alert.signal.lower() == 'buy' else 'PUT'} ${alert.strike} Exp: {alert.expiry}" if alert.strike else ""
-        tg_msg = f"📈 *{alert.signal.upper()} ALERT* for `{alert.symbol}` @ `${alert.price}`{option_info}\n\n📊 GPT Review:\n{gpt_reply}"
-        await shared_client.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": tg_msg, "parse_mode": "Markdown"})
-
-        update_cooldown(alert.symbol, alert.signal)
-        log_signal(alert.symbol, alert.signal, gpt_reply, alert.strike, alert.expiry)
-
-        return {"status": "ok", "gpt_review": gpt_reply}
-
-    except Exception as e:
-        logging.exception("Webhook processing failed")
-        raise HTTPException(status_code=500, detail=str(e))
+# === Start Scheduler ===
+@scheduler.scheduled_job(CronTrigger(hour=16, minute=15, timezone="America/New_York"))
+def scheduled_daily_summary():
+    asyncio.create_task(send_daily_summary())
 
 # === Startup Event ===
 @app.on_event("startup")
