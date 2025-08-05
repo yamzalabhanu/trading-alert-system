@@ -38,9 +38,6 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 # === Redis Client ===
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-# === Global Async Client ===
-shared_client = httpx.AsyncClient()
-
 # === Caching ===
 cache: TTLCache = TTLCache(maxsize=200, ttl=300)
 gpt_cache: TTLCache = TTLCache(maxsize=500, ttl=60)
@@ -139,7 +136,7 @@ async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
     url = f"https://api.polygon.io/v3/reference/tickers/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
     market_url = f"https://api.polygon.io/v1/marketstatus/now?apiKey={POLYGON_API_KEY}"
     try:
-        async with shared_client as client:
+        async with httpx.AsyncClient() as client:
             ref_resp, market_resp = await asyncio.gather(
                 client.get(url),
                 client.get(market_url)
@@ -159,7 +156,8 @@ async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
 async def get_option_greeks(symbol: str) -> Dict[str, Any]:
     try:
         url = f"https://api.polygon.io/v3/snapshot/options/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
-        resp = await shared_client.get(url)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url)
         data = resp.json()
         options = data.get("results", {}).get("options", [])
         if not options:
@@ -232,7 +230,7 @@ async def call_openai_chat(prompt: str, cache_key: str) -> str:
             "temperature": 0.3
         }
         
-        async with shared_client as client:
+        async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 json=data,
@@ -310,14 +308,15 @@ Respond with:
             f"📊 GPT Review:\n{gpt_reply}"
         )
         
-        await shared_client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": tg_msg,
-                "parse_mode": "Markdown"
-            }
-        )
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": tg_msg,
+                    "parse_mode": "Markdown"
+                }
+            )
 
         update_cooldown(alert.symbol, alert.signal)
         log_signal(alert.symbol, alert.signal, gpt_reply, alert.strike, alert.expiry)
@@ -535,14 +534,15 @@ async def send_daily_summary():
             if best_trade:
                 summary += f"🚀 Best Trade: {best_trade['symbol']} +{best_trade['profit_pct']:.1f}%\n"
         
-        await shared_client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": summary,
-                "parse_mode": "Markdown"
-            }
-        )
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": summary,
+                    "parse_mode": "Markdown"
+                }
+            )
         
     except Exception as e:
         logging.error(f"Failed to send daily summary: {e}")
