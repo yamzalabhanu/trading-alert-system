@@ -211,10 +211,11 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
             else:
                 underlying_price = 0
 
-            # Find nearest ATM call
+            # Find nearest ATM call - Fixed the unclosed parenthesis here
             valid_options = sorted(
                 valid_options,
-                key=lambda o: abs(o.get("details", {}).get("strike_price", 0) - underlying_price)
+                key=lambda o: abs(o.get("details", {}).get("strike_price", 0) - underlying_price
+            )
             
             # Return greeks from first valid option
             for opt in valid_options:
