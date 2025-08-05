@@ -152,38 +152,75 @@ async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Validation failed: {e}")
 
-# === Option Greeks from Polygon Snapshot ===
 async def get_option_greeks(symbol: str) -> Dict[str, Any]:
     try:
         url = f"https://api.polygon.io/v3/snapshot/options/{symbol.upper()}?apiKey={POLYGON_API_KEY}"
         async with httpx.AsyncClient() as client:
             resp = await client.get(url)
-        data = resp.json()
-        options = data.get("results", {}).get("options", [])
-        if not options:
-            return {}
+            resp.raise_for_status()
+            data = resp.json()
+            
+            # Check if we got valid results
+            if not data.get("results") or not isinstance(data["results"], dict):
+                return {}
+                
+            options = data["results"].get("options", [])
+            if not options:
+                return {}
 
-        # Filter to nearest expiry >= today
-        today = datetime.utcnow().date()
-        valid = [o for o in options if "details" in o and o["details"].get("expiration_date")]
-        valid = [o for o in valid if datetime.strptime(o["details"]["expiration_date"], "%Y-%m-%d").date() >= today]
+            # Filter to nearest expiry >= today
+            today = datetime.utcnow().date()
+            valid_options = []
+            for o in options:
+                if not isinstance(o, dict):
+                    continue
+                details = o.get("details", {})
+                if not details or not isinstance(details, dict):
+                    continue
+                expiry_date = details.get("expiration_date")
+                if not expiry_date:
+                    continue
+                    
+                try:
+                    expiry_dt = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+                    if expiry_dt >= today:
+                        valid_options.append(o)
+                except ValueError:
+                    continue
 
-        # Find nearest ATM call
-        underlying_price = data.get("results", {}).get("underlying_asset", {}).get("last", {}).get("price", 0)
-        valid = sorted(valid, key=lambda o: abs(o["details"]["strike_price"] - underlying_price))
+            if not valid_options:
+                return {}
 
-        for opt in valid:
-            greeks = opt.get("greeks", {})
-            return {
-                "delta": greeks.get("delta"),
-                "gamma": greeks.get("gamma"),
-                "theta": greeks.get("theta"),
-                "iv": greeks.get("iv")
-            }
+            # Get underlying price
+            underlying_asset = data["results"].get("underlying_asset", {})
+            if isinstance(underlying_asset, dict):
+                last_data = underlying_asset.get("last", {})
+                if isinstance(last_data, dict):
+                    underlying_price = last_data.get("price", 0)
+                else:
+                    underlying_price = 0
+            else:
+                underlying_price = 0
+
+            # Find nearest ATM call
+            valid_options = sorted(
+                valid_options,
+                key=lambda o: abs(o.get("details", {}).get("strike_price", 0) - underlying_price)
+            
+            # Return greeks from first valid option
+            for opt in valid_options:
+                greeks = opt.get("greeks", {})
+                if isinstance(greeks, dict):
+                    return {
+                        "delta": greeks.get("delta"),
+                        "gamma": greeks.get("gamma"),
+                        "theta": greeks.get("theta"),
+                        "iv": greeks.get("iv")
+                    }
 
         return {}
     except Exception as e:
-        logging.warning(f"Failed to fetch option greeks: {e}")
+        logging.warning(f"Failed to fetch option greeks for {symbol}: {str(e)}")
         return {}
 
 # === Helper: Parse TradingView Alert String ===
