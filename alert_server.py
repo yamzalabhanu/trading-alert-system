@@ -235,10 +235,6 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
         logging.warning(f"Failed to fetch option greeks for {symbol}: {str(e)}")
         return {}
 
-# [Rest of the script remains exactly the same as in the previous complete version]
-# [Include all the remaining functions and endpoints exactly as shown before]
-# [The only changes were to validate_symbol_and_market and get_option_greeks functions]
-
 # === Helper: Parse TradingView Alert String ===
 def parse_tradingview_message(msg: str) -> Alert:
     try:
@@ -381,9 +377,6 @@ Respond with:
     except Exception as e:
         logging.exception("Alert processing failed")
         raise HTTPException(status_code=500, detail=str(e))
-
-# [Include all remaining endpoints and functions exactly as in the previous version]
-# [The webhook endpoints, outcome logging, statistics endpoints, etc.]
 
 # === Outcome Logging Endpoint ===
 @app.post("/log_outcome")
