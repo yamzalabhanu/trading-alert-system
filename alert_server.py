@@ -36,7 +36,25 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # === Redis Client ===
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+# Replace this line:
+# redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+# With this more robust connection handling:
+def get_redis_client():
+    try:
+        return redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+            retry_on_timeout=True,
+            max_attempts=3
+        )
+    except Exception as e:
+        logging.error(f"Redis connection error: {str(e)}")
+        return None
+
+redis_client = get_redis_client()
 
 # === Caching ===
 cache: TTLCache = TTLCache(maxsize=200, ttl=300)
@@ -113,20 +131,34 @@ def log_signal(symbol: str, signal: str, gpt_reply: str, strike: int | None = No
         logging.warning(f"Redis logging failed: {e}")
 
 # === Initialize Logs from Redis ===
+# Replace your log loading code with this:
 try:
-    # Load trade signals
-    redis_signals = redis_client.lrange("trade_logs", 0, -1)
-    for entry in redis_signals:
-        signal_log.append(json.loads(entry))
-    logging.info(f"Loaded {len(signal_log)} historical signals from Redis")
-    
-    # Load outcomes
-    redis_outcomes = redis_client.lrange("outcome_logs", 0, -1)
-    for entry in redis_outcomes:
-        outcome_log.append(json.loads(entry))
-    logging.info(f"Loaded {len(outcome_log)} historical outcomes from Redis")
+    if redis_client:
+        # Load trade signals
+        redis_signals = redis_client.lrange("trade_logs", 0, -1)
+        for entry in redis_signals:
+            try:
+                signal_log.append(json.loads(entry))
+            except json.JSONDecodeError:
+                logging.warning(f"Failed to decode Redis log entry: {entry}")
+        
+        # Load outcomes
+        redis_outcomes = redis_client.lrange("outcome_logs", 0, -1)
+        for entry in redis_outcomes:
+            try:
+                outcome_log.append(json.loads(entry))
+            except json.JSONDecodeError:
+                logging.warning(f"Failed to decode Redis outcome entry: {entry}")
+        
+        logging.info(f"Loaded {len(signal_log)} signals and {len(outcome_log)} outcomes from Redis")
+    else:
+        logging.warning("Redis client not available - starting with empty logs")
 except Exception as e:
-    logging.error(f"Failed loading logs from Redis: {e}")
+    logging.error(f"Failed loading logs from Redis: {str(e)}")
+    # Continue with empty logs
+    signal_log = []
+    outcome_log = []
+    
 
 # === Symbol and Market Validation ===
 async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
