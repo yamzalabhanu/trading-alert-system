@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
 from collections import Counter, defaultdict
 import asyncio
+import json
 
 try:
     import ssl
@@ -20,7 +21,6 @@ from cachetools import TTLCache
 from zoneinfo import ZoneInfo
 import httpx
 import redis
-import json
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -35,11 +35,10 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-# === Redis Client ===
-# Replace this line:
-# redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+# === Constants ===
+MAX_LOG_ENTRIES = 1000  # Maximum entries to keep in Redis logs
 
-# With this more robust connection handling:
+# === Redis Client ===
 def get_redis_client():
     try:
         return redis.Redis.from_url(
@@ -48,7 +47,8 @@ def get_redis_client():
             socket_connect_timeout=3,
             socket_timeout=3,
             retry_on_timeout=True,
-            max_attempts=3
+            max_attempts=3,
+            max_connections=50  # Connection pooling
         )
     except Exception as e:
         logging.error(f"Redis connection error: {str(e)}")
@@ -126,12 +126,14 @@ def log_signal(symbol: str, signal: str, gpt_reply: str, strike: int | None = No
     }
     signal_log.append(entry)
     try:
-        redis_client.rpush("trade_logs", json.dumps(entry))
+        if redis_client:
+            redis_client.rpush("trade_logs", json.dumps(entry))
+            # Trim logs to keep only the last MAX_LOG_ENTRIES
+            redis_client.ltrim("trade_logs", -MAX_LOG_ENTRIES, -1)
     except Exception as e:
         logging.warning(f"Redis logging failed: {e}")
 
 # === Initialize Logs from Redis ===
-# Replace your log loading code with this:
 try:
     if redis_client:
         # Load trade signals
@@ -158,7 +160,6 @@ except Exception as e:
     # Continue with empty logs
     signal_log = []
     outcome_log = []
-    
 
 # === Symbol and Market Validation ===
 async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
@@ -243,8 +244,13 @@ async def get_option_greeks(symbol: str) -> Dict[str, Any]:
             else:
                 underlying_price = 0
 
-            # Find nearest ATM call - Fixed the unclosed parenthesis here
-            valid_options = sorted(valid_options, key=lambda o: abs(o.get("details", {}).get("strike_price", 0)) - underlying_price)
+            # Find nearest ATM option by absolute difference between strike and underlying
+            def get_abs_diff(option):
+                details = option.get("details", {})
+                strike_price = details.get("strike_price", 0)
+                return abs(strike_price - underlying_price)
+                
+            valid_options.sort(key=get_abs_diff)
             
             # Return greeks from first valid option
             for opt in valid_options:
@@ -408,60 +414,28 @@ Respond with:
         logging.exception("Alert processing failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-# === Outcome Logging Endpoint ===
+# === Improved Outcome Logging Endpoint ===
 @app.post("/log_outcome")
-async def log_outcome(request: Request):
-    try:
-        # Try to parse as JSON first
-        try:
-            outcome_data = await request.json()
-            outcome = Outcome(**outcome_data)
-        except json.JSONDecodeError:
-            # If JSON fails, try parsing as TradingView alert format
-            body = await request.body()
-            text = body.decode("utf-8")
-            
-            # Parse TradingView format: "CALL/PUT Signal: SYMBOL at PRICE"
-            pattern = r"(CALL|PUT)\s+Signal:\s+(\w+)\s+at\s+([\d.]+)"
-            match = re.search(pattern, text)
-            if not match:
-                raise HTTPException(status_code=400, detail="Invalid alert format")
-            
-            signal_type, symbol, price = match.groups()
-            current_time = datetime.now(ZoneInfo("America/New_York")).isoformat()
-            
-            outcome = Outcome(
-                symbol=symbol.upper(),
-                signal=signal_type.lower(),
-                entry_price=float(price),
-                exit_price=float(price),  # Assuming same price for simplicity
-                entry_time=current_time,
-                exit_time=current_time,
-                outcome="win"  # Default to win, can be adjusted
-            )
-
-        # Calculate profit metrics
-        outcome.profit = outcome.exit_price - outcome.entry_price
-        outcome.profit_pct = (outcome.profit / outcome.entry_price) * 100 if outcome.entry_price != 0 else 0
-        
-        # Prepare log entry
-        log_entry = outcome.dict()
-        log_entry["timestamp"] = datetime.now(ZoneInfo("America/New_York")).isoformat()
-        
-        # Store in Redis and in-memory log
-        outcome_log.append(log_entry)
-        try:
-            redis_client.rpush("outcome_logs", json.dumps(log_entry))
-        except Exception as e:
-            logging.warning(f"Redis outcome logging failed: {str(e)}")
-        
-        return {"status": "logged", "data": log_entry}
+async def log_outcome(outcome: Outcome):
+    # Calculate profit metrics
+    outcome.profit = outcome.exit_price - outcome.entry_price
+    outcome.profit_pct = (outcome.profit / outcome.entry_price) * 100 if outcome.entry_price != 0 else 0
     
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=f"Validation error: {str(e)}")
+    # Prepare log entry
+    log_entry = outcome.dict()
+    log_entry["timestamp"] = datetime.now(ZoneInfo("America/New_York")).isoformat()
+    
+    # Store in Redis and in-memory log
+    outcome_log.append(log_entry)
+    try:
+        if redis_client:
+            redis_client.rpush("outcome_logs", json.dumps(log_entry))
+            # Trim logs to keep only the last MAX_LOG_ENTRIES
+            redis_client.ltrim("outcome_logs", -MAX_LOG_ENTRIES, -1)
     except Exception as e:
-        logging.error(f"Error logging outcome: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logging.warning(f"Redis outcome logging failed: {str(e)}")
+    
+    return {"status": "logged", "data": log_entry}
 
 # === Filtered Signal Retrieval ===
 @app.get("/signals")
@@ -651,19 +625,32 @@ async def handle_alert(alert: Alert):
 def scheduled_daily_summary():
     asyncio.create_task(send_daily_summary())
 
+# === Enhanced Health Check ===
+@app.get("/")
+async def health_check():
+    redis_status = "down"
+    if redis_client:
+        try:
+            redis_client.ping()
+            redis_status = "ok"
+        except redis.RedisError:
+            pass
+
+    return {
+        "status": "running",
+        "signals": len(signal_log),
+        "outcomes": len(outcome_log),
+        "cooldown_entries": len(cooldown_tracker),
+        "redis": redis_status,
+        "log_sizes": {
+            "trade_logs": redis_client.llen("trade_logs") if redis_status == "ok" else 0,
+            "outcome_logs": redis_client.llen("outcome_logs") if redis_status == "ok" else 0
+        }
+    }
+
 # === Startup Event ===
 @app.on_event("startup")
 async def startup_event():
     scheduler.start()
     logging.info("Scheduler started - Daily summaries scheduled at 4:15 PM ET")
     logging.info(f"System initialized with {len(signal_log)} signals and {len(outcome_log)} outcomes")
-
-# === Health Check ===
-@app.get("/")
-async def health_check():
-    return {
-        "status": "running",
-        "signals": len(signal_log),
-        "outcomes": len(outcome_log),
-        "cooldown_entries": len(cooldown_tracker)
-    }
