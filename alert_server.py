@@ -1,12 +1,12 @@
-# main.py (Enhanced Trading System with Redis Logging)
+# main.py (Redis-Free Trading System)
 import os
 import logging
 import re
+import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import asyncio
-import json
 
 try:
     import ssl
@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 from cachetools import TTLCache
 from zoneinfo import ZoneInfo
 import httpx
-import redis
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -33,28 +32,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+LOG_PERSISTENCE_FILE = os.getenv("LOG_PERSISTENCE_FILE", "trading_logs.json")
 
 # === Constants ===
-MAX_LOG_ENTRIES = 1000  # Maximum entries to keep in Redis logs
-
-# === Redis Client ===
-def get_redis_client():
-    try:
-        return redis.Redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            socket_connect_timeout=3,
-            socket_timeout=3,
-            retry_on_timeout=True,
-            max_attempts=3,
-            max_connections=50  # Connection pooling
-        )
-    except Exception as e:
-        logging.error(f"Redis connection error: {str(e)}")
-        return None
-
-redis_client = get_redis_client()
+MAX_LOG_ENTRIES = 1000  # Maximum entries to keep in logs
+RENDER_PORT = int(os.getenv("PORT", 8000))  # Render.com default port
 
 # === Caching ===
 cache: TTLCache = TTLCache(maxsize=200, ttl=300)
@@ -63,8 +45,8 @@ gpt_cache: TTLCache = TTLCache(maxsize=500, ttl=60)
 # === Cooldown + Logs ===
 cooldown_tracker: Dict[Tuple[str, str], datetime] = {}
 COOLDOWN_WINDOW = timedelta(minutes=10)
-signal_log: list = []
-outcome_log: list = []
+signal_log = deque(maxlen=MAX_LOG_ENTRIES)
+outcome_log = deque(maxlen=MAX_LOG_ENTRIES)
 
 # === Models ===
 class Alert(BaseModel):
@@ -125,41 +107,39 @@ def log_signal(symbol: str, signal: str, gpt_reply: str, strike: int | None = No
         "timestamp": datetime.now(ZoneInfo("America/New_York")).isoformat()
     }
     signal_log.append(entry)
-    try:
-        if redis_client:
-            redis_client.rpush("trade_logs", json.dumps(entry))
-            # Trim logs to keep only the last MAX_LOG_ENTRIES
-            redis_client.ltrim("trade_logs", -MAX_LOG_ENTRIES, -1)
-    except Exception as e:
-        logging.warning(f"Redis logging failed: {e}")
+    return entry
 
-# === Initialize Logs from Redis ===
-try:
-    if redis_client:
-        # Load trade signals
-        redis_signals = redis_client.lrange("trade_logs", 0, -1)
-        for entry in redis_signals:
-            try:
-                signal_log.append(json.loads(entry))
-            except json.JSONDecodeError:
-                logging.warning(f"Failed to decode Redis log entry: {entry}")
-        
-        # Load outcomes
-        redis_outcomes = redis_client.lrange("outcome_logs", 0, -1)
-        for entry in redis_outcomes:
-            try:
-                outcome_log.append(json.loads(entry))
-            except json.JSONDecodeError:
-                logging.warning(f"Failed to decode Redis outcome entry: {entry}")
-        
-        logging.info(f"Loaded {len(signal_log)} signals and {len(outcome_log)} outcomes from Redis")
-    else:
-        logging.warning("Redis client not available - starting with empty logs")
-except Exception as e:
-    logging.error(f"Failed loading logs from Redis: {str(e)}")
-    # Continue with empty logs
-    signal_log = []
-    outcome_log = []
+# === Initialize Logs from File ===
+def load_logs_from_file():
+    global signal_log, outcome_log
+    
+    try:
+        if os.path.exists(LOG_PERSISTENCE_FILE):
+            with open(LOG_PERSISTENCE_FILE, 'r') as f:
+                logs = json.load(f)
+                signal_log = deque(logs.get('signals', []), maxlen=MAX_LOG_ENTRIES)
+                outcome_log = deque(logs.get('outcomes', []), maxlen=MAX_LOG_ENTRIES)
+            logging.info(f"Loaded {len(signal_log)} signals and {len(outcome_log)} outcomes from file")
+        else:
+            logging.info("No log file found - starting with empty logs")
+    except Exception as e:
+        logging.error(f"Failed loading logs from file: {str(e)}")
+        signal_log = deque(maxlen=MAX_LOG_ENTRIES)
+        outcome_log = deque(maxlen=MAX_LOG_ENTRIES)
+
+# === Save Logs to File ===
+def save_logs_to_file():
+    try:
+        logs = {
+            'signals': list(signal_log),
+            'outcomes': list(outcome_log),
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        with open(LOG_PERSISTENCE_FILE, 'w') as f:
+            json.dump(logs, f, indent=2)
+        logging.info(f"Saved {len(signal_log)} signals and {len(outcome_log)} outcomes to file")
+    except Exception as e:
+        logging.error(f"Failed to save logs: {str(e)}")
 
 # === Symbol and Market Validation ===
 async def validate_symbol_and_market(symbol: str, allow_closed: bool = False):
@@ -425,15 +405,8 @@ async def log_outcome(outcome: Outcome):
     log_entry = outcome.dict()
     log_entry["timestamp"] = datetime.now(ZoneInfo("America/New_York")).isoformat()
     
-    # Store in Redis and in-memory log
+    # Store in in-memory log
     outcome_log.append(log_entry)
-    try:
-        if redis_client:
-            redis_client.rpush("outcome_logs", json.dumps(log_entry))
-            # Trim logs to keep only the last MAX_LOG_ENTRIES
-            redis_client.ltrim("outcome_logs", -MAX_LOG_ENTRIES, -1)
-    except Exception as e:
-        logging.warning(f"Redis outcome logging failed: {str(e)}")
     
     return {"status": "logged", "data": log_entry}
 
@@ -445,7 +418,7 @@ async def get_filtered_signals(
     max_confidence: Optional[int] = None,
     limit: int = 50
 ) -> List[Dict]:
-    filtered = signal_log
+    filtered = list(signal_log)
     
     if symbol:
         filtered = [s for s in filtered if s["symbol"] == symbol.upper()]
@@ -467,7 +440,7 @@ async def get_filtered_outcomes(
     outcome_type: Optional[str] = None,
     limit: int = 50
 ) -> List[Dict]:
-    filtered = outcome_log
+    filtered = list(outcome_log)
     
     if symbol:
         filtered = [o for o in filtered if o["symbol"] == symbol.upper()]
@@ -489,18 +462,19 @@ async def get_performance_stats():
     if not outcome_log:
         return {"message": "No outcomes logged yet"}
     
+    outcomes = list(outcome_log)
     # Calculate performance metrics
-    wins = [o for o in outcome_log if o["outcome"] == "win"]
-    losses = [o for o in outcome_log if o["outcome"] == "loss"]
+    wins = [o for o in outcomes if o["outcome"] == "win"]
+    losses = [o for o in outcomes if o["outcome"] == "loss"]
     
-    win_rate = len(wins) / len(outcome_log) * 100
-    avg_profit = sum(o["profit"] for o in outcome_log) / len(outcome_log)
+    win_rate = len(wins) / len(outcomes) * 100
+    avg_profit = sum(o["profit"] for o in outcomes) / len(outcomes)
     avg_win = sum(o["profit"] for o in wins) / len(wins) if wins else 0
     avg_loss = sum(o["profit"] for o in losses) / len(losses) if losses else 0
     
     # Calculate best/worst performers
     symbol_perf = defaultdict(list)
-    for o in outcome_log:
+    for o in outcomes:
         symbol_perf[o["symbol"]].append(o["profit_pct"])
     
     best_symbol = ""
@@ -511,10 +485,11 @@ async def get_performance_stats():
         worst_symbol = min(symbol_avg, key=symbol_avg.get)
     
     # Confidence performance correlation
+    signals = list(signal_log)
     conf_perf = []
-    for o in outcome_log:
+    for o in outcomes:
         # Find matching signal
-        signal = next((s for s in signal_log 
+        signal = next((s for s in signals 
                       if s["symbol"] == o["symbol"] 
                       and s["timestamp"] == o["entry_time"]), None)
         if signal:
@@ -526,7 +501,7 @@ async def get_performance_stats():
     avg_conf_profit = sum(cp["profit_pct"] for cp in conf_perf) / len(conf_perf) if conf_perf else 0
     
     return {
-        "total_trades": len(outcome_log),
+        "total_trades": len(outcomes),
         "win_rate": round(win_rate, 2),
         "avg_profit": round(avg_profit, 4),
         "avg_win": round(avg_win, 4),
@@ -625,32 +600,51 @@ async def handle_alert(alert: Alert):
 def scheduled_daily_summary():
     asyncio.create_task(send_daily_summary())
 
-# === Enhanced Health Check ===
+# === Health Check ===
 @app.get("/")
 async def health_check():
-    redis_status = "down"
-    if redis_client:
-        try:
-            redis_client.ping()
-            redis_status = "ok"
-        except redis.RedisError:
-            pass
-
     return {
         "status": "running",
         "signals": len(signal_log),
         "outcomes": len(outcome_log),
         "cooldown_entries": len(cooldown_tracker),
-        "redis": redis_status,
-        "log_sizes": {
-            "trade_logs": redis_client.llen("trade_logs") if redis_status == "ok" else 0,
-            "outcome_logs": redis_client.llen("outcome_logs") if redis_status == "ok" else 0
-        }
+        "environment": "production",
+        "deployment": "render.com",
+        "log_retention": f"{len(signal_log)}/{MAX_LOG_ENTRIES} signals, {len(outcome_log)}/{MAX_LOG_ENTRIES} outcomes"
     }
 
 # === Startup Event ===
 @app.on_event("startup")
 async def startup_event():
+    load_logs_from_file()
     scheduler.start()
+    
+    # Schedule periodic log saving
+    scheduler.add_job(
+        save_logs_to_file,
+        'interval',
+        minutes=15,
+        timezone=ZoneInfo("America/New_York")
+    )
+    
     logging.info("Scheduler started - Daily summaries scheduled at 4:15 PM ET")
     logging.info(f"System initialized with {len(signal_log)} signals and {len(outcome_log)} outcomes")
+    logging.info(f"Server running on port {RENDER_PORT}")
+
+# === Shutdown Event ===
+@app.on_event("shutdown")
+async def shutdown_event():
+    save_logs_to_file()
+    logging.info("Application shutting down - logs saved")
+
+# === Run Server for Render ===
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=RENDER_PORT,
+        reload=False,
+        workers=1,
+        timeout_keep_alive=60
+    )
