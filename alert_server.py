@@ -1,4 +1,4 @@
-# main.py (Redis-Free Trading System)
+# main.py (-Free Trading System)
 import os
 import logging
 import re
