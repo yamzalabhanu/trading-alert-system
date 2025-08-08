@@ -393,9 +393,9 @@ async def process_alert(alert: Alert):
             if alert.indicators.get("RSI", 0) > 60 and alert.signal == "buy": score += 1
             if alert.indicators.get("RSI", 0) < 40 and alert.signal == "sell": score += 1
         
-        if score < 1:
-            logger.info(f"Signal filtered for {alert.symbol}: low score {score}")
-            return {"status": "filtered", "reason": "low local score"}
+     //   if score < 1:
+       //     logger.info(f"Signal filtered for {alert.symbol}: low score {score}")
+         //   return {"status": "filtered", "reason": "low local score"}
 
         cache_key = f"gpt_{alert.symbol}_{alert.signal}_{alert.strike}_{alert.expiry}"
         gpt_prompt = f"""
