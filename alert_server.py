@@ -485,6 +485,23 @@ else:
                 await send_telegram(f"Intraday job failed: {e}")
 
     # ===== API =====
+    # --- Test Telegram endpoints ---
+    @app.post("/test/telegram")
+    async def test_telegram_post(payload: Dict[str, Any]):
+        """Send a test alert to Telegram with provided text.
+        Body: {"text": "your message"}
+        """
+        text = (payload or {}).get("text")
+        if not text or not isinstance(text, str):
+            raise HTTPException(400, "Provide JSON body with {'text': '<message>'}")
+        await send_telegram(text)
+        return {"ok": True, "sent": True, "len": len(text)}
+
+    @app.get("/test/telegram")
+    async def test_telegram_get(text: str = "Test alert: system is online ✅"):
+        await send_telegram(text)
+        return {"ok": True, "sent": True, "len": len(text)}
+
     @app.on_event("startup")
     async def on_startup():
         # Start background loops
@@ -509,22 +526,6 @@ else:
     async def healthz():
         tz_name = getattr(NY, "key", None) if TZ_ET_OK else "UTC (fallback)"
         return {"status": "ok", "ssl": True, "timezone": tz_name, "tz_et_ok": TZ_ET_OK}
-
-    # --- Add test Telegram endpoints here ---
-@app.post("/test/telegram")
-async def test_telegram_post(payload: Dict[str, Any]):
-    """Send a test alert to Telegram with provided text."""
-    text = (payload or {}).get("text")
-    if not text or not isinstance(text, str):
-        raise HTTPException(400, "Provide JSON body with {'text': '<message>'}")
-    await send_telegram(text)
-    return {"ok": True, "sent": True, "len": len(text)}
-
-@app.get("/test/telegram")
-async def test_telegram_get(text: str = "Test alert: system is online ✅"):
-    await send_telegram(text)
-    return {"ok": True, "sent": True, "len": len(text)}
-    
 
     @app.get("/status")
     async def status():
