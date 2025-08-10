@@ -10,3 +10,4 @@ apscheduler
 pytz
 tzdata
 numpy
+micropip
