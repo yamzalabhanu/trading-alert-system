@@ -47,15 +47,30 @@ try:
 except Exception:  # pragma: no cover - tests don't require network
     httpx = None  # type: ignore
 
+# replace current fastapi import try-block with this
 try:
-    from fastapi import APIRouter, HTTPException  # type: ignore
+    from fastapi import FastAPI, APIRouter, HTTPException  # type: ignore
     FASTAPI_AVAILABLE = True
-except Exception:  # pragma: no cover - still allow running tests
+except Exception:  # pragma: no cover
     APIRouter = None  # type: ignore
     FASTAPI_AVAILABLE = False
     class HTTPException(Exception):  # type: ignore
         def __init__(self, status_code: int, detail: str):
             super().__init__(f"HTTP {status_code}: {detail}")
+
+# ==============================================================================
+# ASGI app entrypoint: expose `app` so `uvicorn alert_server:app` works
+# ==============================================================================
+if FASTAPI_AVAILABLE:
+    app = FastAPI(title="Options Alerts Add-on")  # type: ignore
+
+    @app.get("/health")
+    async def _health():  # type: ignore
+        return {"ok": True, "component": "intraday_options_addon", "router": bool(router)}
+
+    if router is not None:
+        app.include_router(router)  # type: ignore
+
 
 # ==============================================================================
 # Providers (Polygon) — network calls are guarded and return None/[] on failure
