@@ -11,3 +11,4 @@ pytz
 tzdata
 numpy
 micropip
+openai
