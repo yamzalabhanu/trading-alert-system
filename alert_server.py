@@ -2,36 +2,106 @@ import os
 import re
 import json
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone, date
 from typing import Dict, Any, Optional, Tuple, List
 
-import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+# =============================================================
+# Robust import strategy to work in sandboxes WITHOUT ssl module
+# =============================================================
+try:
+    import ssl  # noqa: F401
+    SSL_AVAILABLE = True
+except Exception:
+    SSL_AVAILABLE = False
 
-# === Environment ===
+# Try to import FastAPI only if ssl is available (Starlette/AnyIO import ssl)
+try:
+    if not SSL_AVAILABLE:
+        raise ImportError("ssl not available; defer FastAPI import")
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import JSONResponse
+except Exception:
+    # Lightweight stubs so the module can be imported and unit tests can run
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str = ""):
+            self.status_code = status_code
+            self.detail = detail
+            super().__init__(detail)
+
+    class JSONResponse(dict):
+        pass
+
+    class _StubRequest:  # minimal placeholder
+        headers: Dict[str, str] = {}
+        async def body(self) -> bytes:  # pragma: no cover
+            return b""
+
+    class _StubApp:
+        """A tiny stand-in for FastAPI used when ssl (and thus Starlette) isn't available.
+        It supports .get/.post decorators and a no-op .on_event to satisfy code that
+        registers lifecycle handlers.
+        """
+        def __init__(self, *_: Any, **__: Any):
+            self.routes: Dict[Tuple[str, str], Any] = {}
+            self.events: Dict[str, List[Any]] = {}
+        def get(self, path: str, *_, **__):
+            def deco(fn):
+                self.routes[("GET", path)] = fn
+                return fn
+            return deco
+        def post(self, path: str, *_, **__):
+            def deco(fn):
+                self.routes[("POST", path)] = fn
+                return fn
+            return deco
+        def on_event(self, event: str):  # NEW: mock lifecycle hook
+            def deco(fn):
+                self.events.setdefault(event, []).append(fn)
+                return fn
+            return deco
+        async def __call__(self, scope, receive, send):  # pragma: no cover
+            raise RuntimeError("FastAPI unavailable: ssl module missing in this environment.")
+    FastAPI = _StubApp  # type: ignore
+    Request = _StubRequest  # type: ignore
+
+# -------------------- Logging --------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# -------------------- Environment --------------------
 POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY", "")
 FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Safety checks (validated at request time; we don't fail startup)
 REQUIRED_KEYS = {
     "POLYGON_API_KEY": POLYGON_API_KEY,
     "FINNHUB_API_KEY": FINNHUB_API_KEY,
     "OPENAI_API_KEY": OPENAI_API_KEY,
 }
 
-# === App & HTTP client ===
+# -------------------- HTTP client (lazy, avoids importing httpx when ssl is missing) --------------------
+_http_client = None
+
+def get_http_client():
+    global _http_client
+    if _http_client is not None:
+        return _http_client
+    if not SSL_AVAILABLE:
+        # In this sandbox there is no TLS; network calls shouldn't run.
+        raise RuntimeError("SSL not available; HTTP client disabled in this environment.")
+    # Lazy import httpx to avoid AnyIO->ssl import at module import time in restricted envs
+    import httpx  # noqa: WPS433
+    HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
+    transport = httpx.AsyncHTTPTransport(retries=2)
+    _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=transport, headers={"Accept-Encoding": "gzip"})
+    return _http_client
+
+# -------------------- App --------------------
 app = FastAPI(title="TradingView → Polygon/Finnhub → OpenAI Decision API")
 
-HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
-transport = httpx.AsyncHTTPTransport(retries=2)
-client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=transport, headers={"Accept-Encoding": "gzip"})
-
-# === Simple in-memory quota for LLM calls (20/day) ===
+# -------------------- LLM quota --------------------
 LLM_DAILY_LIMIT = 20
 _llm_calls_today = 0
 _llm_roll_date = datetime.now(timezone.utc).date()
@@ -51,61 +121,94 @@ def _tick_llm_quota():
     global _llm_calls_today
     _llm_calls_today += 1
 
-# === Regex for alert parsing ===
-# Example: "PUT/CALL: AAPL at $230 Strike: $245 Expiry: 08-15-2025"
+# -------------------- Alert parsing --------------------
 ALERT_RE = re.compile(
-    r"""(?ix)          # ignore case, verbose
+    r"""(?ix)
     ^\s*
-    (PUT|CALL)         # 1: side
+    (PUT|CALL)
     \s*:\s*
-    ([A-Z.\-]+)        # 2: ticker (AAPL, BRK.B, etc)
-    \s+at\s+\$?([\d.]+)   # 3: underlying price (optional use)
-    \s+Strike:\s+\$?([\d.]+) # 4: strike
-    \s+Expiry:\s+(\d{2}-\d{2}-\d{4}) # 5: MM-DD-YYYY
+    ([A-Z.\-]+)
+    \s+at\s+\$?([\d.]+)
+    \s+Strike:\s+\$?([\d.]+)
+    \s+Expiry:\s+(\d{2}-\d{2}-\d{4})
     \s*$
     """
 )
 
 def parse_alert(text: str) -> Dict[str, Any]:
+    logging.info("Processing alert: %s", text)
     m = ALERT_RE.match(text.strip())
     if not m:
         raise ValueError("Alert format invalid. Expected: 'PUT/CALL: TICKER at $PRICE Strike: $STRIKE Expiry: MM-DD-YYYY'")
-    side = m.group(1).upper()       # PUT or CALL
+    side = m.group(1).upper()
     ticker = m.group(2).upper()
     price = float(m.group(3))
     strike = float(m.group(4))
-    exp_str = m.group(5)            # MM-DD-YYYY
+    exp_str = m.group(5)
     exp_iso = datetime.strptime(exp_str, "%m-%d-%Y").date().isoformat()
     return {"side": side, "ticker": ticker, "price": price, "strike": strike, "expiry": exp_iso, "expiry_input": exp_str}
 
-# === Nearby search knobs ===
+# -------------------- Nearby search knobs --------------------
 NEARBY_DAY_WINDOW = 7           # +/- days around requested expiry
 STRIKE_PCT_WINDOW = 0.10        # +/- percent around requested strike (10%)
 MAX_CANDIDATES    = 5           # how many closest contracts to return
 
-# === Helpers: Polygon ===
+# -------------------- Polygon helpers (with graceful auth handling) --------------------
+class PolygonAuthzError(Exception):
+    def __init__(self, msg: str):
+        self.msg = msg
+        super().__init__(msg)
 
 async def polygon_get(url: str, params: Dict[str, Any] = None) -> Any:
     if not POLYGON_API_KEY:
         raise HTTPException(500, detail="Missing POLYGON_API_KEY")
-    params = params or {}
+    params = dict(params or {})
     params["apiKey"] = POLYGON_API_KEY
-    r = await client.get(url, params=params)
+    logging.info("Retrieving data from Polygon.io: %s", url)
+    cli = get_http_client()
+    r = await cli.get(url, params=params)
     if r.status_code >= 400:
+        try:
+            j = r.json()
+            if isinstance(j, dict) and str(j.get("status")).upper() == "NOT_AUTHORIZED":
+                raise PolygonAuthzError(j.get("message", "NOT_AUTHORIZED"))
+        except Exception:
+            pass
         raise HTTPException(r.status_code, detail=f"Polygon error: {r.text}")
     return r.json()
 
-async def get_intraday_volume_snapshot(ticker: str) -> Dict[str, Any]:
+async def get_intraday_volume_snapshot(ticker: str, warnings: List[str]) -> Dict[str, Any]:
+    logging.info("Retrieving Polygon indicators/volume for %s", ticker)
     prev = await polygon_get(f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev")
-    today = datetime.now(timezone.utc).date().isoformat()
-    aggs = await polygon_get(f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{today}/{today}",
-                             params={"adjusted": "true", "sort": "asc", "limit": 1200})
     prev_vol = (prev.get("results") or [{}])[0].get("v", None)
-    today_vol = sum(b.get("v", 0) for b in aggs.get("results", []) or [])
-    return {"prev_volume": prev_vol, "today_volume": today_vol}
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    # Try minute bars first
+    try:
+        aggs = await polygon_get(
+            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{today}/{today}",
+            params={"adjusted": "true", "sort": "asc", "limit": 1200}
+        )
+        today_vol = sum(b.get("v", 0) for b in (aggs.get("results") or []))
+        return {"prev_volume": prev_vol, "today_volume": today_vol, "timespan": "minute"}
+    except PolygonAuthzError as e:
+        warnings.append(f"Minute bars not available on current plan: {e.msg}. Fell back to daily bars.")
+
+    # Fallback: daily bars
+    try:
+        daggs = await polygon_get(
+            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{today}/{today}",
+            params={"adjusted": "true", "sort": "asc", "limit": 1}
+        )
+        rows = daggs.get("results") or []
+        today_vol = rows[0].get("v") if rows else None
+        return {"prev_volume": prev_vol, "today_volume": today_vol, "timespan": "day"}
+    except PolygonAuthzError as e:
+        warnings.append(f"Daily bars not available on current plan: {e.msg}. Today volume unavailable.")
+        return {"prev_volume": prev_vol, "today_volume": None, "timespan": "unavailable"}
 
 async def get_indicators(ticker: str) -> Dict[str, Any]:
-    # Daily EMA9/EMA21/RSI14/ADX14; adjust timespan/window/limit if you prefer
     ema9  = await polygon_get(f"https://api.polygon.io/v1/indicators/ema/{ticker}",
                               params={"timespan": "day", "window": 9, "series_type": "close", "limit": 1})
     ema21 = await polygon_get(f"https://api.polygon.io/v1/indicators/ema/{ticker}",
@@ -115,9 +218,9 @@ async def get_indicators(ticker: str) -> Dict[str, Any]:
     adx14 = await polygon_get(f"https://api.polygon.io/v1/indicators/adx/{ticker}",
                               params={"timespan": "day", "window": 14, "limit": 1})
 
-    def last_val(obj, key="results"):
+    def last_val(obj):
         try:
-            return (obj.get(key) or [])[0].get("values", [])[0].get("value")
+            return (obj.get("results") or [])[0].get("values", [])[0].get("value")
         except Exception:
             return None
 
@@ -127,6 +230,8 @@ async def get_indicators(ticker: str) -> Dict[str, Any]:
         "rsi14": last_val(rsi14),
         "adx14": last_val(adx14),
     }
+
+# -------------------- Nearby contract search --------------------
 
 def _iso(d: date) -> str:
     return d.isoformat()
@@ -145,13 +250,7 @@ async def find_option_candidates_nearby(
     strike_pct_window: float = STRIKE_PCT_WINDOW,
     max_candidates: int = MAX_CANDIDATES,
 ) -> List[Dict[str, Any]]:
-    """
-    Find nearby option contracts constrained by:
-      - contract_type == side (CALL/PUT)
-      - expiration_date within +/- day_window days of requested expiry
-      - strike within +/- strike_pct_window of requested strike
-    Rank by (days_from_target, abs(strike_pct_diff)).
-    """
+    logging.info("Searching for nearby option contracts for %s", ticker)
     ctype = "call" if side.upper() == "CALL" else "put"
 
     tgt_date = datetime.fromisoformat(expiry_iso).date()
@@ -178,8 +277,7 @@ async def find_option_candidates_nearby(
     if not results:
         return []
 
-    def rank_key(row: Dict[str, Any]) -> Tuple[float, float, float]:
-        # smaller is better
+    def rank_key(row: Dict[str, Any]):
         try:
             exp = datetime.fromisoformat(row["expiration_date"]).date()
         except Exception:
@@ -192,11 +290,7 @@ async def find_option_candidates_nearby(
     ranked = sorted(results, key=rank_key)
     return ranked[:max_candidates]
 
-async def get_option_snapshots_many(underlying: str, option_tickers: List[str]) -> List[Dict[str, Any]]:
-    """
-    Fetch snapshots for multiple option tickers, one-by-one (parallelized).
-    Uses /v3/snapshot/options/{underlying} filtered by ticker.
-    """
+async def get_option_snapshots_many(underlying: str, option_tickers: List[str], warnings: List[str]) -> List[Dict[str, Any]]:
     async def _one(tkr: str):
         try:
             snap = await polygon_get(
@@ -208,44 +302,41 @@ async def get_option_snapshots_many(underlying: str, option_tickers: List[str]) 
                 if r.get("ticker") == tkr:
                     return r
             return rows[0] if rows else None
+        except PolygonAuthzError as e:
+            warnings.append(f"Option snapshots not available on current plan: {e.msg}.")
+            return None
         except Exception:
             return None
 
-    tasks = [asyncio.create_task(_one(t)) for t in option_tickers]
-    snaps = await asyncio.gather(*tasks)
+    snaps = await asyncio.gather(*(asyncio.create_task(_one(t)) for t in option_tickers))
     return [s for s in snaps if s]
 
-# === Helpers: Finnhub ===
-
+# -------------------- Finnhub helpers --------------------
 async def finnhub_get(url: str, params: Dict[str, Any]) -> Any:
     if not FINNHUB_API_KEY:
         raise HTTPException(500, detail="Missing FINNHUB_API_KEY")
     params = dict(params or {})
     params["token"] = FINNHUB_API_KEY
-    r = await client.get(url, params=params)
+    logging.info("Fetching news data from Finnhub: %s", url)
+    cli = get_http_client()
+    r = await cli.get(url, params=params)
     if r.status_code >= 400:
         raise HTTPException(r.status_code, detail=f"Finnhub error: {r.text}")
     return r.json()
 
 async def get_news_and_sentiment(ticker: str) -> Dict[str, Any]:
+    logging.info("Fetching Finnhub news/sentiment for %s", ticker)
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=3)
     news = await finnhub_get("https://finnhub.io/api/v1/company-news", {"symbol": ticker, "from": start.isoformat(), "to": end.isoformat()})
     sent = await finnhub_get("https://finnhub.io/api/v1/news-sentiment", {"symbol": ticker})
     overall = sent.get("sentiment", {}) if isinstance(sent, dict) else {}
     score = overall.get("score", 0) if isinstance(overall, dict) else 0
-    return {
-        "news": news[:8] if isinstance(news, list) else [],
-        "sentiment_score": score
-    }
+    return {"news": news[:8] if isinstance(news, list) else [], "sentiment_score": score}
 
-# === Helpers: OpenAI ===
-
+# -------------------- OpenAI helper --------------------
 async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calls OpenAI *only* if we are under the daily quota.
-    Returns a decision dict: { "decision": "BUY/SELL/NEUTRAL", "confidence": 0-100, "rationale": "..." }
-    """
+    logging.info("LLM processing start for %s", payload["ticker"])
     if not OPENAI_API_KEY:
         raise HTTPException(500, detail="Missing OPENAI_API_KEY")
     if not _llm_quota_ok():
@@ -263,12 +354,14 @@ async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
         f"ALERT: {payload['side']} {payload['ticker']} strike {payload['strike']} exp {payload['expiry']} (spot ~{payload['price']}).\n"
         f"TECH: EMA9={payload['indicators'].get('ema9')}, EMA21={payload['indicators'].get('ema21')}, "
         f"RSI14={payload['indicators'].get('rsi14')}, ADX14={payload['indicators'].get('adx14')}.\n"
-        f"VOL: prev_vol={payload['volume'].get('prev_volume')}, today_vol={payload['volume'].get('today_volume')}.\n"
+        f"VOL: prev_vol={payload['volume'].get('prev_volume')}, today_vol={payload['volume'].get('today_volume')} (timespan={payload['volume'].get('timespan')}).\n"
         f"OPTION (top candidate snapshot): {payload['option_snapshot']}\n"
         f"NEWS_SENTIMENT: {payload['news'].get('sentiment_score')}; recent_headlines_count={len(payload['news'].get('news', []))}.\n"
         "Return JSON with keys: decision, confidence, rationale."
     )
 
+    # Lazy import httpx to avoid ssl import at module import time
+    cli = get_http_client()
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     body = {
         "model": "gpt-4o-mini",
@@ -280,7 +373,7 @@ async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
         "max_tokens": 300,
         "temperature": 0.2,
     }
-    resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
+    resp = await cli.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, detail=f"OpenAI error: {resp.text}")
     _tick_llm_quota()
@@ -295,7 +388,8 @@ async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"decision": "NEUTRAL", "confidence": 0, "rationale": "Model response parse error"}
 
-# === Simple heuristic score (pre-LLM) ===
+# -------------------- Simple heuristic score (pre-LLM) --------------------
+
 def simple_score(tech: Dict[str, Any], vol: Dict[str, Any], news_score: float, side: str) -> float:
     score = 0.0
     ema9, ema21 = tech.get("ema9"), tech.get("ema21")
@@ -315,24 +409,31 @@ def simple_score(tech: Dict[str, Any], vol: Dict[str, Any], news_score: float, s
     score += (news_score - 0.5) * 20
     return round(score, 2)
 
-# === Telegram (optional) ===
+# -------------------- Telegram (optional) --------------------
 async def send_telegram(msg: str) -> None:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
+    cli = get_http_client()
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True})
+    await cli.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True})
 
-# === Pydantic model (optional JSON webhook) ===
+# -------------------- Pydantic model (optional JSON webhook) --------------------
+try:
+    from pydantic import BaseModel  # noqa: F811
+except Exception:  # pragma: no cover
+    class BaseModel:  # minimal stub for tests if pydantic missing
+        pass
+
 class AlertIn(BaseModel):
     text: str
 
-# === Routes ===
-
+# -------------------- Health/Quota endpoints --------------------
 @app.get("/health")
 async def health():
     _reset_quota_if_needed()
     return {
         "ok": True,
+        "ssl_available": SSL_AVAILABLE,
         "llm_calls_today": _llm_calls_today,
         "llm_daily_limit": LLM_DAILY_LIMIT,
         "keys_loaded": {k: bool(v) for k, v in REQUIRED_KEYS.items()},
@@ -343,34 +444,35 @@ async def quota():
     _reset_quota_if_needed()
     return {"remaining": max(LLM_DAILY_LIMIT - _llm_calls_today, 0), "limit": LLM_DAILY_LIMIT}
 
+# -------------------- Main webhook --------------------
 @app.post("/webhook/tradingview", response_class=JSONResponse)
 async def tradingview_webhook(request: Request):
-    """
-    Accepts plain text in the TradingView alert body OR JSON { "text": "<alert>" }.
-    """
-    content_type = request.headers.get("content-type", "").lower()
+    content_type = getattr(request, 'headers', {}).get("content-type", "").lower()
 
     if "application/json" in content_type:
-        body = await request.json()
+        body = await request.json() if hasattr(request, 'json') else {}
         text = (body.get("text") or "").strip()
     else:
-        text = (await request.body()).decode("utf-8").strip()
+        raw = await request.body() if hasattr(request, 'body') else b""
+        text = (raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)).strip()
 
     if not text:
         raise HTTPException(400, detail="Empty alert body")
 
-    # 1) Parse
+    # 1) Parse alert
     try:
         parsed = parse_alert(text)
     except ValueError as e:
         raise HTTPException(400, detail=str(e))
 
-    # 2) Fetch data (Polygon + Finnhub) in parallel
+    warnings: List[str] = []
+
+    # 2) Fetch data in parallel (Polygon + Finnhub), with graceful degradation
     try:
         candidates_task = asyncio.create_task(find_option_candidates_nearby(
             parsed["ticker"], parsed["expiry"], parsed["side"], parsed["strike"]
         ))
-        vol_task  = asyncio.create_task(get_intraday_volume_snapshot(parsed["ticker"]))
+        vol_task  = asyncio.create_task(get_intraday_volume_snapshot(parsed["ticker"], warnings))
         ind_task  = asyncio.create_task(get_indicators(parsed["ticker"]))
         news_task = asyncio.create_task(get_news_and_sentiment(parsed["ticker"]))
 
@@ -382,7 +484,7 @@ async def tradingview_webhook(request: Request):
         option_snapshots: List[Dict[str, Any]] = []
         if option_candidates:
             tickers = [c["ticker"] for c in option_candidates if c.get("ticker")]
-            option_snapshots = await get_option_snapshots_many(parsed["ticker"], tickers)
+            option_snapshots = await get_option_snapshots_many(parsed["ticker"], tickers, warnings)
 
     except HTTPException:
         raise
@@ -404,19 +506,23 @@ async def tradingview_webhook(request: Request):
     }
     decision = await openai_decide(payload)
 
-    # 5) Build final message + (optional) Telegram
+    # 5) Optional Telegram + response
     cand_line = f"CANDIDATES: {', '.join([c['ticker'] for c in option_candidates[:3]])}" if option_candidates else "CANDIDATES: none"
+    warn_line = f"WARNINGS: {len(warnings)} (plan limits)" if warnings else "WARNINGS: none"
     summary_lines = [
         f"ALERT ➜ {parsed['side']} {parsed['ticker']}  strike {parsed['strike']}  exp {parsed['expiry_input']} (spot ~{parsed['price']})",
         cand_line,
+        warn_line,
         f"PRE-SCORE: {pre_score}",
         f"DECISION: {decision.get('decision')}  (confidence {decision.get('confidence')}%)",
         f"WHY: {decision.get('rationale')[:300]}",
     ]
-    msg = "\n".join(summary_lines)
-    await send_telegram(msg)
+    try:
+        await send_telegram("\n".join(summary_lines))
+    except Exception:
+        # Ignore Telegram errors in restricted environments
+        pass
 
-    # 6) Response
     return {
         "parsed": parsed,
         "pre_score": pre_score,
@@ -426,11 +532,104 @@ async def tradingview_webhook(request: Request):
         "option_snapshots": option_snapshots,
         "news_sentiment": news.get("sentiment_score"),
         "decision": decision,
+        "warnings": warnings,
         "llm_calls_used_today": _llm_calls_today,
         "llm_daily_limit": LLM_DAILY_LIMIT
     }
 
-# Graceful shutdown: close the shared client
+# -------------------- Shutdown hook --------------------
 @app.on_event("shutdown")
 async def _shutdown():
-    await client.aclose()
+    try:
+        cli = get_http_client()
+        await cli.aclose()
+    except Exception:
+        pass
+
+# =============================================================
+# Minimal unit tests (run: `python fastapi_trading_alert_service.py`)
+# These DO NOT make network calls and work without ssl/fastapi.
+# =============================================================
+
+def _assert(cond: bool, msg: str):  # simple assert so script never exits abruptly in CI-like sandboxes
+    if not cond:
+        logging.error("TEST FAIL: %s", msg)
+        raise AssertionError(msg)
+
+
+def test_parse_alert_valid():
+    s = "CALL: AAPL at $230 Strike: $245 Expiry: 08-15-2025"
+    out = parse_alert(s)
+    _assert(out["side"] == "CALL", "side parse")
+    _assert(out["ticker"] == "AAPL", "ticker parse")
+    _assert(abs(out["price"] - 230.0) < 1e-9, "price parse")
+    _assert(abs(out["strike"] - 245.0) < 1e-9, "strike parse")
+    _assert(out["expiry"] == "2025-08-15", "expiry parse")
+
+
+def test_parse_alert_invalid():
+    bad = "BUY: AAPL 230 245 08-15-2025"
+    try:
+        parse_alert(bad)
+    except ValueError:
+        return
+    raise AssertionError("Invalid alert should raise ValueError")
+
+
+def test_simple_score_direction():
+    tech = {"ema9": 11, "ema21": 10, "rsi14": 60, "adx14": 25}
+    vol = {"prev_volume": 1000, "today_volume": 1500}
+    s_call = simple_score(tech, vol, news_score=0.6, side="CALL")
+    s_put  = simple_score(tech, vol, news_score=0.6, side="PUT")
+    _assert(s_call > s_put, "CALL should score higher when ema9>ema21 & RSI>50")
+
+# --- Additional tests (no network / SSL required) ---
+
+def test_parse_alert_case_insensitive_and_spaces():
+    s = "  put: nvda at $183 Strike: $180 Expiry: 09-20-2025  "
+    out = parse_alert(s)
+    _assert(out["side"] == "PUT", "case-insensitive PUT parse")
+    _assert(out["ticker"] == "NVDA", "ticker upper-cased")
+    _assert(out["expiry"] == "2025-09-20", "expiry normalized to ISO")
+
+
+def test_clamp_strike_bounds():
+    lo, hi = _clamp_strike_bounds(100.0, 0.10)
+    _assert(abs(lo - 90.0) < 1e-9 and abs(hi - 110.0) < 1e-9, "10% strike window bounds")
+
+
+def test_stub_on_event_and_routes_registration():
+    # Only meaningful when FastAPI is stubbed (no ssl)
+    if SSL_AVAILABLE:
+        return
+    _assert(hasattr(app, 'on_event'), "Stub app should have on_event")
+    called = {"shutdown": False}
+
+    @app.on_event("shutdown")
+    async def _test_shutdown():
+        called["shutdown"] = True
+
+    _assert("shutdown" in getattr(app, 'events', {}), "Shutdown event registered in stub")
+
+
+def test_http_client_no_ssl_raises():
+    if SSL_AVAILABLE:
+        return
+    try:
+        get_http_client()
+    except RuntimeError:
+        return
+    raise AssertionError("get_http_client should raise RuntimeError when SSL is unavailable")
+
+
+if __name__ == "__main__":
+    logging.info("Running self-tests...")
+    test_parse_alert_valid()
+    test_parse_alert_invalid()
+    test_simple_score_direction()
+    test_parse_alert_case_insensitive_and_spaces()
+    test_clamp_strike_bounds()
+    test_stub_on_event_and_routes_registration()
+    test_http_client_no_ssl_raises()
+    logging.info("All tests passed. If you need the HTTP server, run with uvicorn in an environment with ssl support:")
+    logging.info("uvicorn fastapi_trading_alert_service:app --host 0.0.0.0 --port 10000")
