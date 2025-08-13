@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone, date
 from typing import Dict, Any, Optional, Tuple, List
 
 # =============================================================
-# Robust import strategy to work in sandboxes WITHOUT ssl module
+# Runs in sandboxes without ssl: avoids network data providers
 # =============================================================
 try:
     import ssl  # noqa: F401
@@ -15,14 +15,13 @@ try:
 except Exception:
     SSL_AVAILABLE = False
 
-# Try to import FastAPI only if ssl is available (Starlette/AnyIO import ssl)
+# FastAPI import (with stubs if ssl isn't available)
 try:
     if not SSL_AVAILABLE:
         raise ImportError("ssl not available; defer FastAPI import")
     from fastapi import FastAPI, Request, HTTPException
     from fastapi.responses import JSONResponse
 except Exception:
-    # Lightweight stubs so the module can be imported and unit tests can run
     class HTTPException(Exception):
         def __init__(self, status_code: int, detail: str = ""):
             self.status_code = status_code
@@ -38,10 +37,7 @@ except Exception:
             return b""
 
     class _StubApp:
-        """A tiny stand-in for FastAPI used when ssl (and thus Starlette) isn't available.
-        It supports .get/.post decorators and a no-op .on_event to satisfy code that
-        registers lifecycle handlers.
-        """
+        """Minimal stand-in for FastAPI, with route decorators and on_event."""
         def __init__(self, *_: Any, **__: Any):
             self.routes: Dict[Tuple[str, str], Any] = {}
             self.events: Dict[str, List[Any]] = {}
@@ -55,7 +51,7 @@ except Exception:
                 self.routes[("POST", path)] = fn
                 return fn
             return deco
-        def on_event(self, event: str):  # mock lifecycle hook
+        def on_event(self, event: str):
             def deco(fn):
                 self.events.setdefault(event, []).append(fn)
                 return fn
@@ -69,28 +65,15 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -------------------- Environment --------------------
-POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Yahoo provider config (supports free RSS or paid API via custom endpoint)
-NEWS_PROVIDER            = os.getenv("NEWS_PROVIDER", "yahoo_rss").lower()  # 'yahoo_rss' (default) or 'yahoo_premium'
-YAHOO_NEWS_URL           = os.getenv("YAHOO_NEWS_URL", "")  # full URL for paid endpoint (preferred)
-YAHOO_API_BASE           = os.getenv("YAHOO_API_BASE", "")  # base URL if not using full URL
-YAHOO_NEWS_ENDPOINT      = os.getenv("YAHOO_NEWS_ENDPOINT", "news")  # relative path joined to base
-YAHOO_SYMBOL_PARAM       = os.getenv("YAHOO_SYMBOL_PARAM", "symbol")  # some APIs use 'ticker'
-YAHOO_EXTRA_PARAMS_JSON  = os.getenv("YAHOO_EXTRA_PARAMS", "")  # JSON string of extra query params
-YAHOO_API_KEY            = os.getenv("YAHOO_API_KEY", "")
-YAHOO_API_KEY_HEADER     = os.getenv("YAHOO_API_KEY_HEADER", "x-api-key")  # e.g., 'X-RapidAPI-Key'
-YAHOO_API_HEADERS_JSON   = os.getenv("YAHOO_API_HEADERS", "")  # JSON string of additional headers (wins over key header)
-
 REQUIRED_KEYS = {
-    "POLYGON_API_KEY": POLYGON_API_KEY,
     "OPENAI_API_KEY": OPENAI_API_KEY,
 }
 
-# -------------------- HTTP client (lazy, avoids importing httpx when ssl is missing) --------------------
+# -------------------- HTTP client (lazy; used only for OpenAI/Telegram) --------------------
 _http_client = None
 
 def get_http_client():
@@ -98,17 +81,15 @@ def get_http_client():
     if _http_client is not None:
         return _http_client
     if not SSL_AVAILABLE:
-        # In this sandbox there is no TLS; network calls shouldn't run.
         raise RuntimeError("SSL not available; HTTP client disabled in this environment.")
-    # Lazy import httpx to avoid AnyIO->ssl import at module import time in restricted envs
-    import httpx  # noqa: WPS433
+    import httpx  # lazy import to avoid anyio->ssl on module import
     HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
     transport = httpx.AsyncHTTPTransport(retries=2)
     _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=transport, headers={"Accept-Encoding": "gzip"})
     return _http_client
 
 # -------------------- App --------------------
-app = FastAPI(title="TradingView → Polygon/Yahoo Finance → OpenAI Decision API")
+app = FastAPI(title="TradingView → LLM Decision API (no external market/news)")
 
 # -------------------- LLM quota --------------------
 LLM_DAILY_LIMIT = 20
@@ -157,90 +138,23 @@ def parse_alert(text: str) -> Dict[str, Any]:
     exp_iso = datetime.strptime(exp_str, "%m-%d-%Y").date().isoformat()
     return {"side": side, "ticker": ticker, "price": price, "strike": strike, "expiry": exp_iso, "expiry_input": exp_str}
 
-# -------------------- Nearby search knobs --------------------
-NEARBY_DAY_WINDOW = 7           # +/- days around requested expiry
-STRIKE_PCT_WINDOW = 0.10        # +/- percent around requested strike (10%)
-MAX_CANDIDATES    = 5           # how many closest contracts to return
+# -------------------- Config knobs (provider-free) --------------------
+NEARBY_DAY_WINDOW = 7           # kept for API shape compatibility
+STRIKE_PCT_WINDOW = 0.10
+MAX_CANDIDATES    = 5
 
-# -------------------- Polygon helpers (with graceful auth handling) --------------------
-class PolygonAuthzError(Exception):
-    def __init__(self, msg: str):
-        self.msg = msg
-        super().__init__(msg)
+# -------------------- Provider-free stubs --------------------
+async def get_intraday_volume_snapshot(_ticker: str, warnings: List[str]) -> Dict[str, Any]:
+    """No external provider: return neutral/unknown volume snapshot."""
+    logging.info("Volume snapshot disabled (no provider)")
+    return {"prev_volume": None, "today_volume": None, "timespan": "disabled"}
 
-async def polygon_get(url: str, params: Dict[str, Any] = None) -> Any:
-    if not POLYGON_API_KEY:
-        raise HTTPException(500, detail="Missing POLYGON_API_KEY")
-    params = dict(params or {})
-    params["apiKey"] = POLYGON_API_KEY
-    logging.info("Retrieving data from Polygon.io: %s", url)
-    cli = get_http_client()
-    r = await cli.get(url, params=params)
-    if r.status_code >= 400:
-        try:
-            j = r.json()
-            if isinstance(j, dict) and str(j.get("status")).upper() == "NOT_AUTHORIZED":
-                raise PolygonAuthzError(j.get("message", "NOT_AUTHORIZED"))
-        except Exception:
-            pass
-        raise HTTPException(r.status_code, detail=f"Polygon error: {r.text}")
-    return r.json()
+async def get_indicators(_ticker: str) -> Dict[str, Any]:
+    """No external provider: return indicators as None."""
+    logging.info("Indicators disabled (no provider)")
+    return {"ema9": None, "ema21": None, "rsi14": None, "adx14": None}
 
-async def get_intraday_volume_snapshot(ticker: str, warnings: List[str]) -> Dict[str, Any]:
-    logging.info("Retrieving Polygon indicators/volume for %s", ticker)
-    prev = await polygon_get(f"https://api.polygon.io/v2/aggs/ticker/{ticker}/prev")
-    prev_vol = (prev.get("results") or [{}])[0].get("v", None)
-
-    today = datetime.now(timezone.utc).date().isoformat()
-
-    # Try minute bars first
-    try:
-        aggs = await polygon_get(
-            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{today}/{today}",
-            params={"adjusted": "true", "sort": "asc", "limit": 1200}
-        )
-        today_vol = sum(b.get("v", 0) for b in (aggs.get("results") or []))
-        return {"prev_volume": prev_vol, "today_volume": today_vol, "timespan": "minute"}
-    except PolygonAuthzError as e:
-        warnings.append(f"Minute bars not available on current plan: {e.msg}. Fell back to daily bars.")
-
-    # Fallback: daily bars
-    try:
-        daggs = await polygon_get(
-            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{today}/{today}",
-            params={"adjusted": "true", "sort": "asc", "limit": 1}
-        )
-        rows = daggs.get("results") or []
-        today_vol = rows[0].get("v") if rows else None
-        return {"prev_volume": prev_vol, "today_volume": today_vol, "timespan": "day"}
-    except PolygonAuthzError as e:
-        warnings.append(f"Daily bars not available on current plan: {e.msg}. Today volume unavailable.")
-        return {"prev_volume": prev_vol, "today_volume": None, "timespan": "unavailable"}
-
-async def get_indicators(ticker: str) -> Dict[str, Any]:
-    ema9  = await polygon_get(f"https://api.polygon.io/v1/indicators/ema/{ticker}",
-                              params={"timespan": "day", "window": 9, "series_type": "close", "limit": 1})
-    ema21 = await polygon_get(f"https://api.polygon.io/v1/indicators/ema/{ticker}",
-                              params={"timespan": "day", "window": 21, "series_type": "close", "limit": 1})
-    rsi14 = await polygon_get(f"https://api.polygon.io/v1/indicators/rsi/{ticker}",
-                              params={"timespan": "day", "window": 14, "series_type": "close", "limit": 1})
-    adx14 = await polygon_get(f"https://api.polygon.io/v1/indicators/adx/{ticker}",
-                              params={"timespan": "day", "window": 14, "limit": 1})
-
-    def last_val(obj):
-        try:
-            return (obj.get("results") or [])[0].get("values", [])[0].get("value")
-        except Exception:
-            return None
-
-    return {
-        "ema9": last_val(ema9),
-        "ema21": last_val(ema21),
-        "rsi14": last_val(rsi14),
-        "adx14": last_val(adx14),
-    }
-
-# -------------------- Nearby contract search --------------------
+# Nearby option candidates: turned off when no provider
 
 def _iso(d: date) -> str:
     return d.isoformat()
@@ -250,83 +164,18 @@ def _clamp_strike_bounds(strike: float, pct: float) -> Tuple[float, float]:
     hi = strike * (1.0 + pct)
     return (round(lo, 2), round(hi, 2))
 
-async def find_option_candidates_nearby(
-    ticker: str,
-    expiry_iso: str,
-    side: str,
-    strike: float,
-    day_window: int = NEARBY_DAY_WINDOW,
-    strike_pct_window: float = STRIKE_PCT_WINDOW,
-    max_candidates: int = MAX_CANDIDATES,
-) -> List[Dict[str, Any]]:
-    logging.info("Searching for nearby option contracts for %s", ticker)
-    ctype = "call" if side.upper() == "CALL" else "put"
+async def find_option_candidates_nearby(*_args, **_kwargs) -> List[Dict[str, Any]]:
+    logging.info("Nearby option search disabled (no provider)")
+    return []
 
-    tgt_date = datetime.fromisoformat(expiry_iso).date()
-    start = tgt_date - timedelta(days=day_window)
-    end   = tgt_date + timedelta(days=day_window)
+async def get_option_snapshots_many(*_args, **_kwargs) -> List[Dict[str, Any]]:
+    logging.info("Option snapshots disabled (no provider)")
+    return []
 
-    lo_strike, hi_strike = _clamp_strike_bounds(strike, strike_pct_window)
-
-    data = await polygon_get(
-        "https://api.polygon.io/v3/reference/options/contracts",
-        params={
-            "underlying_ticker": ticker,
-            "contract_type": ctype,
-            "expiration_date.gte": _iso(start),
-            "expiration_date.lte": _iso(end),
-            "strike_price.gte": f"{lo_strike:.2f}",
-            "strike_price.lte": f"{hi_strike:.2f}",
-            "order": "asc",
-            "sort": "expiration_date",
-            "limit": 1000,
-        }
-    )
-    results = data.get("results") or []
-    if not results:
-        return []
-
-    def rank_key(row: Dict[str, Any]):
-        try:
-            exp = datetime.fromisoformat(row["expiration_date"]).date()
-        except Exception:
-            exp = tgt_date
-        days_diff = abs((exp - tgt_date).days)
-        k_strike = float(row.get("strike_price", 0.0)) or 0.0
-        pct_diff = abs((k_strike - strike) / strike) if strike else 1.0
-        return (days_diff, pct_diff, k_strike)
-
-    ranked = sorted(results, key=rank_key)
-    return ranked[:max_candidates]
-
-async def get_option_snapshots_many(underlying: str, option_tickers: List[str], warnings: List[str]) -> List[Dict[str, Any]]:
-    async def _one(tkr: str):
-        try:
-            snap = await polygon_get(
-                f"https://api.polygon.io/v3/snapshot/options/{underlying}",
-                params={"limit": 250, "order": "asc", "sort": "ticker", "ticker": tkr}
-            )
-            rows = snap.get("results") or []
-            for r in rows:
-                if r.get("ticker") == tkr:
-                    return r
-            return rows[0] if rows else None
-        except PolygonAuthzError as e:
-            warnings.append(f"Option snapshots not available on current plan: {e.msg}.")
-            return None
-        except Exception:
-            return None
-
-    snaps = await asyncio.gather(*(asyncio.create_task(_one(t)) for t in option_tickers))
-    return [s for s in snaps if s]
-
-# -------------------- Yahoo Finance helpers --------------------
+# -------------------- Generic helpers (no provider usage) --------------------
 
 def _build_headers_from_values(api_key: str, api_key_header: str, api_headers_json: str) -> Dict[str, str]:
-    """Pure helper for tests: build headers from pieces.
-    - If api_headers_json is valid JSON, merge it first.
-    - Then, if api_key is non-empty, set/override api_key_header with the key.
-    """
+    """Build headers from user-provided pieces (pure function used in tests)."""
     headers: Dict[str, str] = {}
     if api_headers_json:
         try:
@@ -340,54 +189,14 @@ def _build_headers_from_values(api_key: str, api_key_header: str, api_headers_js
     return headers
 
 
-def _resolve_premium_news_url() -> str:
-    if YAHOO_NEWS_URL:
-        return YAHOO_NEWS_URL
-    if YAHOO_API_BASE:
-        base = YAHOO_API_BASE.rstrip("/")
-        path = "/" + YAHOO_NEWS_ENDPOINT.lstrip("/")
-        return base + path
-    return ""
-
-
-def _build_premium_params(ticker: str) -> Dict[str, Any]:
-    params: Dict[str, Any] = {YAHOO_SYMBOL_PARAM: ticker}
-    if YAHOO_EXTRA_PARAMS_JSON:
-        try:
-            extra = json.loads(YAHOO_EXTRA_PARAMS_JSON)
-            if isinstance(extra, dict):
-                params.update(extra)
-        except Exception:
-            pass
-    return params
-
-
-def _premium_configured() -> bool:
-    return NEWS_PROVIDER == "yahoo_premium" and bool(_resolve_premium_news_url())
-
-
-async def _yahoo_fetch_rss_xml(ticker: str) -> str:
-    """Fetch Yahoo Finance RSS XML for a ticker (uses Yahoo's public RSS)."""
-    logging.info("Fetching Yahoo Finance RSS for %s", ticker)
-    # Yahoo uses hyphen for class suffixes like BRK-B instead of BRK.B
-    yf_symbol = ticker.replace(".", "-")
-    url = "https://feeds.finance.yahoo.com/rss/2.0/headline"
-    params = {"s": yf_symbol, "region": "US", "lang": "en-US"}
-    cli = get_http_client()
-    r = await cli.get(url, params=params)
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, detail=f"Yahoo Finance RSS error: {r.text}")
-    return r.text
-
-
 def _parse_yahoo_rss(xml_text: str) -> List[Dict[str, Any]]:
+    """Generic RSS parser used by tests (name kept to preserve existing tests)."""
     import xml.etree.ElementTree as ET
     try:
         root = ET.fromstring(xml_text)
     except Exception as e:
-        logging.warning("Failed to parse Yahoo RSS: %s", e)
+        logging.warning("Failed to parse RSS: %s", e)
         return []
-    # RSS structure: <rss><channel><item><title>..</title><link>..</link><pubDate>..</pubDate>
     items = []
     for item in root.findall('.//item'):
         title = (item.findtext('title') or '').strip()
@@ -398,7 +207,7 @@ def _parse_yahoo_rss(xml_text: str) -> List[Dict[str, Any]]:
 
 
 def calc_headline_sentiment(headlines: List[str]) -> float:
-    """Very lightweight lexicon-based sentiment -> 0..1 (0=neg, 0.5=neutral, 1=pos)."""
+    """Lightweight lexicon sentiment 0..1 (0=neg, 0.5=neutral, 1=pos)."""
     if not headlines:
         return 0.5
     pos = {
@@ -412,85 +221,22 @@ def calc_headline_sentiment(headlines: List[str]) -> float:
     import re as _re
     score_acc = 0
     count = 0
-    for t in headlines[:20]:  # cap to last 20 for speed
+    for t in headlines[:20]:
         words = set(_re.findall(r"[a-z']+", (t or '').lower()))
         p = len(words & pos)
         n = len(words & neg)
         if p == 0 and n == 0:
             continue
         raw = (p - n) / float(p + n)
-        mapped = (raw + 1.0) / 2.0  # -1..1 -> 0..1
+        mapped = (raw + 1.0) / 2.0
         score_acc += mapped
         count += 1
     return round(score_acc / count, 3) if count else 0.5
 
-
-async def get_yahoo_news_and_sentiment_rss(ticker: str) -> Dict[str, Any]:
-    xml_text = await _yahoo_fetch_rss_xml(ticker)
-    items = _parse_yahoo_rss(xml_text)
-    headlines = [it.get('title','') for it in items]
-    score = calc_headline_sentiment(headlines)
-    # Match previous shape: { "news": [...], "sentiment_score": <0..1> }
-    return {"news": items[:8], "sentiment_score": score}
-
-
-def _flex_articles_from_json(payload: Any) -> List[Dict[str, Any]]:
-    """Attempt to extract a list of article-like dicts from unknown JSON shapes."""
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    if isinstance(payload, dict):
-        for key in ("items", "news", "articles", "data", "results"):
-            val = payload.get(key)
-            if isinstance(val, list) and val and isinstance(val[0], dict):
-                return val
-        # last resort: return any first list of dicts
-        for v in payload.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
-    return []
-
-
-def _map_article_fields(it: Dict[str, Any]) -> Dict[str, Any]:
-    title = it.get("title") or it.get("headline") or it.get("name") or ""
-    link = it.get("link") or it.get("url") or it.get("article_url") or ""
-    pub = it.get("pubDate") or it.get("published_at") or it.get("publishedAt") or it.get("providerPublishTime") or it.get("time") or ""
-    return {"title": str(title), "link": str(link), "pubDate": str(pub)}
-
-
-async def get_yahoo_news_and_sentiment_premium(ticker: str) -> Dict[str, Any]:
-    """Fetch news from a paid Yahoo provider endpoint.
-    Configure with env:
-    - NEWS_PROVIDER=yahoo_premium
-    - YAHOO_NEWS_URL=full endpoint URL  (or YAHOO_API_BASE + YAHOO_NEWS_ENDPOINT)
-    - YAHOO_API_KEY=... and YAHOO_API_KEY_HEADER=... (or YAHOO_API_HEADERS JSON)
-    - YAHOO_SYMBOL_PARAM=symbol|ticker and optional YAHOO_EXTRA_PARAMS JSON
-    """
-    url = _resolve_premium_news_url()
-    if not url:
-        raise HTTPException(500, detail="Yahoo premium not configured: set YAHOO_NEWS_URL or YAHOO_API_BASE/YAHOO_NEWS_ENDPOINT")
-    headers = _build_headers_from_values(YAHOO_API_KEY, YAHOO_API_KEY_HEADER, YAHOO_API_HEADERS_JSON)
-    params = _build_premium_params(ticker)
-    logging.info("Fetching Yahoo Premium news for %s via %s", ticker, url)
-    cli = get_http_client()
-    r = await cli.get(url, params=params, headers=headers)
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, detail=f"Yahoo Premium error: {r.text}")
-    try:
-        payload = r.json()
-    except Exception:
-        raise HTTPException(502, detail="Yahoo Premium returned non-JSON body")
-    raw_items = _flex_articles_from_json(payload)
-    items = [_map_article_fields(it) for it in raw_items]
-    headlines = [it.get('title','') for it in items]
-    score = calc_headline_sentiment(headlines)
-    return {"news": items[:8], "sentiment_score": score}
-
-
-async def get_news_and_sentiment(ticker: str) -> Dict[str, Any]:
-    if NEWS_PROVIDER == "yahoo_premium":
-        return await get_yahoo_news_and_sentiment_premium(ticker)
-    # default path
-    return await get_yahoo_news_and_sentiment_rss(ticker)
+async def get_news_and_sentiment(_ticker: str) -> Dict[str, Any]:
+    """No external news: return neutral sentiment and empty headlines."""
+    logging.info("News fetch disabled (no provider)")
+    return {"news": [], "sentiment_score": 0.5}
 
 # -------------------- OpenAI helper --------------------
 async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -502,10 +248,10 @@ async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     sys_prompt = (
         "You are a disciplined trading assistant for options. "
-        "Given technicals, volume context, option snapshot, and news sentiment, output a conservative decision:\n"
+        "Given technicals, volume context, option snapshot, and news sentiment (which may be missing), output a conservative decision:\n"
         "- 'BUY CALL', 'BUY PUT', 'SELL CALL', 'SELL PUT', or 'NEUTRAL'\n"
         "- A 0-100 confidence score\n"
-        "- 2-4 bullet reasons that reference specific inputs. Avoid overconfidence."
+        "- 2-4 bullet reasons that reference specific inputs. If data is unavailable, state that clearly."
     )
 
     user_prompt = (
@@ -514,11 +260,10 @@ async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
         f"RSI14={payload['indicators'].get('rsi14')}, ADX14={payload['indicators'].get('adx14')}.\n"
         f"VOL: prev_vol={payload['volume'].get('prev_volume')}, today_vol={payload['volume'].get('today_volume')} (timespan={payload['volume'].get('timespan')}).\n"
         f"OPTION (top candidate snapshot): {payload['option_snapshot']}\n"
-        f"NEWS_SENTIMENT: {payload['news'].get('sentiment_score')}; recent_headlines_count={len(payload['news'].get('news', []))}.\n"
+        f"NEWS_SENTIMENT: {payload['news'].get('sentiment_score')} (headlines may be empty).\n"
         "Return JSON with keys: decision, confidence, rationale."
     )
 
-    # Lazy import httpx to avoid ssl import at module import time
     cli = get_http_client()
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     body = {
@@ -595,8 +340,7 @@ async def health():
         "llm_calls_today": _llm_calls_today,
         "llm_daily_limit": LLM_DAILY_LIMIT,
         "keys_loaded": {k: bool(v) for k, v in REQUIRED_KEYS.items()},
-        "news_provider": NEWS_PROVIDER,
-        "yahoo_premium_configured": _premium_configured(),
+        "providers": "disabled",
     }
 
 @app.get("/quota")
@@ -627,34 +371,17 @@ async def tradingview_webhook(request: Request):
 
     warnings: List[str] = []
 
-    # 2) Fetch data in parallel (Polygon + Yahoo Finance), with graceful degradation
-    try:
-        candidates_task = asyncio.create_task(find_option_candidates_nearby(
-            parsed["ticker"], parsed["expiry"], parsed["side"], parsed["strike"]
-        ))
-        vol_task  = asyncio.create_task(get_intraday_volume_snapshot(parsed["ticker"], warnings))
-        ind_task  = asyncio.create_task(get_indicators(parsed["ticker"]))
-        news_task = asyncio.create_task(get_news_and_sentiment(parsed["ticker"]))
-
-        option_candidates = await candidates_task
-        volume     = await vol_task
-        indicators = await ind_task
-        news       = await news_task
-
-        option_snapshots: List[Dict[str, Any]] = []
-        if option_candidates:
-            tickers = [c["ticker"] for c in option_candidates if c.get("ticker")]
-            option_snapshots = await get_option_snapshots_many(parsed["ticker"], tickers, warnings)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, detail=f"Upstream data fetch failed: {e}")
+    # 2) Provider-free data: all stubs
+    option_candidates: List[Dict[str, Any]] = await find_option_candidates_nearby(parsed["ticker"], parsed["expiry"], parsed["side"], parsed["strike"])
+    volume     = await get_intraday_volume_snapshot(parsed["ticker"], warnings)
+    indicators = await get_indicators(parsed["ticker"])
+    news       = await get_news_and_sentiment(parsed["ticker"])
+    option_snapshots: List[Dict[str, Any]] = await get_option_snapshots_many(parsed["ticker"], [c.get("ticker") for c in option_candidates], warnings)
 
     # 3) Pre-score
-    pre_score = simple_score(indicators, volume, news.get("sentiment_score", 0), parsed["side"])
+    pre_score = simple_score(indicators, volume, news.get("sentiment_score", 0.5), parsed["side"])
 
-    # 4) LLM decision (respect daily quota) – feed the best snapshot if available
+    # 4) LLM decision (respect daily quota)
     payload = {
         **parsed,
         "indicators": indicators,
@@ -667,8 +394,8 @@ async def tradingview_webhook(request: Request):
     decision = await openai_decide(payload)
 
     # 5) Optional Telegram + response
-    cand_line = f"CANDIDATES: {', '.join([c['ticker'] for c in option_candidates[:3]])}" if option_candidates else "CANDIDATES: none"
-    warn_line = f"WARNINGS: {len(warnings)} (plan limits)" if warnings else "WARNINGS: none"
+    cand_line = f"CANDIDATES: {', '.join([c['ticker'] for c in option_candidates[:3] if c.get('ticker')])}" if option_candidates else "CANDIDATES: none"
+    warn_line = f"WARNINGS: {len(warnings)}" if warnings else "WARNINGS: none"
     summary_lines = [
         f"ALERT ➜ {parsed['side']} {parsed['ticker']}  strike {parsed['strike']}  exp {parsed['expiry_input']} (spot ~{parsed['price']})",
         cand_line,
@@ -680,7 +407,6 @@ async def tradingview_webhook(request: Request):
     try:
         await send_telegram("\n".join(summary_lines))
     except Exception:
-        # Ignore Telegram errors in restricted environments
         pass
 
     return {
@@ -711,7 +437,7 @@ async def _shutdown():
 # These DO NOT make network calls and work without ssl/fastapi.
 # =============================================================
 
-def _assert(cond: bool, msg: str):  # simple assert so script never exits abruptly in CI-like sandboxes
+def _assert(cond: bool, msg: str):
     if not cond:
         logging.error("TEST FAIL: %s", msg)
         raise AssertionError(msg)
@@ -759,7 +485,6 @@ def test_clamp_strike_bounds():
 
 
 def test_stub_on_event_and_routes_registration():
-    # Only meaningful when FastAPI is stubbed (no ssl)
     if SSL_AVAILABLE:
         return
     _assert(hasattr(app, 'on_event'), "Stub app should have on_event")
@@ -800,7 +525,6 @@ def test_calc_headline_sentiment():
 def test_calc_headline_sentiment_neutral_empty():
     _assert(abs(calc_headline_sentiment([]) - 0.5) < 1e-9, "empty list should be neutral 0.5")
     mixed = ["Company announces new product", "Analyst says outlook uncertain"]
-    # Mixed with no lexicon hits should map to neutral
     _assert(abs(calc_headline_sentiment(mixed) - 0.5) < 1e-6, "mixed/no-keywords should be ~neutral")
 
 
@@ -808,7 +532,6 @@ def test_build_headers_from_values_merges_and_overrides():
     base = _build_headers_from_values("k1", "X-Api-Key", json.dumps({"A":"1","B":"2"}))
     _assert(base.get("A") == "1" and base.get("B") == "2", "base headers merged")
     _assert(base.get("X-Api-Key") == "k1", "api key header set/overridden")
-    # overrides via JSON
     over = _build_headers_from_values("k2", "X-Api-Key", json.dumps({"X-Api-Key":"OVERRIDE","C":"3"}))
     _assert(over.get("X-Api-Key") == "k2", "explicit api key wins over JSON override")
     _assert(over.get("C") == "3", "extra header kept")
