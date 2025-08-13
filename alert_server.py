@@ -83,7 +83,7 @@ def get_http_client():
     if not SSL_AVAILABLE:
         raise RuntimeError("SSL not available; HTTP client disabled in this environment.")
     import httpx  # lazy import to avoid anyio->ssl on module import
-    HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
+    HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
     transport = httpx.AsyncHTTPTransport(retries=2)
     _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=transport, headers={"Accept-Encoding": "gzip"})
     return _http_client
@@ -92,7 +92,7 @@ def get_http_client():
 app = FastAPI(title="TradingView → LLM Decision API (no external market/news)")
 
 # -------------------- LLM quota --------------------
-LLM_DAILY_LIMIT = 20
+LLM_DAILY_LIMIT = int(os.getenv("LLM_DAILY_LIMIT", "20"))
 _llm_calls_today = 0
 _llm_roll_date = datetime.now(timezone.utc).date()
 
@@ -120,7 +120,7 @@ ALERT_RE = re.compile(
     ([A-Z.\-]+)
     \s+at\s+\$?([\d.]+)
     \s+Strike:\s+\$?([\d.]+)
-    \s+Expiry:\s+(\d{2}-\d{2}-\d{4})
+    \s+Expiry:\s+(\n?\d{2}-\d{2}-\d{4})
     \s*$
     """
 )
@@ -134,7 +134,7 @@ def parse_alert(text: str) -> Dict[str, Any]:
     ticker = m.group(2).upper()
     price = float(m.group(3))
     strike = float(m.group(4))
-    exp_str = m.group(5)
+    exp_str = m.group(5).strip()
     exp_iso = datetime.strptime(exp_str, "%m-%d-%Y").date().isoformat()
     return {"side": side, "ticker": ticker, "price": price, "strike": strike, "expiry": exp_iso, "expiry_input": exp_str}
 
@@ -238,30 +238,50 @@ async def get_news_and_sentiment(_ticker: str) -> Dict[str, Any]:
     logging.info("News fetch disabled (no provider)")
     return {"news": [], "sentiment_score": 0.5}
 
-# -------------------- OpenAI helper --------------------
+# -------------------- OpenAI helper (UPDATED) --------------------
 async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ask OpenAI for a conservative, options-specific decision.
+    Returns a normalized dict even if the model response is malformed.
+    """
     logging.info("LLM processing start for %s", payload["ticker"])
     if not OPENAI_API_KEY:
         raise HTTPException(500, detail="Missing OPENAI_API_KEY")
     if not _llm_quota_ok():
-        return {"decision": "NEUTRAL", "confidence": 0, "rationale": "LLM quota exceeded for today; skipping model."}
+        return {
+            "decision": "NEUTRAL",
+            "confidence": 0,
+            "rationale": ["LLM quota exceeded for today; skipping model."],
+            "suggested_action": "SKIP",
+            "risk_notes": ["Quota exhausted"],
+            "time_horizon_days": 0,
+            "alts": []
+        }
 
+    # Make the prompt robust to missing data.
     sys_prompt = (
-        "You are a disciplined trading assistant for options. "
-        "Given technicals, volume context, option snapshot, and news sentiment (which may be missing), output a conservative decision:\n"
-        "- 'BUY CALL', 'BUY PUT', 'SELL CALL', 'SELL PUT', or 'NEUTRAL'\n"
-        "- A 0-100 confidence score\n"
-        "- 2-4 bullet reasons that reference specific inputs. If data is unavailable, state that clearly."
+        "You are a disciplined, risk-aware options trading assistant.\n"
+        "Given technicals, volume context, an option snapshot (may be None), and news sentiment,\n"
+        "return a JSON decision with these keys: decision (BUY CALL|BUY PUT|SELL CALL|SELL PUT|NEUTRAL),\n"
+        "confidence (0-100 integer), rationale (array of 2-6 short bullets), suggested_action (BUY|PASS|HEDGE),\n"
+        "risk_notes (array), time_horizon_days (integer), and alts (array of textual alternative ideas).\n"
+        "Be conservative when inputs are missing; call out missing data explicitly in rationale."
     )
+
+    # Try to echo user alert and context
+    ind = payload.get('indicators') or {}
+    vol = payload.get('volume') or {}
+    news = payload.get('news') or {}
+    opt = payload.get('option_snapshot')
 
     user_prompt = (
         f"ALERT: {payload['side']} {payload['ticker']} strike {payload['strike']} exp {payload['expiry']} (spot ~{payload['price']}).\n"
-        f"TECH: EMA9={payload['indicators'].get('ema9')}, EMA21={payload['indicators'].get('ema21')}, "
-        f"RSI14={payload['indicators'].get('rsi14')}, ADX14={payload['indicators'].get('adx14')}.\n"
-        f"VOL: prev_vol={payload['volume'].get('prev_volume')}, today_vol={payload['volume'].get('today_volume')} (timespan={payload['volume'].get('timespan')}).\n"
-        f"OPTION (top candidate snapshot): {payload['option_snapshot']}\n"
-        f"NEWS_SENTIMENT: {payload['news'].get('sentiment_score')} (headlines may be empty).\n"
-        "Return JSON with keys: decision, confidence, rationale."
+        f"TECH: EMA9={ind.get('ema9')}, EMA21={ind.get('ema21')}, RSI14={ind.get('rsi14')}, ADX14={ind.get('adx14')}.\n"
+        f"VOL: prev_vol={vol.get('prev_volume')}, today_vol={vol.get('today_volume')} (timespan={vol.get('timespan')}).\n"
+        f"OPTION (top candidate snapshot): {opt}.\n"
+        f"NEWS_SENTIMENT: {news.get('sentiment_score')} (headlines may be empty).\n"
+        f"PRE_SCORE: {payload.get('pre_score')} | candidates={payload.get('option_candidates_count')}.\n"
+        "Return *only* JSON with: decision, confidence, rationale, suggested_action, risk_notes, time_horizon_days, alts."
     )
 
     cli = get_http_client()
@@ -273,23 +293,62 @@ async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
             {"role": "user", "content": user_prompt}
         ],
         "response_format": {"type": "json_object"},
-        "max_tokens": 300,
+        "max_tokens": 350,
         "temperature": 0.2,
     }
-    resp = await cli.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
-    if resp.status_code >= 400:
-        raise HTTPException(resp.status_code, detail=f"OpenAI error: {resp.text}")
+
+    # Resilient call with a single retry on 5xx
+    for attempt in range(2):
+        resp = await cli.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
+        if 500 <= resp.status_code < 600 and attempt == 0:
+            await asyncio.sleep(0.6)
+            continue
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, detail=f"OpenAI error: {resp.text}")
+        break
+
     _tick_llm_quota()
     data = resp.json()
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "{}")
+
+    # Normalize output
+    def _norm(d: Dict[str, Any]) -> Dict[str, Any]:
+        decision = str(d.get("decision", "NEUTRAL")).upper().strip()
+        if decision not in {"BUY CALL", "BUY PUT", "SELL CALL", "SELL PUT", "NEUTRAL"}:
+            decision = "NEUTRAL"
+        try:
+            confidence = int(d.get("confidence", 0))
+        except Exception:
+            confidence = 0
+        rationale = d.get("rationale")
+        if not isinstance(rationale, list):
+            rationale = [str(rationale) if rationale else "No rationale provided by model."]
+        suggested_action = str(d.get("suggested_action", "SKIP"))[:16].upper()
+        risk_notes = d.get("risk_notes")
+        if not isinstance(risk_notes, list):
+            risk_notes = [str(risk_notes) if risk_notes else "No explicit risks noted."]
+        try:
+            th = int(d.get("time_horizon_days", 0))
+        except Exception:
+            th = 0
+        alts = d.get("alts")
+        if not isinstance(alts, list):
+            alts = []
+        return {
+            "decision": decision,
+            "confidence": max(0, min(100, confidence)),
+            "rationale": rationale,
+            "suggested_action": suggested_action,
+            "risk_notes": risk_notes,
+            "time_horizon_days": max(0, th),
+            "alts": alts,
+        }
+
     try:
-        content = data["choices"][0]["message"]["content"]
         parsed = json.loads(content)
-        decision = str(parsed.get("decision", "NEUTRAL")).upper().strip()
-        confidence = int(parsed.get("confidence", 0))
-        rationale = parsed.get("rationale", "")
-        return {"decision": decision, "confidence": confidence, "rationale": rationale}
     except Exception:
-        return {"decision": "NEUTRAL", "confidence": 0, "rationale": "Model response parse error"}
+        parsed = {}
+    return _norm(parsed)
 
 # -------------------- Simple heuristic score (pre-LLM) --------------------
 
@@ -353,8 +412,8 @@ async def quota():
 async def tradingview_webhook(request: Request):
     content_type = getattr(request, 'headers', {}).get("content-type", "").lower()
 
-    if "application/json" in content_type:
-        body = await request.json() if hasattr(request, 'json') else {}
+    if "application/json" in content_type and hasattr(request, 'json'):
+        body = await request.json()
         text = (body.get("text") or "").strip()
     else:
         raw = await request.body() if hasattr(request, 'body') else b""
@@ -393,6 +452,11 @@ async def tradingview_webhook(request: Request):
     }
     decision = await openai_decide(payload)
 
+    # 4.1) Apply a very light policy layer (optional)
+    # If pre_score and confidence disagree strongly, nudge to NEUTRAL.
+    if abs(pre_score) < 3 and decision.get("confidence", 0) < 55:
+        decision = {**decision, "decision": "NEUTRAL", "suggested_action": "PASS"}
+
     # 5) Optional Telegram + response
     cand_line = f"CANDIDATES: {', '.join([c['ticker'] for c in option_candidates[:3] if c.get('ticker')])}" if option_candidates else "CANDIDATES: none"
     warn_line = f"WARNINGS: {len(warnings)}" if warnings else "WARNINGS: none"
@@ -401,8 +465,9 @@ async def tradingview_webhook(request: Request):
         cand_line,
         warn_line,
         f"PRE-SCORE: {pre_score}",
-        f"DECISION: {decision.get('decision')}  (confidence {decision.get('confidence')}%)",
-        f"WHY: {decision.get('rationale')[:300]}",
+        f"DECISION: {decision.get('decision')}  (confidence {decision.get('confidence')}%) | ACTION: {decision.get('suggested_action')}",
+        "WHY:" , *[f"- {r}" for r in decision.get('rationale', [])][:4],
+        "RISKS:", *[f"- {r}" for r in decision.get('risk_notes', [])][:3],
     ]
     try:
         await send_telegram("\n".join(summary_lines))
@@ -564,4 +629,4 @@ if __name__ == "__main__":
     test_build_headers_from_values_merges_and_overrides()
     test_parse_yahoo_rss_basic()
     logging.info("All tests passed. If you need the HTTP server, run with uvicorn in an environment with ssl support:")
-    logging.info("uvicorn fastapi_trading_alert_service:app --host 0.0.0.0 --port 10000")
+    logging.info("uvicorn fastapi_trading_alert_service_llm_updated:app --host 0.0.0.0 --port 10000")
