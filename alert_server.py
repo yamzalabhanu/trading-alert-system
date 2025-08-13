@@ -55,7 +55,7 @@ except Exception:
                 self.routes[("POST", path)] = fn
                 return fn
             return deco
-        def on_event(self, event: str):  # NEW: mock lifecycle hook
+        def on_event(self, event: str):  # mock lifecycle hook
             def deco(fn):
                 self.events.setdefault(event, []).append(fn)
                 return fn
@@ -70,14 +70,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 # -------------------- Environment --------------------
 POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY", "")
-FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Yahoo provider config (supports free RSS or paid API via custom endpoint)
+NEWS_PROVIDER            = os.getenv("NEWS_PROVIDER", "yahoo_rss").lower()  # 'yahoo_rss' (default) or 'yahoo_premium'
+YAHOO_NEWS_URL           = os.getenv("YAHOO_NEWS_URL", "")  # full URL for paid endpoint (preferred)
+YAHOO_API_BASE           = os.getenv("YAHOO_API_BASE", "")  # base URL if not using full URL
+YAHOO_NEWS_ENDPOINT      = os.getenv("YAHOO_NEWS_ENDPOINT", "news")  # relative path joined to base
+YAHOO_SYMBOL_PARAM       = os.getenv("YAHOO_SYMBOL_PARAM", "symbol")  # some APIs use 'ticker'
+YAHOO_EXTRA_PARAMS_JSON  = os.getenv("YAHOO_EXTRA_PARAMS", "")  # JSON string of extra query params
+YAHOO_API_KEY            = os.getenv("YAHOO_API_KEY", "")
+YAHOO_API_KEY_HEADER     = os.getenv("YAHOO_API_KEY_HEADER", "x-api-key")  # e.g., 'X-RapidAPI-Key'
+YAHOO_API_HEADERS_JSON   = os.getenv("YAHOO_API_HEADERS", "")  # JSON string of additional headers (wins over key header)
+
 REQUIRED_KEYS = {
     "POLYGON_API_KEY": POLYGON_API_KEY,
-    "FINNHUB_API_KEY": FINNHUB_API_KEY,
     "OPENAI_API_KEY": OPENAI_API_KEY,
 }
 
@@ -99,7 +108,7 @@ def get_http_client():
     return _http_client
 
 # -------------------- App --------------------
-app = FastAPI(title="TradingView → Polygon/Finnhub → OpenAI Decision API")
+app = FastAPI(title="TradingView → Polygon/Yahoo Finance → OpenAI Decision API")
 
 # -------------------- LLM quota --------------------
 LLM_DAILY_LIMIT = 20
@@ -311,28 +320,177 @@ async def get_option_snapshots_many(underlying: str, option_tickers: List[str], 
     snaps = await asyncio.gather(*(asyncio.create_task(_one(t)) for t in option_tickers))
     return [s for s in snaps if s]
 
-# -------------------- Finnhub helpers --------------------
-async def finnhub_get(url: str, params: Dict[str, Any]) -> Any:
-    if not FINNHUB_API_KEY:
-        raise HTTPException(500, detail="Missing FINNHUB_API_KEY")
-    params = dict(params or {})
-    params["token"] = FINNHUB_API_KEY
-    logging.info("Fetching news data from Finnhub: %s", url)
+# -------------------- Yahoo Finance helpers --------------------
+
+def _build_headers_from_values(api_key: str, api_key_header: str, api_headers_json: str) -> Dict[str, str]:
+    """Pure helper for tests: build headers from pieces.
+    - If api_headers_json is valid JSON, merge it first.
+    - Then, if api_key is non-empty, set/override api_key_header with the key.
+    """
+    headers: Dict[str, str] = {}
+    if api_headers_json:
+        try:
+            user = json.loads(api_headers_json)
+            if isinstance(user, dict):
+                headers.update({str(k): str(v) for k, v in user.items()})
+        except Exception:
+            pass
+    if api_key:
+        headers[str(api_key_header)] = str(api_key)
+    return headers
+
+
+def _resolve_premium_news_url() -> str:
+    if YAHOO_NEWS_URL:
+        return YAHOO_NEWS_URL
+    if YAHOO_API_BASE:
+        base = YAHOO_API_BASE.rstrip("/")
+        path = "/" + YAHOO_NEWS_ENDPOINT.lstrip("/")
+        return base + path
+    return ""
+
+
+def _build_premium_params(ticker: str) -> Dict[str, Any]:
+    params: Dict[str, Any] = {YAHOO_SYMBOL_PARAM: ticker}
+    if YAHOO_EXTRA_PARAMS_JSON:
+        try:
+            extra = json.loads(YAHOO_EXTRA_PARAMS_JSON)
+            if isinstance(extra, dict):
+                params.update(extra)
+        except Exception:
+            pass
+    return params
+
+
+def _premium_configured() -> bool:
+    return NEWS_PROVIDER == "yahoo_premium" and bool(_resolve_premium_news_url())
+
+
+async def _yahoo_fetch_rss_xml(ticker: str) -> str:
+    """Fetch Yahoo Finance RSS XML for a ticker (uses Yahoo's public RSS)."""
+    logging.info("Fetching Yahoo Finance RSS for %s", ticker)
+    # Yahoo uses hyphen for class suffixes like BRK-B instead of BRK.B
+    yf_symbol = ticker.replace(".", "-")
+    url = "https://feeds.finance.yahoo.com/rss/2.0/headline"
+    params = {"s": yf_symbol, "region": "US", "lang": "en-US"}
     cli = get_http_client()
     r = await cli.get(url, params=params)
     if r.status_code >= 400:
-        raise HTTPException(r.status_code, detail=f"Finnhub error: {r.text}")
-    return r.json()
+        raise HTTPException(r.status_code, detail=f"Yahoo Finance RSS error: {r.text}")
+    return r.text
+
+
+def _parse_yahoo_rss(xml_text: str) -> List[Dict[str, Any]]:
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as e:
+        logging.warning("Failed to parse Yahoo RSS: %s", e)
+        return []
+    # RSS structure: <rss><channel><item><title>..</title><link>..</link><pubDate>..</pubDate>
+    items = []
+    for item in root.findall('.//item'):
+        title = (item.findtext('title') or '').strip()
+        link = (item.findtext('link') or '').strip()
+        pub = (item.findtext('pubDate') or '').strip()
+        items.append({"title": title, "link": link, "pubDate": pub})
+    return items
+
+
+def calc_headline_sentiment(headlines: List[str]) -> float:
+    """Very lightweight lexicon-based sentiment -> 0..1 (0=neg, 0.5=neutral, 1=pos)."""
+    if not headlines:
+        return 0.5
+    pos = {
+        "surge","beat","beats","record","strong","growth","upgrade","upgraded","bullish","rally","profit",
+        "soar","soars","gain","gains","optimistic","outperform","top","tops","exceed","exceeds","positive"
+    }
+    neg = {
+        "plunge","miss","misses","lawsuit","probe","bearish","downgrade","downgraded","loss","decline","falls",
+        "fall","drop","drops","warning","cuts","cut","negative","missed","disappoint","disappoints","bankrupt"
+    }
+    import re as _re
+    score_acc = 0
+    count = 0
+    for t in headlines[:20]:  # cap to last 20 for speed
+        words = set(_re.findall(r"[a-z']+", (t or '').lower()))
+        p = len(words & pos)
+        n = len(words & neg)
+        if p == 0 and n == 0:
+            continue
+        raw = (p - n) / float(p + n)
+        mapped = (raw + 1.0) / 2.0  # -1..1 -> 0..1
+        score_acc += mapped
+        count += 1
+    return round(score_acc / count, 3) if count else 0.5
+
+
+async def get_yahoo_news_and_sentiment_rss(ticker: str) -> Dict[str, Any]:
+    xml_text = await _yahoo_fetch_rss_xml(ticker)
+    items = _parse_yahoo_rss(xml_text)
+    headlines = [it.get('title','') for it in items]
+    score = calc_headline_sentiment(headlines)
+    # Match previous shape: { "news": [...], "sentiment_score": <0..1> }
+    return {"news": items[:8], "sentiment_score": score}
+
+
+def _flex_articles_from_json(payload: Any) -> List[Dict[str, Any]]:
+    """Attempt to extract a list of article-like dicts from unknown JSON shapes."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ("items", "news", "articles", "data", "results"):
+            val = payload.get(key)
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                return val
+        # last resort: return any first list of dicts
+        for v in payload.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v
+    return []
+
+
+def _map_article_fields(it: Dict[str, Any]) -> Dict[str, Any]:
+    title = it.get("title") or it.get("headline") or it.get("name") or ""
+    link = it.get("link") or it.get("url") or it.get("article_url") or ""
+    pub = it.get("pubDate") or it.get("published_at") or it.get("publishedAt") or it.get("providerPublishTime") or it.get("time") or ""
+    return {"title": str(title), "link": str(link), "pubDate": str(pub)}
+
+
+async def get_yahoo_news_and_sentiment_premium(ticker: str) -> Dict[str, Any]:
+    """Fetch news from a paid Yahoo provider endpoint.
+    Configure with env:
+    - NEWS_PROVIDER=yahoo_premium
+    - YAHOO_NEWS_URL=full endpoint URL  (or YAHOO_API_BASE + YAHOO_NEWS_ENDPOINT)
+    - YAHOO_API_KEY=... and YAHOO_API_KEY_HEADER=... (or YAHOO_API_HEADERS JSON)
+    - YAHOO_SYMBOL_PARAM=symbol|ticker and optional YAHOO_EXTRA_PARAMS JSON
+    """
+    url = _resolve_premium_news_url()
+    if not url:
+        raise HTTPException(500, detail="Yahoo premium not configured: set YAHOO_NEWS_URL or YAHOO_API_BASE/YAHOO_NEWS_ENDPOINT")
+    headers = _build_headers_from_values(YAHOO_API_KEY, YAHOO_API_KEY_HEADER, YAHOO_API_HEADERS_JSON)
+    params = _build_premium_params(ticker)
+    logging.info("Fetching Yahoo Premium news for %s via %s", ticker, url)
+    cli = get_http_client()
+    r = await cli.get(url, params=params, headers=headers)
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, detail=f"Yahoo Premium error: {r.text}")
+    try:
+        payload = r.json()
+    except Exception:
+        raise HTTPException(502, detail="Yahoo Premium returned non-JSON body")
+    raw_items = _flex_articles_from_json(payload)
+    items = [_map_article_fields(it) for it in raw_items]
+    headlines = [it.get('title','') for it in items]
+    score = calc_headline_sentiment(headlines)
+    return {"news": items[:8], "sentiment_score": score}
+
 
 async def get_news_and_sentiment(ticker: str) -> Dict[str, Any]:
-    logging.info("Fetching Finnhub news/sentiment for %s", ticker)
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=3)
-    news = await finnhub_get("https://finnhub.io/api/v1/company-news", {"symbol": ticker, "from": start.isoformat(), "to": end.isoformat()})
-    sent = await finnhub_get("https://finnhub.io/api/v1/news-sentiment", {"symbol": ticker})
-    overall = sent.get("sentiment", {}) if isinstance(sent, dict) else {}
-    score = overall.get("score", 0) if isinstance(overall, dict) else 0
-    return {"news": news[:8] if isinstance(news, list) else [], "sentiment_score": score}
+    if NEWS_PROVIDER == "yahoo_premium":
+        return await get_yahoo_news_and_sentiment_premium(ticker)
+    # default path
+    return await get_yahoo_news_and_sentiment_rss(ticker)
 
 # -------------------- OpenAI helper --------------------
 async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -437,6 +595,8 @@ async def health():
         "llm_calls_today": _llm_calls_today,
         "llm_daily_limit": LLM_DAILY_LIMIT,
         "keys_loaded": {k: bool(v) for k, v in REQUIRED_KEYS.items()},
+        "news_provider": NEWS_PROVIDER,
+        "yahoo_premium_configured": _premium_configured(),
     }
 
 @app.get("/quota")
@@ -467,7 +627,7 @@ async def tradingview_webhook(request: Request):
 
     warnings: List[str] = []
 
-    # 2) Fetch data in parallel (Polygon + Finnhub), with graceful degradation
+    # 2) Fetch data in parallel (Polygon + Yahoo Finance), with graceful degradation
     try:
         candidates_task = asyncio.create_task(find_option_candidates_nearby(
             parsed["ticker"], parsed["expiry"], parsed["side"], parsed["strike"]
@@ -622,6 +782,51 @@ def test_http_client_no_ssl_raises():
     raise AssertionError("get_http_client should raise RuntimeError when SSL is unavailable")
 
 
+def test_calc_headline_sentiment():
+    pos_titles = [
+        "Shares surge after strong earnings beat",
+        "Company upgraded; outlook positive",
+    ]
+    neg_titles = [
+        "Stock plunges after lawsuit",
+        "Revenue misses estimates and guidance cut",
+    ]
+    s_pos = calc_headline_sentiment(pos_titles)
+    s_neg = calc_headline_sentiment(neg_titles)
+    _assert(s_pos > 0.55, "positive titles should score > 0.55")
+    _assert(s_neg < 0.45, "negative titles should score < 0.45")
+
+
+def test_calc_headline_sentiment_neutral_empty():
+    _assert(abs(calc_headline_sentiment([]) - 0.5) < 1e-9, "empty list should be neutral 0.5")
+    mixed = ["Company announces new product", "Analyst says outlook uncertain"]
+    # Mixed with no lexicon hits should map to neutral
+    _assert(abs(calc_headline_sentiment(mixed) - 0.5) < 1e-6, "mixed/no-keywords should be ~neutral")
+
+
+def test_build_headers_from_values_merges_and_overrides():
+    base = _build_headers_from_values("k1", "X-Api-Key", json.dumps({"A":"1","B":"2"}))
+    _assert(base.get("A") == "1" and base.get("B") == "2", "base headers merged")
+    _assert(base.get("X-Api-Key") == "k1", "api key header set/overridden")
+    # overrides via JSON
+    over = _build_headers_from_values("k2", "X-Api-Key", json.dumps({"X-Api-Key":"OVERRIDE","C":"3"}))
+    _assert(over.get("X-Api-Key") == "k2", "explicit api key wins over JSON override")
+    _assert(over.get("C") == "3", "extra header kept")
+
+
+def test_parse_yahoo_rss_basic():
+    sample = """
+    <rss><channel>
+      <item><title>Apple shares surge on record revenue</title><link>http://example.com/a</link><pubDate>Mon, 12 Aug 2025 10:00:00 GMT</pubDate></item>
+      <item><title>Apple downgraded by broker</title><link>http://example.com/b</link><pubDate>Mon, 12 Aug 2025 09:00:00 GMT</pubDate></item>
+    </channel></rss>
+    """
+    items = _parse_yahoo_rss(sample)
+    _assert(len(items) == 2, "should parse two items")
+    _assert(items[0]["title"].startswith("Apple shares surge"), "first title parsed")
+    _assert(items[1]["link"].endswith("/b"), "second link parsed")
+
+
 if __name__ == "__main__":
     logging.info("Running self-tests...")
     test_parse_alert_valid()
@@ -631,5 +836,9 @@ if __name__ == "__main__":
     test_clamp_strike_bounds()
     test_stub_on_event_and_routes_registration()
     test_http_client_no_ssl_raises()
+    test_calc_headline_sentiment()
+    test_calc_headline_sentiment_neutral_empty()
+    test_build_headers_from_values_merges_and_overrides()
+    test_parse_yahoo_rss_basic()
     logging.info("All tests passed. If you need the HTTP server, run with uvicorn in an environment with ssl support:")
     logging.info("uvicorn fastapi_trading_alert_service:app --host 0.0.0.0 --port 10000")
