@@ -1,844 +1,299 @@
+# alert_server.py
+"""
+FastAPI + Polygon.io (Options) — single-file service
+
+Features
+- Async httpx client with keep-alive, connection limits, and timeouts
+- Endpoints for options contracts, snapshots (all & one), unusual activity, latest trade/quote
+- EMA indicator on the underlying
+- Underlying last price fetch + ATM & near-expiry filter
+- Simple in-memory TTL cache to reduce rate-limit pressure
+- Clean JSON responses ready for your trading logic
+
+ENV (set before running):
+  POLYGON_API_KEY=...
+
+Run:
+  uvicorn alert_server:app --host 0.0.0.0 --port 8000 --reload
+"""
+
 import os
-import re
-import sys
-import json
-import asyncio
-import logging
-from datetime import datetime, timedelta, timezone, date
-from typing import Dict, Any, Optional, Tuple, List
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-"""
-FASTAPI TRADING ALERT SERVICE — LLM DECISION (MICROPIP-SAFE)
------------------------------------------------------------
-Why this rewrite?
-- Some environments (e.g., Pyodide / browser sandboxes) try to use `micropip` for installing
-  third‑party packages on the fly. Our module must import cleanly **without** requiring any
-  third‑party dependency — otherwise imports can throw `ModuleNotFoundError: micropip`.
-- This file now **hard-guards** against importing external libraries (FastAPI, httpx) whenever
-  we detect a restricted runtime. In such cases we provide **pure-Python stubs** and ensure
-  all tests run without network or third‑party modules.
+import httpx
+from fastapi import FastAPI, HTTPException, Query
 
-How to force stub mode (no external deps at all):
-  export PY_FORCE_STUBS=1
+# =========================
+# Config & HTTP client
+# =========================
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+if not POLYGON_API_KEY:
+    raise RuntimeError("POLYGON_API_KEY is not set in environment.")
 
-In stub mode:
-- No imports of FastAPI/httpx happen.
-- `openai_decide()` returns a conservative NEUTRAL decision (documented), so imports succeed.
-- All unit tests are offline and pass.
+BASE_URL = "https://api.polygon.io"
 
-When running in a full server environment (non-stub):
-- If `ssl` is available and PY_FORCE_STUBS is not set, we use FastAPI/httpx as before.
+# Create client on startup so we reuse connections
+client: Optional[httpx.AsyncClient] = None
 
-IMPORTANT: We did **not** change existing test cases; we only added more tests.
-"""
 
-# ============================
-# Runtime / environment guards
-# ============================
-RUNTIME_STUBS: bool = bool(
-    os.getenv("PY_FORCE_STUBS") == "1"
-    or sys.platform in {"emscripten", "wasi", "wasm32"}
-    or ("pyodide" in sys.modules)
-)
+# =========================
+# Tiny TTL Cache (in-memory)
+# =========================
+class TTLCache:
+    def __init__(self):
+        self.store: Dict[str, Dict[str, Any]] = {}
 
-# =============================================================
-# Runs in sandboxes without ssl: avoids network data providers
-# =============================================================
-try:
-    if RUNTIME_STUBS:
-        raise ImportError("Force stubs: skip ssl import")
-    import ssl  # noqa: F401
-    SSL_AVAILABLE = True
-except Exception:
-    SSL_AVAILABLE = False
+    def _now(self) -> float:
+        return time.time()
 
-# FastAPI import (with stubs if ssl isn't available or in stub runtime)
-try:
-    if not SSL_AVAILABLE or RUNTIME_STUBS:
-        raise ImportError("FastAPI disabled: no ssl or stub runtime")
-    from fastapi import FastAPI, Request, HTTPException
-    from fastapi.responses import JSONResponse
-except Exception:
-    class HTTPException(Exception):
-        def __init__(self, status_code: int, detail: str = ""):
-            self.status_code = status_code
-            self.detail = detail
-            super().__init__(detail)
+    def get(self, key: str) -> Optional[Any]:
+        entry = self.store.get(key)
+        if not entry:
+            return None
+        if self._now() >= entry["exp"]:
+            self.store.pop(key, None)
+            return None
+        return entry["val"]
 
-    class JSONResponse(dict):
-        pass
+    def set(self, key: str, val: Any, ttl: int):
+        self.store[key] = {"val": val, "exp": self._now() + ttl}
 
-    class _StubRequest:  # minimal placeholder
-        headers: Dict[str, str] = {}
-        async def body(self) -> bytes:  # pragma: no cover
-            return b""
-        async def json(self) -> Dict[str, Any]:  # pragma: no cover
-            return {}
 
-    class _StubApp:
-        """Minimal stand-in for FastAPI, with route decorators and on_event."""
-        def __init__(self, *_: Any, **__: Any):
-            self.routes: Dict[Tuple[str, str], Any] = {}
-            self.events: Dict[str, List[Any]] = {}
-        def get(self, path: str, *_, **__):
-            def deco(fn):
-                self.routes[("GET", path)] = fn
-                return fn
-            return deco
-        def post(self, path: str, *_, **__):
-            def deco(fn):
-                self.routes[("POST", path)] = fn
-                return fn
-            return deco
-        def on_event(self, event: str):
-            def deco(fn):
-                self.events.setdefault(event, []).append(fn)
-                return fn
-            return deco
-        async def __call__(self, scope, receive, send):  # pragma: no cover
-            raise RuntimeError("FastAPI unavailable in stub runtime.")
-    FastAPI = _StubApp  # type: ignore
-    Request = _StubRequest  # type: ignore
+cache = TTLCache()
 
-# -------------------- Logging --------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# -------------------- Environment --------------------
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
+def cache_key(path: str, params: Dict[str, Any]) -> str:
+    # Stable cache key for GET requests
+    items = sorted((k, str(v)) for k, v in params.items())
+    return f"{path}?{'&'.join([f'{k}={v}' for k,v in items])}"
 
-REQUIRED_KEYS = {
-    "OPENAI_API_KEY": OPENAI_API_KEY,
-}
 
-# -------------------- HTTP client (lazy; used only for OpenAI/Telegram) --------------------
-_http_client = None
-
-def get_http_client():
-    """Return a shared httpx.AsyncClient when allowed; otherwise raise.
-
-    We **never** import httpx in stub runtimes to avoid triggering micropip or any
-    third‑party imports in restricted environments.
-    """
-    if RUNTIME_STUBS:
-        raise RuntimeError("HTTP client disabled in stub runtime")
-    global _http_client
-    if _http_client is not None:
-        return _http_client
-    if not SSL_AVAILABLE:
-        raise RuntimeError("SSL not available; HTTP client disabled in this environment.")
-    import httpx  # lazy import to avoid anyio->ssl on module import
-    HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
-    transport = httpx.AsyncHTTPTransport(retries=2)
-    _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, transport=transport, headers={"Accept-Encoding": "gzip"})
-    return _http_client
-
-# -------------------- App --------------------
-app = FastAPI(title="TradingView → LLM Decision API (micropip-safe)")
-
-# -------------------- LLM quota --------------------
-LLM_DAILY_LIMIT = int(os.getenv("LLM_DAILY_LIMIT", "20"))
-_llm_calls_today = 0
-_llm_roll_date = datetime.now(timezone.utc).date()
-
-def _reset_quota_if_needed():
-    global _llm_calls_today, _llm_roll_date
-    today = datetime.now(timezone.utc).date()
-    if today != _llm_roll_date:
-        _llm_roll_date = today
-        _llm_calls_today = 0
-
-def _llm_quota_ok() -> bool:
-    _reset_quota_if_needed()
-    return _llm_calls_today < LLM_DAILY_LIMIT
-
-def _tick_llm_quota():
-    global _llm_calls_today
-    _llm_calls_today += 1
-
-# -------------------- Alert parsing --------------------
-ALERT_RE = re.compile(
-    r"""(?ix)
-    ^\s*
-    (PUT|CALL)
-    \s*:\s*
-    ([A-Z.\-]+)
-    \s+at\s+\$?([\d.]+)
-    \s+Strike:\s+\$?([\d.]+)
-    \s+Expiry:\s+(\n?\d{2}-\d{2}-\d{4})
-    \s*$
-    """
-)
-
-def parse_alert(text: str) -> Dict[str, Any]:
-    logging.info("Processing alert: %s", text)
-    s = (text or "").strip()
-    # Expect formats like:
-    #   CALL: AAPL at $230 Strike: $245 Expiry: 08-15-2025
-    #   PUT: NVDA at $183 Strike: $180 Expiry: 2025-09-20
-    # Case-insensitive for side keyword, robust spacing, $ optional on numbers
-    colon = s.find(":")
-    if colon <= 0:
-        raise ValueError("Alert format invalid. Expected 'PUT/CALL: TICKER at $PRICE Strike: $STRIKE Expiry: MM-DD-YYYY or YYYY-MM-DD'")
-    side = s[:colon].strip().upper()
-    if side not in {"PUT", "CALL"}:
-        raise ValueError("First token must be PUT or CALL followed by ':'")
-    rest = s[colon+1:].strip()
-
-    # ticker before ' at '
-    at_idx = rest.lower().find(" at ")
-    if at_idx <= 0:
-        raise ValueError("Missing ' at ' segment after ticker")
-    ticker = rest[:at_idx].strip().upper()
-    tail = rest[at_idx+4:].strip()
-
-    # price before ' Strike:'
-    strike_tag = tail.lower().find(" strike:")
-    if strike_tag <= 0:
-        raise ValueError("Missing 'Strike:' segment")
-    price_str = tail[:strike_tag].strip()
-    if price_str.startswith("$"):
-        price_str = price_str[1:]
+async def cached_get(path: str, params: Dict[str, Any], ttl: int = 30) -> Dict[str, Any]:
+    """GET with TTL cache + auth header attached automatically."""
+    assert client is not None, "HTTP client not initialized"
+    params = {k: v for k, v in params.items() if v is not None}
+    key = cache_key(path, params)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    r = await client.get(f"{BASE_URL}{path}", params=params)
     try:
-        price = float(price_str)
-    except Exception:
-        raise ValueError("Price parse failed")
-
-    tail2 = tail[strike_tag+len(" Strike:"):].strip()
-    # strike before ' Expiry:'
-    expiry_tag = tail2.lower().find(" expiry:")
-    if expiry_tag <= 0:
-        raise ValueError("Missing 'Expiry:' segment")
-    strike_str = tail2[:expiry_tag].strip()
-    if strike_str.startswith("$"):
-        strike_str = strike_str[1:]
-    try:
-        strike = float(strike_str)
-    except Exception:
-        raise ValueError("Strike parse failed")
-
-    exp_str = tail2[expiry_tag+len(" Expiry:"):].strip()
-    # normalize date
-    exp_iso = None
-    for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
-        try:
-            exp_iso = datetime.strptime(exp_str, fmt).date().isoformat()
-            break
-        except Exception:
-            pass
-    if not exp_iso:
-        raise ValueError("Expiry parse failed: expected MM-DD-YYYY or YYYY-MM-DD")
-
-    return {"side": side, "ticker": ticker, "price": price, "strike": strike, "expiry": exp_iso, "expiry_input": exp_str}
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    data = r.json()
+    cache.set(key, data, ttl)
+    return data
 
 
-def _coerce_to_text(body: bytes) -> str:
-    """Coerce typical webhook bodies into an alert string.
-    Supports raw text, JSON with {text|message|payload}, and form-encoded text=/message=/payload=.
-    """
-    if not body:
-        return ""
-    try:
-        s = body.decode("utf-8", errors="ignore").strip()
-    except Exception:
-        return ""
-
-    # JSON object
-    if s.startswith("{") and s.endswith("}"):
-        try:
-            obj = json.loads(s)
-            val = obj.get("text") or obj.get("message") or obj.get("payload")
-            if isinstance(val, str):
-                return val.strip()
-        except Exception:
-            pass
-
-    # Form-encoded
-    if ("=" in s) or ("&" in s):
-        try:
-            from urllib.parse import parse_qs
-            qs = parse_qs(s)
-            for key in ("text", "message", "payload"):
-                vals = qs.get(key)
-                if vals and isinstance(vals, list) and vals[0]:
-                    return vals[0].strip()
-        except Exception:
-            pass
-
-    # Plain text fallback
-    return s
-
-# -------------------- Config knobs (provider-free) --------------------
-NEARBY_DAY_WINDOW = 7           # kept for API shape compatibility
-STRIKE_PCT_WINDOW = 0.10
-MAX_CANDIDATES    = 5
-
-# -------------------- Provider-free stubs --------------------
-async def get_intraday_volume_snapshot(_ticker: str, warnings: List[str]) -> Dict[str, Any]:
-    """No external provider: return neutral/unknown volume snapshot."""
-    logging.info("Volume snapshot disabled (no provider)")
-    return {"prev_volume": None, "today_volume": None, "timespan": "disabled"}
-
-async def get_indicators(_ticker: str) -> Dict[str, Any]:
-    """No external provider: return indicators as None."""
-    logging.info("Indicators disabled (no provider)")
-    return {"ema9": None, "ema21": None, "rsi14": None, "adx14": None}
-
-# Nearby option candidates: turned off when no provider
-
-def _iso(d: date) -> str:
-    return d.isoformat()
-
-def _clamp_strike_bounds(strike: float, pct: float) -> Tuple[float, float]:
-    lo = max(0.01, strike * (1.0 - pct))
-    hi = strike * (1.0 + pct)
-    return (round(lo, 2), round(hi, 2))
-
-async def find_option_candidates_nearby(*_args, **_kwargs) -> List[Dict[str, Any]]:
-    logging.info("Nearby option search disabled (no provider)")
-    return []
-
-async def get_option_snapshots_many(*_args, **_kwargs) -> List[Dict[str, Any]]:
-    logging.info("Option snapshots disabled (no provider)")
-    return []
-
-# -------------------- Generic helpers (no provider usage) --------------------
-
-def _build_headers_from_values(api_key: str, api_key_header: str, api_headers_json: str) -> Dict[str, str]:
-    """Build headers from user-provided pieces (pure function used in tests)."""
-    headers: Dict[str, str] = {}
-    if api_headers_json:
-        try:
-            user = json.loads(api_headers_json)
-            if isinstance(user, dict):
-                headers.update({str(k): str(v) for k, v in user.items()})
-        except Exception:
-            pass
-    if api_key:
-        headers[str(api_key_header)] = str(api_key)
-    return headers
-
-
-def _parse_yahoo_rss(xml_text: str) -> List[Dict[str, Any]]:
-    """Generic RSS parser used by tests (name kept to preserve existing tests)."""
-    import xml.etree.ElementTree as ET
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception as e:
-        logging.warning("Failed to parse RSS: %s", e)
-        return []
-    items = []
-    for item in root.findall('.//item'):
-        title = (item.findtext('title') or '').strip()
-        link = (item.findtext('link') or '').strip()
-        pub = (item.findtext('pubDate') or '').strip()
-        items.append({"title": title, "link": link, "pubDate": pub})
-    return items
-
-
-def calc_headline_sentiment(headlines: List[str]) -> float:
-    """Lightweight lexicon sentiment 0..1 (0=neg, 0.5=neutral, 1=pos)."""
-    if not headlines:
-        return 0.5
-    pos = {
-        "surge","beat","beats","record","strong","growth","upgrade","upgraded","bullish","rally","profit",
-        "soar","soars","gain","gains","optimistic","outperform","top","tops","exceed","exceeds","positive"
+# =========================
+# Polygon wrappers (async)
+# =========================
+async def list_option_contracts(
+    symbol: str,
+    contract_type: Optional[str] = None,      # 'call' | 'put'
+    expiration_date: Optional[str] = None,    # 'YYYY-MM-DD'
+    strike_price: Optional[float] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    params = {
+        "underlying_ticker": symbol.upper(),
+        "contract_type": contract_type,
+        "expiration_date": expiration_date,
+        "strike_price": strike_price,
+        "limit": limit,
+        # Note: add more filters if needed (e.g., "expired": "false")
     }
-    neg = {
-        "plunge","miss","misses","lawsuit","probe","bearish","downgrade","downgraded","loss","decline","falls",
-        "fall","drop","drops","warning","cuts","cut","negative","missed","disappoint","disappoints","bankrupt"
-    }
-    import re as _re
-    score_acc = 0
-    count = 0
-    for t in headlines[:20]:
-        words = set(_re.findall(r"[a-z']+", (t or '').lower()))
-        p = len(words & pos)
-        n = len(words & neg)
-        if p == 0 and n == 0:
+    return await cached_get("/v3/reference/options/contracts", params, ttl=60)
+
+
+async def snapshot_options_all(symbol: str) -> Dict[str, Any]:
+    # All active options for underlying (includes greeks, oi, vol, last, etc.)
+    return await cached_get(f"/v3/snapshot/options/{symbol.upper()}", {}, ttl=15)
+
+
+async def snapshot_option_one(symbol: str, option_ticker: str) -> Dict[str, Any]:
+    return await cached_get(f"/v3/snapshot/options/{symbol.upper()}/{option_ticker}", {}, ttl=10)
+
+
+async def unusual_activity(symbol: Optional[str] = None) -> Dict[str, Any]:
+    params = {"ticker": symbol.upper() if symbol else None}
+    return await cached_get("/v3/unusual_activity/stocks", params, ttl=30)
+
+
+async def latest_option_trade(option_ticker: str) -> Dict[str, Any]:
+    return await cached_get(f"/v3/trades/{option_ticker}/last", {}, ttl=5)
+
+
+async def latest_option_quote(option_ticker: str) -> Dict[str, Any]:
+    return await cached_get(f"/v3/quotes/{option_ticker}/last", {}, ttl=5)
+
+
+async def ema_indicator(symbol: str, window: int = 9, timespan: str = "minute") -> Dict[str, Any]:
+    params = {"window": window, "timespan": timespan}
+    return await cached_get(f"/v1/indicators/ema/{symbol.upper()}", params, ttl=15)
+
+
+async def underlying_last_trade(symbol: str) -> float:
+    """
+    Get last trade price for the underlying stock.
+    Uses /v2/last/trade/{ticker} (stock).
+    """
+    data = await cached_get(f"/v2/last/trade/{symbol.upper()}", {}, ttl=3)
+    # Expected shape: {"results":{"p": <price>, ...}}
+    try:
+        return float(data["results"]["p"])
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"Unexpected last trade payload: {data}")
+
+
+# =========================
+# Helpers
+# =========================
+def filter_near_atm_and_expiry(
+    contracts: List[Dict[str, Any]],
+    underlying_price: float,
+    max_dte: int = 21,
+    moneyness_band: float = 0.10,  # +/-10% of underlying
+) -> List[Dict[str, Any]]:
+    """
+    Keep contracts within +/- moneyness_band of spot and expiring within max_dte days.
+    contracts: list items shaped like Polygon "reference/options/contracts" results
+    """
+    today = datetime.utcnow().date()
+    out: List[Dict[str, Any]] = []
+    for c in contracts:
+        try:
+            details = c.get("details") or {}
+            strike = float(details["strike_price"])
+            expiry = datetime.strptime(details["expiration_date"], "%Y-%m-%d").date()
+            dte = (expiry - today).days
+            if dte <= 0 or dte > max_dte:
+                continue
+            if underlying_price <= 0:
+                continue
+            if abs(strike - underlying_price) / underlying_price <= moneyness_band:
+                out.append(c)
+        except Exception:
+            # Skip malformed entries
             continue
-        raw = (p - n) / float(p + n)
-        mapped = (raw + 1.0) / 2.0
-        score_acc += mapped
-        count += 1
-    return round(score_acc / count, 3) if count else 0.5
+    return out
 
-async def get_news_and_sentiment(_ticker: str) -> Dict[str, Any]:
-    """No external news: return neutral sentiment and empty headlines."""
-    logging.info("News fetch disabled (no provider)")
-    return {"news": [], "sentiment_score": 0.5}
 
-# -------------------- LLM decision helpers --------------------
+# =========================
+# FastAPI app & routes
+# =========================
+app = FastAPI(title="Polygon Options API (FastAPI single-file)")
 
-def _normalize_llm_output(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize an LLM JSON into our schema (pure function — fully testable)."""
-    decision = str(d.get("decision", "NEUTRAL")).upper().strip()
-    if decision not in {"BUY CALL", "BUY PUT", "SELL CALL", "SELL PUT", "NEUTRAL"}:
-        decision = "NEUTRAL"
-    try:
-        confidence = int(d.get("confidence", 0))
-    except Exception:
-        confidence = 0
-    rationale = d.get("rationale")
-    if not isinstance(rationale, list):
-        rationale = [str(rationale) if rationale else "No rationale provided by model."]
-    suggested_action = str(d.get("suggested_action", "SKIP"))[:16].upper()
-    risk_notes = d.get("risk_notes")
-    if not isinstance(risk_notes, list):
-        risk_notes = [str(risk_notes) if risk_notes else "No explicit risks noted."]
-    try:
-        th = int(d.get("time_horizon_days", 0))
-    except Exception:
-        th = 0
-    alts = d.get("alts")
-    if not isinstance(alts, list):
-        alts = []
-    return {
-        "decision": decision,
-        "confidence": max(0, min(100, confidence)),
-        "rationale": rationale,
-        "suggested_action": suggested_action,
-        "risk_notes": risk_notes,
-        "time_horizon_days": max(0, th),
-        "alts": alts,
-    }
-
-# -------------------- OpenAI helper (UPDATED & STUB-SAFE) --------------------
-async def openai_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ask OpenAI for a conservative, options-specific decision.
-    - In stub runtimes or without OPENAI_API_KEY, returns a conservative NEUTRAL decision
-      so imports/tests never attempt network or 3rd‑party imports.
-    - In full runtimes, calls OpenAI Chat Completions and normalizes the response.
-    """
-    logging.info("LLM processing start for %s", payload.get("ticker"))
-
-    if RUNTIME_STUBS or not OPENAI_API_KEY:
-        return _normalize_llm_output({
-            "decision": "NEUTRAL",
-            "confidence": 0,
-            "rationale": [
-                "Stub/runtime or missing key — skipping external LLM call.",
-                "Be conservative when data is missing."
-            ],
-            "suggested_action": "PASS",
-            "risk_notes": ["No market data; unknown volatility; avoid overfitting"],
-            "time_horizon_days": 0,
-            "alts": []
-        })
-
-    if not _llm_quota_ok():
-        return _normalize_llm_output({
-            "decision": "NEUTRAL",
-            "confidence": 0,
-            "rationale": ["LLM quota exceeded for today; skipping model."],
-            "suggested_action": "SKIP",
-            "risk_notes": ["Quota exhausted"],
-            "time_horizon_days": 0,
-            "alts": []
-        })
-
-    # Make the prompt robust to missing data.
-    sys_prompt = (
-        "You are a disciplined, risk-aware options trading assistant.\n"
-        "Given technicals, volume context, an option snapshot (may be None), and news sentiment,\n"
-        "return a JSON decision with these keys: decision (BUY CALL|BUY PUT|SELL CALL|SELL PUT|NEUTRAL),\n"
-        "confidence (0-100 integer), rationale (array of 2-6 short bullets), suggested_action (BUY|PASS|HEDGE),\n"
-        "risk_notes (array), time_horizon_days (integer), and alts (array of textual alternative ideas).\n"
-        "Be conservative when inputs are missing; call out missing data explicitly in rationale."
+@app.on_event("startup")
+async def _startup():
+    global client
+    # Build a single shared HTTP client with auth header
+    client = httpx.AsyncClient(
+        timeout=10.0,
+        headers={"Authorization": f"Bearer {POLYGON_API_KEY}"},
+        limits=httpx.Limits(max_keepalive_connections=16, max_connections=32),
+        http2=False,
     )
 
-    ind = payload.get('indicators') or {}
-    vol = payload.get('volume') or {}
-    news = payload.get('news') or {}
-    opt = payload.get('option_snapshot')
 
-    user_prompt = (
-        f"ALERT: {payload['side']} {payload['ticker']} strike {payload['strike']} exp {payload['expiry']} (spot ~{payload['price']}).\n"
-        f"TECH: EMA9={ind.get('ema9')}, EMA21={ind.get('ema21')}, RSI14={ind.get('rsi14')}, ADX14={ind.get('adx14')}.\n"
-        f"VOL: prev_vol={vol.get('prev_volume')}, today_vol={vol.get('today_volume')} (timespan={vol.get('timespan')}).\n"
-        f"OPTION (top candidate snapshot): {opt}.\n"
-        f"NEWS_SENTIMENT: {news.get('sentiment_score')} (headlines may be empty).\n"
-        f"PRE_SCORE: {payload.get('pre_score')} | candidates={payload.get('option_candidates_count')}.\n"
-        "Return *only* JSON with: decision, confidence, rationale, suggested_action, risk_notes, time_horizon_days, alts."
-    )
-
-    cli = get_http_client()
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "response_format": {"type": "json_object"},
-        "max_tokens": 350,
-        "temperature": 0.2,
-    }
-
-    # Resilient call with a single retry on 5xx
-    for attempt in range(2):
-        resp = await cli.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
-        if 500 <= resp.status_code < 600 and attempt == 0:
-            await asyncio.sleep(0.6)
-            continue
-        if resp.status_code >= 400:
-            raise HTTPException(resp.status_code, detail=f"OpenAI error: {resp.text}")
-        break
-
-    _tick_llm_quota()
-    data = resp.json()
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "{}")
-
-    try:
-        parsed = json.loads(content)
-    except Exception:
-        parsed = {}
-    return _normalize_llm_output(parsed)
-
-# -------------------- Simple heuristic score (pre-LLM) --------------------
-
-def simple_score(tech: Dict[str, Any], vol: Dict[str, Any], news_score: float, side: str) -> float:
-    score = 0.0
-    ema9, ema21 = tech.get("ema9"), tech.get("ema21")
-    rsi, adx = tech.get("rsi14"), tech.get("adx14")
-    if ema9 is not None and ema21 is not None:
-        trend_up = ema9 > ema21
-        score += 10 if trend_up else -10
-        score += (5 if (side == "CALL" and trend_up) else (-5 if side == "CALL" else (5 if not trend_up else -5)))
-    if rsi is not None:
-        score += (rsi - 50) / 2 if side == "CALL" else (50 - rsi) / 2
-    if adx is not None:
-        score += min(max((adx - 20), 0), 10)
-    prev_v, today_v = vol.get("prev_volume") or 0, vol.get("today_volume") or 0
-    if prev_v and today_v:
-        rel = today_v / prev_v
-        score += (rel - 1.0) * 10
-    score += (news_score - 0.5) * 20
-    return round(score, 2)
-
-# -------------------- Telegram (optional) --------------------
-async def send_telegram(msg: str) -> None:
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        return
-    if RUNTIME_STUBS:
-        logging.info("Telegram disabled in stub runtime; message suppressed.")
-        return
-    cli = get_http_client()
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    await cli.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True})
-
-# -------------------- Pydantic model (optional JSON webhook) --------------------
-try:
-    if RUNTIME_STUBS:
-        raise ImportError("pydantic disabled in stub runtime")
-    from pydantic import BaseModel  # noqa: F811
-except Exception:  # pragma: no cover
-    class BaseModel:  # minimal stub for tests if pydantic missing
-        pass
-
-class AlertIn(BaseModel):
-    text: str
-
-# -------------------- Health/Quota endpoints --------------------
-@app.get("/health")
-async def health():
-    _reset_quota_if_needed()
-    return {
-        "ok": True,
-        "ssl_available": SSL_AVAILABLE,
-        "stub_runtime": RUNTIME_STUBS,
-        "llm_calls_today": _llm_calls_today,
-        "llm_daily_limit": LLM_DAILY_LIMIT,
-        "keys_loaded": {k: bool(v) for k, v in REQUIRED_KEYS.items()},
-        "providers": "disabled",
-    }
-
-@app.get("/quota")
-async def quota():
-    _reset_quota_if_needed()
-    return {"remaining": max(LLM_DAILY_LIMIT - _llm_calls_today, 0), "limit": LLM_DAILY_LIMIT}
-
-# -------------------- Main webhook --------------------
-@app.post("/webhook/tradingview", response_class=JSONResponse)
-async def tradingview_webhook(request: Request):
-    content_type = getattr(request, 'headers', {}).get("content-type", "").lower()
-
-    text = ""
-    # JSON body: {"text": "..."} or {"message": "..."} or {"payload": "..."}
-    if "application/json" in content_type and hasattr(request, 'json'):
-        try:
-            body_obj = await request.json()
-            text = str((body_obj or {}).get("text") or (body_obj or {}).get("message") or (body_obj or {}).get("payload") or "").strip()
-        except Exception:
-            text = ""
-
-    # Fallback to raw body (plain text or form-encoded)
-    if not text:
-        raw = await request.body() if hasattr(request, 'body') else b""
-        text = _coerce_to_text(raw)
-
-    if not text:
-        raise HTTPException(
-            400,
-            detail=(
-                "Empty alert body: send plain text like 'CALL: AAPL at $230 Strike: $245 Expiry: 08-15-2025' "
-                "or JSON {\"text\": \"...\"} / {\"message\": \"...\"}, or form 'text=...' / 'message=...' / 'payload=...'."
-            ),
-        )
-
-    # 1) Parse alert
-    try:
-        parsed = parse_alert(text)
-    except ValueError as e:
-        raise HTTPException(400, detail=str(e))
-
-    warnings: List[str] = []
-
-    # 2) Provider-free data: all stubs
-    option_candidates: List[Dict[str, Any]] = await find_option_candidates_nearby(parsed["ticker"], parsed["expiry"], parsed["side"], parsed["strike"])
-    volume     = await get_intraday_volume_snapshot(parsed["ticker"], warnings)
-    indicators = await get_indicators(parsed["ticker"])
-    news       = await get_news_and_sentiment(parsed["ticker"])
-    option_snapshots: List[Dict[str, Any]] = await get_option_snapshots_many(parsed["ticker"], [c.get("ticker") for c in option_candidates], warnings)
-
-    # 3) Pre-score
-    pre_score = simple_score(indicators, volume, news.get("sentiment_score", 0.5), parsed["side"])
-
-    # 4) LLM decision (respect daily quota & stub runtime)
-    payload = {
-        **parsed,
-        "indicators": indicators,
-        "volume": volume,
-        "news": news,
-        "option_snapshot": (option_snapshots[0] if option_snapshots else None),
-        "pre_score": pre_score,
-        "option_candidates_count": len(option_candidates),
-    }
-    decision = await openai_decide(payload)
-
-    # 4.1) Apply a very light policy layer (optional)
-    if abs(pre_score) < 3 and decision.get("confidence", 0) < 55:
-        decision = {**decision, "decision": "NEUTRAL", "suggested_action": "PASS"}
-
-    # 5) Optional Telegram + response
-    cand_line = f"CANDIDATES: {', '.join([c['ticker'] for c in option_candidates[:3] if c.get('ticker')])}" if option_candidates else "CANDIDATES: none"
-    warn_line = f"WARNINGS: {len(warnings)}" if warnings else "WARNINGS: none"
-    summary_lines = [
-        f"ALERT ➜ {parsed['side']} {parsed['ticker']}  strike {parsed['strike']}  exp {parsed['expiry_input']} (spot ~{parsed['price']})",
-        cand_line,
-        warn_line,
-        f"PRE-SCORE: {pre_score}",
-        f"DECISION: {decision.get('decision')}  (confidence {decision.get('confidence')}%) | ACTION: {decision.get('suggested_action')}",
-        "WHY:", *[f"- {r}" for r in decision.get('rationale', [])][:4],
-        "RISKS:", *[f"- {r}" for r in decision.get('risk_notes', [])][:3],
-    ]
-    try:
-        await send_telegram("\n".join(summary_lines))
-    except Exception:
-        pass
-
-    return {
-        "parsed": parsed,
-        "pre_score": pre_score,
-        "indicators": indicators,
-        "volume": volume,
-        "option_candidates": option_candidates,
-        "option_snapshots": option_snapshots,
-        "news_sentiment": news.get("sentiment_score"),
-        "decision": decision,
-        "warnings": warnings,
-        "llm_calls_used_today": _llm_calls_today,
-        "llm_daily_limit": LLM_DAILY_LIMIT,
-        "stub_runtime": RUNTIME_STUBS,
-    }
-
-# -------------------- Shutdown hook --------------------
 @app.on_event("shutdown")
 async def _shutdown():
-    try:
-        if not RUNTIME_STUBS:
-            cli = get_http_client()
-            await cli.aclose()
-    except Exception:
-        pass
-
-# =============================================================
-# Minimal unit tests (run: `python fastapi_trading_alert_service_llm_updated.py`)
-# These DO NOT make network calls and work without ssl/fastapi.
-# =============================================================
-
-def _assert(cond: bool, msg: str):
-    if not cond:
-        logging.error("TEST FAIL: %s", msg)
-        raise AssertionError(msg)
+    global client
+    if client:
+        await client.aclose()
+    client = None
 
 
-def test_parse_alert_valid():
-    s = "CALL: AAPL at $230 Strike: $245 Expiry: 08-15-2025"
-    out = parse_alert(s)
-    _assert(out["side"] == "CALL", "side parse")
-    _assert(out["ticker"] == "AAPL", "ticker parse")
-    _assert(abs(out["price"] - 230.0) < 1e-9, "price parse")
-    _assert(abs(out["strike"] - 245.0) < 1e-9, "strike parse")
-    _assert(out["expiry"] == "2025-08-15", "expiry parse")
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "component": "polygon_options_service",
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
 
 
-def test_parse_alert_invalid():
-    bad = "BUY: AAPL 230 245 08-15-2025"
-    try:
-        parse_alert(bad)
-    except ValueError:
-        return
-    raise AssertionError("Invalid alert should raise ValueError")
+# ---- Reference: list contracts
+@app.get("/options/contracts/{symbol}")
+async def api_contracts(
+    symbol: str,
+    contract_type: Optional[str] = Query(None, regex="^(call|put)$"),
+    expiration_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    strike_price: Optional[float] = None,
+    limit: int = 100,
+):
+    return await list_option_contracts(symbol, contract_type, expiration_date, strike_price, limit)
 
 
-def test_parse_alert_iso_date():
-    s = "CALL: MSFT at $400 Strike: $405 Expiry: 2025-08-22"
-    out = parse_alert(s)
-    _assert(out["expiry"] == "2025-08-22", "ISO date supported (YYYY-MM-DD)")
+# ---- Snapshot: all options for underlying
+@app.get("/options/snapshot/{symbol}")
+async def api_snapshot_all(symbol: str):
+    return await snapshot_options_all(symbol)
 
 
-def test_coerce_to_text_variants():
-    # raw text
-    raw = b"CALL: AAPL at $230 Strike: $245 Expiry: 08-15-2025"
-    _assert(_coerce_to_text(raw).startswith("CALL:"), "raw text path")
-    # json {text}
-    rawj = b'{"text":"PUT: NVDA at $183 Strike: $180 Expiry: 09-20-2025"}'
-    _assert(_coerce_to_text(rawj).startswith("PUT:"), "json text path")
-    # json {message}
-    rawm = b'{"message":"CALL: TSLA at $250 Strike: $255 Expiry: 08-20-2025"}'
-    _assert(_coerce_to_text(rawm).startswith("CALL:"), "json message path")
-    # form text=...
-    rawf = b'text=CALL%3A%20TSLA%20at%20%24250%20Strike%3A%20%24255%20Expiry%3A%2008-20-2025'
-    _assert(_coerce_to_text(rawf).startswith("CALL:"), "form-encoded text path")
-    # form message=...
-    rawfm = b'message=PUT%3A%20NVDA%20at%20%24183%20Strike%3A%20%24180%20Expiry%3A%2009-20-2025'
-    _assert(_coerce_to_text(rawfm).startswith("PUT:"), "form-encoded message path")
+# ---- Snapshot: one contract
+@app.get("/options/snapshot/{symbol}/{option_ticker}")
+async def api_snapshot_one(symbol: str, option_ticker: str):
+    return await snapshot_option_one(symbol, option_ticker)
 
 
-def test_simple_score_direction():
-    tech = {"ema9": 11, "ema21": 10, "rsi14": 60, "adx14": 25}
-    vol = {"prev_volume": 1000, "today_volume": 1500}
-    s_call = simple_score(tech, vol, news_score=0.6, side="CALL")
-    s_put  = simple_score(tech, vol, news_score=0.6, side="PUT")
-    _assert(s_call > s_put, "CALL should score higher when ema9>ema21 & RSI>50")
-
-# --- Additional tests (no network / SSL required) ---
-
-def test_parse_alert_case_insensitive_and_spaces():
-    s = "  put: nvda at $183 Strike: $180 Expiry: 09-20-2025  "
-    out = parse_alert(s)
-    _assert(out["side"] == "PUT", "case-insensitive PUT parse")
-    _assert(out["ticker"] == "NVDA", "ticker upper-cased")
-    _assert(out["expiry"] == "2025-09-20", "expiry normalized to ISO")
+# ---- Unusual activity
+@app.get("/options/unusual")
+async def api_unusual(symbol: Optional[str] = None):
+    return await unusual_activity(symbol)
 
 
-def test_parse_alert_trailing_newline():
-    s = "CALL: TSLA at $250 Strike: $255 Expiry: 08-20-2025\n"
-    out = parse_alert(s)
-    _assert(out["ticker"] == "TSLA", "handles newline before end")
+# ---- Latest trade/quote for a specific option
+@app.get("/options/{option_ticker}/last-trade")
+async def api_last_trade(option_ticker: str):
+    return await latest_option_trade(option_ticker)
 
 
-def test_clamp_strike_bounds():
-    lo, hi = _clamp_strike_bounds(100.0, 0.10)
-    _assert(abs(lo - 90.0) < 1e-9 and abs(hi - 110.0) < 1e-9, "10% strike window bounds")
+@app.get("/options/{option_ticker}/last-quote")
+async def api_last_quote(option_ticker: str):
+    return await latest_option_quote(option_ticker)
 
 
-def test_stub_on_event_and_routes_registration():
-    if SSL_AVAILABLE and not RUNTIME_STUBS:
-        return
-    _assert(hasattr(app, 'on_event'), "Stub app should have on_event")
-    called = {"shutdown": False}
-
-    @app.on_event("shutdown")
-    async def _test_shutdown():
-        called["shutdown"] = True
-
-    _assert("shutdown" in getattr(app, 'events', {}), "Shutdown event registered in stub")
+# ---- EMA on underlying
+@app.get("/indicators/ema/{symbol}")
+async def api_ema(symbol: str, window: int = 9, timespan: str = "minute"):
+    return await ema_indicator(symbol, window, timespan)
 
 
-def test_http_client_behavior_depends_on_runtime():
-    if RUNTIME_STUBS:
-        try:
-            get_http_client()
-        except RuntimeError:
-            return
-        raise AssertionError("In stub runtime, get_http_client must raise RuntimeError")
-    else:
-        # In non-stub environments we cannot guarantee httpx is installed here,
-        # so we just assert the function is callable (not raising due to stub guard).
-        try:
-            get_http_client  # reference only
-        except Exception as e:
-            raise AssertionError(f"get_http_client reference failed: {e}")
+# ---- Combined helper: fetch contracts → filter ATM & near-expiry
+@app.get("/options/near-atm/{symbol}")
+async def api_near_atm(
+    symbol: str,
+    max_dte: int = 21,
+    moneyness_band: float = 0.10,
+    contract_type: Optional[str] = Query(None, regex="^(call|put)$"),
+    # Optional: if you already know spot, pass it to skip an extra request
+    spot_hint: Optional[float] = None,
+    limit: int = 500,
+):
+    """
+    Returns:
+      {
+        "underlying_price": float,
+        "count": int,
+        "results": [contracts...]
+      }
+    """
+    # 1) Spot
+    spot = float(spot_hint) if spot_hint is not None else await underlying_last_trade(symbol)
 
+    # 2) Contracts (reference endpoint is lighter than full snapshot, good for filtering)
+    contracts_resp = await list_option_contracts(symbol, contract_type=contract_type, limit=limit)
+    contracts = contracts_resp.get("results") or []
 
-def test_calc_headline_sentiment():
-    pos_titles = [
-        "Shares surge after strong earnings beat",
-        "Company upgraded; outlook positive",
-    ]
-    neg_titles = [
-        "Stock plunges after lawsuit",
-        "Revenue misses estimates and guidance cut",
-    ]
-    s_pos = calc_headline_sentiment(pos_titles)
-    s_neg = calc_headline_sentiment(neg_titles)
-    _assert(s_pos > 0.55, "positive titles should score > 0.55")
-    _assert(s_neg < 0.45, "negative titles should score < 0.45")
+    # 3) Filter ATM & near-expiry
+    filtered = filter_near_atm_and_expiry(contracts, spot, max_dte=max_dte, moneyness_band=moneyness_band)
 
-
-def test_calc_headline_sentiment_neutral_empty():
-    _assert(abs(calc_headline_sentiment([]) - 0.5) < 1e-9, "empty list should be neutral 0.5")
-    mixed = ["Company announces new product", "Analyst says outlook uncertain"]
-    _assert(abs(calc_headline_sentiment(mixed) - 0.5) < 1e-6, "mixed/no-keywords should be ~neutral")
-
-
-def test_build_headers_from_values_merges_and_overrides():
-    base = _build_headers_from_values("k1", "X-Api-Key", json.dumps({"A":"1","B":"2"}))
-    _assert(base.get("A") == "1" and base.get("B") == "2", "base headers merged")
-    _assert(base.get("X-Api-Key") == "k1", "api key header set/overridden")
-    over = _build_headers_from_values("k2", "X-Api-Key", json.dumps({"X-Api-Key":"OVERRIDE","C":"3"}))
-    _assert(over.get("X-Api-Key") == "k2", "explicit api key wins over JSON override")
-    _assert(over.get("C") == "3", "extra header kept")
-
-
-def test_normalize_llm_output():
-    raw = {"decision": "buy call", "confidence": "87", "rationale": "ok", "suggested_action": "Buy", "risk_notes": "theta", "time_horizon_days": "2", "alts": "x"}
-    norm = _normalize_llm_output(raw)
-    _assert(norm["decision"] == "BUY CALL", "decision normalized")
-    _assert(norm["confidence"] == 87, "confidence cast to int and clamped")
-    _assert(isinstance(norm["rationale"], list) and norm["rationale"], "rationale list")
-    _assert(isinstance(norm["risk_notes"], list) and norm["risk_notes"], "risks list")
-    _assert(isinstance(norm["alts"], list), "alts list")
-
-
-def test_openai_decide_stub_mode_returns_neutral():
-    if not RUNTIME_STUBS and os.getenv("CI_FORCE_STUB_TEST") != "1":
-        return  # avoid network in non-stub environments
-    payload = {"side": "CALL", "ticker": "TEST", "strike": 100, "expiry": "2025-08-15", "price": 101,
-               "indicators": {}, "volume": {}, "news": {}, "option_snapshot": None, "pre_score": 0,
-               "option_candidates_count": 0}
-    res = asyncio.get_event_loop().run_until_complete(openai_decide(payload))
-    _assert(res["decision"] == "NEUTRAL", "stub mode decision is NEUTRAL")
-
-
-if __name__ == "__main__":
-    logging.info("Running self-tests...")
-    test_parse_alert_valid()
-    test_parse_alert_invalid()
-    test_simple_score_direction()
-    test_parse_alert_case_insensitive_and_spaces()
-    test_parse_alert_trailing_newline()
-    test_clamp_strike_bounds()
-    test_stub_on_event_and_routes_registration()
-    test_http_client_behavior_depends_on_runtime()
-    test_calc_headline_sentiment()
-    test_calc_headline_sentiment_neutral_empty()
-    test_build_headers_from_values_merges_and_overrides()
-    test_normalize_llm_output()
-    test_openai_decide_stub_mode_returns_neutral()
-    logging.info("All tests passed. If you need the HTTP server, run with uvicorn in a full Python env:")
-    logging.info("uvicorn fastapi_trading_alert_service_llm_updated:app --host 0.0.0.0 --port 10000")
+    return {
+        "underlying_price": spot,
+        "count": len(filtered),
+        "results": filtered,
+    }
