@@ -2,11 +2,11 @@
 import os
 import re
 import json
-from datetime import datetime, timezone, date
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone, date, timedelta
+from typing import Any, Dict, Optional, List
 
 import uvicorn
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 import httpx
 from openai import OpenAI
@@ -18,8 +18,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Telegram (optional)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # chat id or channel @handle (numeric id preferred)
-TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")  # optional, for forum topics
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
 
 if not POLYGON_API_KEY:
     raise RuntimeError("Missing POLYGON_API_KEY in environment")
@@ -27,49 +27,94 @@ if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY in environment")
 
 oai_client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="TradingView Options Alert Ingestor + Telegram")
+app = FastAPI(title="TradingView Options Alert Ingestor + Telegram (Same-Week Expiry)")
 
-ALERT_RE = re.compile(
+# Accepts with expiry:
+#   CALL Signal: GOOGL at 206.13 Strike: 205 Expiry: 2025-08-21
+# Or without expiry (we'll compute same-week Friday):
+#   CALL Signal: GOOGL at 206.13 Strike: 205
+ALERT_RE_WITH_EXP = re.compile(
     r"^\s*(CALL|PUT)\s*Signal:\s*([A-Z][A-Z0-9\.\-]*)\s*at\s*([0-9]*\.?[0-9]+)\s*"
     r"Strike:\s*([0-9]*\.?[0-9]+)\s*Expiry:\s*(\d{4}-\d{2}-\d{2})\s*$",
+    re.IGNORECASE,
+)
+ALERT_RE_NO_EXP = re.compile(
+    r"^\s*(CALL|PUT)\s*Signal:\s*([A-Z][A-Z0-9\.\-]*)\s*at\s*([0-9]*\.?[0-9]+)\s*"
+    r"Strike:\s*([0-9]*\.?[0-9]+)\s*$",
     re.IGNORECASE,
 )
 
 # ---------- Helpers ----------
 
-def parse_alert(text: str) -> Dict[str, Any]:
-    m = ALERT_RE.match(text.strip())
-    if not m:
-        raise HTTPException(
-            status_code=400,
-            detail='Alert must look like: "CALL Signal: TICKER at 123.45 Strike: 123 Expiry: YYYY-MM-DD"',
-        )
-    side, symbol, underlying_px, strike, expiry = m.groups()
-    return {
-        "side": side.upper(),
-        "symbol": symbol.upper(),
-        "underlying_price_from_alert": float(underlying_px),
-        "strike": float(strike),
-        "expiry": expiry,
-    }
+def same_week_friday(today: date) -> date:
+    # Monday=0 ... Friday=4
+    offset = 4 - today.weekday()
+    if offset < 0:  # Sat/Sun -> next Friday
+        offset += 7
+    return today + timedelta(days=offset)
 
-async def polygon_get_option_ticker(client: httpx.AsyncClient, *, symbol: str, strike: float,
-                                    expiry: str, side: str) -> Optional[str]:
+def round_strike_to_common_increment(strike: float) -> float:
+    # Simple, practical rounding: nearest 0.5
+    return round(strike * 2) / 2.0
+
+def parse_alert_text(text: str) -> Dict[str, Any]:
+    s = text.strip()
+    m = ALERT_RE_WITH_EXP.match(s)
+    if m:
+        side, symbol, underlying_px, strike, expiry = m.groups()
+        return {
+            "side": side.upper(),
+            "symbol": symbol.upper(),
+            "underlying_price_from_alert": float(underlying_px),
+            "strike": float(strike),
+            "expiry": expiry,
+            "expiry_source": "alert",
+        }
+    m = ALERT_RE_NO_EXP.match(s)
+    if m:
+        side, symbol, underlying_px, strike = m.groups()
+        # compute same-week Friday (server local date in UTC for determinism)
+        swf = same_week_friday(datetime.now(timezone.utc).date()).isoformat()
+        return {
+            "side": side.upper(),
+            "symbol": symbol.upper(),
+            "underlying_price_from_alert": float(underlying_px),
+            "strike": float(strike),
+            "expiry": swf,
+            "expiry_source": "computed_same_week_friday",
+        }
+    raise HTTPException(
+        status_code=400,
+        detail='Alert must be like: "CALL Signal: TICKER at 123.45 Strike: 123" '
+               'or with expiry: "... Expiry: YYYY-MM-DD"',
+    )
+
+async def polygon_list_contracts_for_expiry(
+    client: httpx.AsyncClient, *, symbol: str, expiry: str, side: str, limit: int = 250
+) -> List[Dict[str, Any]]:
     params = {
         "underlying_ticker": symbol,
-        "strike_price": strike,
         "expiration_date": expiry,
         "contract_type": "call" if side == "CALL" else "put",
-        "limit": 5,
+        "limit": limit,
         "apiKey": POLYGON_API_KEY,
     }
     r = await client.get("https://api.polygon.io/v3/reference/options/contracts", params=params, timeout=20.0)
     r.raise_for_status()
-    results = (r.json() or {}).get("results", []) or []
-    if not results:
-        return None
-    results.sort(key=lambda x: (x.get("correction", 0), x.get("ticker", "")))
-    return results[0].get("ticker")
+    return (r.json() or {}).get("results", []) or []
+
+def pick_nearest_strike(contracts: List[Dict[str, Any]], desired_strike: float) -> Optional[Dict[str, Any]]:
+    best = None
+    best_diff = float("inf")
+    for c in contracts:
+        sp = c.get("strike_price")
+        if sp is None:
+            continue
+        diff = abs(float(sp) - desired_strike)
+        if diff < best_diff:
+            best_diff = diff
+            best = c
+    return best
 
 async def polygon_get_option_snapshot(client: httpx.AsyncClient, *, underlying: str, option_ticker: str) -> Dict[str, Any]:
     url = f"https://api.polygon.io/v3/snapshot/options/{underlying}/{option_ticker}"
@@ -84,18 +129,19 @@ def dte(expiry: str) -> int:
 def safe_get(d: Dict, path: str, default=None):
     cur = d
     for key in path.split("."):
-        if cur is None:
+        if cur is None or not isinstance(cur, dict):
             return default
         cur = cur.get(key)
     return cur if cur is not None else default
 
 def build_llm_prompt(context: Dict[str, Any]) -> str:
     lines = [
-        f"Alert: {context['side']} {context['symbol']} strike {context['strike']} exp {context['expiry']} (~{context['dte']} DTE) at underlying ≈ {context['underlying_price_from_alert']}",
+        f"Alert: {context['side']} {context['symbol']} strike {context['strike']} "
+        f"exp {context['expiry']} (~{context['dte']} DTE) at underlying ≈ {context['underlying_price_from_alert']}",
         f"Option ticker: {context['option_ticker']}",
         "Snapshot:",
         f"  IV: {context['implied_volatility']}",
-        f"  OI: {context['open_interest']}",
+        f"  Open Interest: {context['open_interest']}",
         f"  Volume (today): {context['volume']}",
     ]
     greeks = context.get("greeks") or {}
@@ -108,13 +154,12 @@ def build_llm_prompt(context: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 async def analyze_with_openai(context: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = build_llm_prompt(context)
     system = (
-        "You are a disciplined options trading analyst. Evaluate IV level, liquidity (OI/volume), DTE, and greeks. "
-        "Return STRICT JSON: "
-        '{"decision":"buy|skip","confidence":0..1,"reason":"one or two sentences",'
+        "You are a disciplined options trading analyst. Evaluate IV level, liquidity (OI/volume), DTE, and greeks.\n"
+        'Return STRICT JSON: {"decision":"buy|skip","confidence":0..1,"reason":"one or two sentences",'
         '"factors":{"iv":"low|medium|high","oi_ok":true|false,"volume_ok":true|false,"greeks_hint":"text"}}'
     )
+    prompt = build_llm_prompt(context)
     try:
         resp = oai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -136,7 +181,6 @@ def _fmt(val):
     return "—" if val is None else str(val)
 
 def compose_telegram_text(alert: Dict[str, Any], option_ticker: str, metrics: Dict[str, Any], llm: Dict[str, Any]) -> str:
-    # Plain text keeps things simple across chat types
     g = metrics.get("greeks", {})
     lines = [
         f"📣 Options Alert",
@@ -159,7 +203,6 @@ def compose_telegram_text(alert: Dict[str, Any], option_ticker: str, metrics: Di
     return "\n".join(lines)
 
 async def send_telegram(text: str) -> Optional[Dict[str, Any]]:
-    """Send a message to Telegram if token/chat are configured. Returns API response JSON or None."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -172,7 +215,6 @@ async def send_telegram(text: str) -> Optional[Dict[str, Any]]:
         payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(url, json=payload)
-        # Do not raise on status; just return what Telegram said for troubleshooting
         try:
             return r.json()
         except Exception:
@@ -184,20 +226,39 @@ async def send_telegram(text: str) -> Optional[Dict[str, Any]]:
 def health():
     return {"ok": True, "component": "alert_server", "fastapi_available": True}
 
+async def _get_alert_text(request: Request) -> str:
+    ctype = request.headers.get("content-type", "")
+    if "application/json" in ctype:
+        data = await request.json()
+        return data.get("message", "")
+    return (await request.body()).decode("utf-8", errors="ignore")
+
+@app.post("/webhook", response_class=JSONResponse)
 @app.post("/webhook/tradingview", response_class=JSONResponse)
-async def webhook_tradingview(payload: str = Body(..., media_type="text/plain")):
-    """
-    Accepts raw TradingView alert text like:
-    'CALL Signal: GOOGL at 206.13 Strike: 205 Expiry: 2025-08-21'
-    """
-    alert = parse_alert(payload)
+async def webhook_tradingview(request: Request):
+    payload = await _get_alert_text(request)
+    alert = parse_alert_text(payload)
+
+    # Round strike to common increment and search by same-week expiry, pick nearest strike if exact missing
+    desired_strike = round_strike_to_common_increment(alert["strike"])
 
     async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-        option_ticker = await polygon_get_option_ticker(
-            client, symbol=alert["symbol"], strike=alert["strike"], expiry=alert["expiry"], side=alert["side"]
+        # Pull all contracts for that expiry and side, then pick closest strike.
+        contracts = await polygon_list_contracts_for_expiry(
+            client, symbol=alert["symbol"], expiry=alert["expiry"], side=alert["side"], limit=250
         )
-        if not option_ticker:
-            raise HTTPException(status_code=404, detail="No matching option contract found on Polygon.")
+        if not contracts:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {alert['expiry']} (same-week Friday).",
+            )
+        best = pick_nearest_strike(contracts, desired_strike)
+        if not best:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No strikes available near {desired_strike} for {alert['symbol']} on {alert['expiry']}.",
+            )
+        option_ticker = best.get("ticker")
 
         snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
 
@@ -211,6 +272,7 @@ async def webhook_tradingview(payload: str = Body(..., media_type="text/plain"))
 
     context = {
         **alert,
+        "strike": desired_strike,  # normalized
         "option_ticker": option_ticker,
         "dte": dte(alert["expiry"]),
         "implied_volatility": iv,
@@ -229,7 +291,6 @@ async def webhook_tradingview(payload: str = Body(..., media_type="text/plain"))
         "greeks": context["greeks"],
     }
 
-    # --- Telegram push (if configured) ---
     tg_text = compose_telegram_text(alert, option_ticker, metrics, llm)
     tg_result = await send_telegram(tg_text)
 
@@ -240,7 +301,7 @@ async def webhook_tradingview(payload: str = Body(..., media_type="text/plain"))
         "metrics": metrics,
         "llm_decision": llm,
         "telegram": {"sent": bool(tg_result) if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else False, "result": tg_result},
-        "notes": "Educational demo; not financial advice.",
+        "notes": "Expiry defaults to same-week Friday when not provided. Educational demo; not financial advice.",
     }
 
 if __name__ == "__main__":
