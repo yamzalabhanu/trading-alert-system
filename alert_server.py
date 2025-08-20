@@ -25,8 +25,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Existing LLM budget & volume/OI gate
 MAX_LLM_PER_DAY     = int(os.getenv("MAX_LLM_PER_DAY", "50"))
-VOLUME_MIN_FOR_LLM  = int(os.getenv("VOLUME_MIN_FOR_LLM", "5000"))
-OI_MIN_FOR_LLM      = int(os.getenv("OI_MIN_FOR_LLM", "10000"))
+VOLUME_MIN_FOR_LLM  = int(os.getenv("VOLUME_MIN_FOR_LLM", "500"))
+OI_MIN_FOR_LLM      = int(os.getenv("OI_MIN_FOR_LLM", "1000"))
 
 # Cooldown + daily report
 COOLDOWN_SECONDS    = int(os.getenv("COOLDOWN_SECONDS", "600"))  # 10m
@@ -60,6 +60,10 @@ HEADROOM_MIN_R      = float(os.getenv("HEADROOM_MIN_R", "1.0"))
 # Hybrid pre-score thresholds
 PRESCORE_AUTO_BUY   = int(os.getenv("PRESCORE_AUTO_BUY", "80"))
 PRESCORE_AUTO_SKIP  = int(os.getenv("PRESCORE_AUTO_SKIP","50"))
+
+# LLM morning window (default: allow until 11:30 AM CST)
+LLM_CUTOFF_TZ    = os.getenv("LLM_CUTOFF_TZ", "America/Chicago")
+LLM_CUTOFF_HHMM  = os.getenv("LLM_CUTOFF_HHMM", "11:30")  # inclusive cutoff
 
 # Market regime thresholds
 SPY_ATR_PCT_DAYS    = int(os.getenv("SPY_ATR_PCT_DAYS", "14"))
@@ -166,6 +170,15 @@ def round_strike_to_common_increment(strike: float) -> float:
 def _parse_hhmm(hhmm: str) -> Tuple[int, int]:
     hh, mm = hhmm.split(":")
     return int(hh), int(mm)
+
+def _is_within_llm_window(now_utc: datetime) -> bool:
+    """Return True if current local time in LLM_CUTOFF_TZ is <= LLM_CUTOFF_HHMM."""
+    tz = ZoneInfo(LLM_CUTOFF_TZ)
+    hh, mm = _parse_hhmm(LLM_CUTOFF_HHMM)
+    now_local = now_utc.astimezone(tz)
+    cutoff_local = datetime.combine(now_local.date(), dt_time(hour=hh, minute=mm), tzinfo=tz)
+    # "till 11:30" => inclusive
+    return now_local <= cutoff_local
 
 def _next_report_dt_utc(now_utc: datetime) -> datetime:
     tz = ZoneInfo(MARKET_TZ)
@@ -754,6 +767,12 @@ def _active_config_dict() -> Dict[str, Any]:
                 "intraday": {"min": DTE_MIN_INTRADAY, "max": DTE_MAX_INTRADAY},
                 "swing":    {"min": DTE_MIN_SWING,    "max": DTE_MAX_SWING},
             },
+
+            "llm_window": {
+            "cutoff_tz": LLM_CUTOFF_TZ,
+            "cutoff_hhmm": LLM_CUTOFF_HHMM,
+            "inclusive": True
+        },
         },
     }
 
@@ -974,8 +993,12 @@ async def webhook_tradingview(request: Request):
     elif not can_consume_llm():
         llm_reason = f"Daily LLM quota reached ({llm_quota_snapshot()['used']}/{llm_quota_snapshot()['max']})."
         decision_path = "skip.quota"
+    elif not _is_within_llm_window(datetime.now(timezone.utc)):
+        # After 11:30 AM CST (by default), do NOT run LLM. Autos still applied above.
+        llm_reason = f"LLM window closed (allowed until {LLM_CUTOFF_HHMM} {LLM_CUTOFF_TZ})."
+        decision_path = "skip.llm_window"
     else:
-        # Gray zone -> LLM
+        # Gray zone -> LLM (morning only)
         llm = await analyze_with_openai(alert, f)
         consume_llm()
         llm_ran = True
