@@ -63,7 +63,7 @@ PRESCORE_AUTO_SKIP  = int(os.getenv("PRESCORE_AUTO_SKIP","50"))
 
 # LLM morning window (default: allow until 11:30 AM CST)
 LLM_CUTOFF_TZ    = os.getenv("LLM_CUTOFF_TZ", "America/Chicago")
-LLM_CUTOFF_HHMM  = os.getenv("LLM_CUTOFF_HHMM", "11:30")  # inclusive cutoff
+LLM_CUTOFF_HHMM  = os.getenv("LLM_CUTOFF_HHMM", "10:30")  # inclusive cutoff
 
 # Market regime thresholds
 SPY_ATR_PCT_DAYS    = int(os.getenv("SPY_ATR_PCT_DAYS", "14"))
