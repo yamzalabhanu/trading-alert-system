@@ -978,9 +978,9 @@ async def webhook_tradingview(request: Request):
     elif not base_gate_ok:
         llm_reason = f"Below thresholds: vol {vol} < {VOLUME_MIN_FOR_LLM} AND OI {oi} < {OI_MIN_FOR_LLM}."
         decision_path = "skip.base_gate"
-    /#elif not sp_ok or not qa_ok:
-      #llm_reason = f"Liquidity gate failed: spread_ok={sp_ok}, quote_age_ok={qa_ok}"
-     #  decision_path = "skip.liquidity" 
+    elif not sp_ok or not qa_ok:
+      llm_reason = f"Liquidity gate failed: spread_ok={sp_ok}, quote_age_ok={qa_ok}"
+       decision_path = "skip.liquidity" 
     elif not delta_band_ok or not dte_band_ok:
         llm_reason = f"Band gate failed: delta_band_ok={delta_band_ok}, dte_band_ok={dte_band_ok}"
         decision_path = "skip.bands"
