@@ -971,8 +971,8 @@ async def webhook_tradingview(request: Request):
         decision_final = "buy"
         decision_path = "auto.buy"
     elif prescore <= PRESCORE_AUTO_SKIP:
-        decision_final = "skip"
-        decision_path = "auto.skip"
+        decision_final = "buy"
+        decision_path = "auto.buy"
     elif not can_consume_llm():
         llm_reason = f"Daily LLM quota reached ({llm_quota_snapshot()['used']}/{llm_quota_snapshot()['max']})."
         decision_path = "skip.quota"
