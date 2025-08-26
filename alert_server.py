@@ -1,4 +1,4 @@
-# alert_server.py-backup 08/19
+# alert_server.py-backup 08/19 (Liquidity gates removed)
 import os
 import re
 import json
@@ -33,10 +33,7 @@ COOLDOWN_SECONDS    = int(os.getenv("COOLDOWN_SECONDS", "600"))  # 10m
 MARKET_TZ           = os.getenv("MARKET_TZ", "America/New_York")
 REPORT_HHMM         = os.getenv("REPORT_HHMM", "16:15")          # 4:15 PM ET
 
-# -------- New enhancement knobs --------
-# Liquidity/microstructure gates
-OPT_SPREAD_MAX_PCT  = float(os.getenv("OPT_SPREAD_MAX_PCT", "0.12"))  # 12%
-QUOTE_AGE_MAX_SEC   = int(os.getenv("QUOTE_AGE_MAX_SEC", "10"))       # 10 seconds
+# -------- Enhancement knobs (liquidity gates removed) --------
 
 # Trade style (affects bands & risk plan)
 TRADE_STYLE         = os.getenv("TRADE_STYLE", "intraday").lower()    # intraday|swing
@@ -61,7 +58,7 @@ HEADROOM_MIN_R      = float(os.getenv("HEADROOM_MIN_R", "1.0"))
 PRESCORE_AUTO_BUY   = int(os.getenv("PRESCORE_AUTO_BUY", "80"))
 PRESCORE_AUTO_SKIP  = int(os.getenv("PRESCORE_AUTO_SKIP","50"))
 
-# LLM morning window (default: allow until 11:30 AM CST)
+# LLM morning window (default: allow until 10:30 AM CST)
 LLM_CUTOFF_TZ    = os.getenv("LLM_CUTOFF_TZ", "America/Chicago")
 LLM_CUTOFF_HHMM  = os.getenv("LLM_CUTOFF_HHMM", "10:30")  # inclusive cutoff
 
@@ -177,7 +174,7 @@ def _is_within_llm_window(now_utc: datetime) -> bool:
     hh, mm = _parse_hhmm(LLM_CUTOFF_HHMM)
     now_local = now_utc.astimezone(tz)
     cutoff_local = datetime.combine(now_local.date(), dt_time(hour=hh, minute=mm), tzinfo=tz)
-    # "till 11:30" => inclusive
+    # "till 10:30" => inclusive
     return now_local <= cutoff_local
 
 def _next_report_dt_utc(now_utc: datetime) -> datetime:
@@ -309,7 +306,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
     oi = int(res.get("open_interest") or 0)
     vol = int(day.get("volume") or 0)
 
-    # NBBO spread% & quote age
+    # NBBO spread% & quote age (kept for display only; no gating)
     bid = last_quote.get("bid_price")
     ask = last_quote.get("ask_price")
     mid = None
@@ -442,12 +439,12 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
         "vol": vol,
         "iv": cur_iv,
         "iv_rank": iv_rank,                 # 0..1 or None
-        "rv20": realized_vol_annualized(closes, 20) if closes else None,  # annualized realized vol
+        "rv20": rv20,                       # annualized realized vol
         "opt_bid": bid,
         "opt_ask": ask,
         "opt_mid": mid,
-        "option_spread_pct": opt_spread_pct,
-        "quote_age_sec": quote_age_sec,
+        "option_spread_pct": opt_spread_pct,   # display only
+        "quote_age_sec": quote_age_sec,        # display only
         "delta": delta,
         "dte": days_to_exp,
         "atr": atr,
@@ -476,13 +473,13 @@ def numerical_pre_score(side: str, f: Dict[str, Any]) -> int:
     """0..100 pre-score to gate LLM (hybrid)."""
     score = 0
 
-    # Liquidity
+    # Liquidity-ish signals (soft scoring only; not gating)
     if (f.get("oi", 0) >= 10000): score += 10
     if (f.get("vol", 0) >= 5000): score += 10
     sp = f.get("option_spread_pct")
-    if (sp is not None) and (sp <= OPT_SPREAD_MAX_PCT): score += 5
+    if (sp is not None) and (sp <= 0.12): score += 5  # keeps contribution but not a gate
     qa = f.get("quote_age_sec")
-    if (qa is not None) and (qa <= QUOTE_AGE_MAX_SEC): score += 5
+    if (qa is not None) and (qa <= 10): score += 5
 
     # Structure
     if f.get("mtf_align") is True: score += 15
@@ -519,9 +516,7 @@ def build_llm_prompt(alert: Dict[str, Any], f: Dict[str, Any]) -> str:
         "rv<iv"
     )
     checklist_hint = {
-        "liquidity_ok": (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= OPT_SPREAD_MAX_PCT)
-                        and (f.get("quote_age_sec") is not None and f["quote_age_sec"] <= QUOTE_AGE_MAX_SEC),
-        "spread_ok": (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= OPT_SPREAD_MAX_PCT),
+        # liquidity checks removed from gating/checklist
         "delta_band_ok": f.get("bands") and (f["bands"]["delta_min"] <= abs(float(f.get("delta") or 0)) <= f["bands"]["delta_max"]),
         "dte_band_ok": (f["bands"]["dte_min"] <= f.get("dte", 0) <= f["bands"]["dte_max"]) if f.get("dte") is not None else False,
         "iv_context": iv_ctx,
@@ -559,8 +554,6 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
         '  "confidence": <0..1>,\n'
         '  "reason": "<=2 sentences>",\n'
         '  "checklist": {\n'
-        '    "liquidity_ok": true/false,\n'
-        '    "spread_ok": true/false,\n'
         '    "delta_band_ok": true/false,\n'
         '    "dte_band_ok": true/false,\n'
         '    "iv_context": "low|medium|high",\n'
@@ -573,7 +566,7 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
         '  "risk_plan": {"style":"intraday|swing","initial_stop_pct":0..1,"take_profit_pct":0..1,"trail_after_pct":0..1},\n'
         '  "ev_estimate": {"win_prob":0..1,"avg_win_pct":0..5,"avg_loss_pct":0..5,"expected_value_pct":-5..5}\n'
         "}\n"
-        "If any checklist *_ok is false, decision must be 'skip'. Keep temperature low, be consistent."
+        "If any *_ok in the checklist is false (except iv_context/rv≈iv), decision must be 'skip'. Keep temperature low."
     )
     prompt = build_llm_prompt(alert, f)
     try:
@@ -591,18 +584,19 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
             "confidence": 0.0,
             "reason": f"LLM call failed: {type(e).__name__}.",
             "checklist": {
-                "liquidity_ok": False, "spread_ok": False, "delta_band_ok": False, "dte_band_ok": False,
-                "iv_context": "medium", "rv_iv_spread": "rv≈iv", "em_vs_breakeven_ok": False,
-                "mtf_trend_alignment": False, "sr_headroom_ok": False, "no_event_risk": True
+                "delta_band_ok": False, "dte_band_ok": False,
+                "iv_context": "medium", "rv_iv_spread": "rv≈iv",
+                "em_vs_breakeven_ok": False, "mtf_trend_alignment": False,
+                "sr_headroom_ok": False, "no_event_risk": True
             },
             "risk_plan": f.get("risk_plan", {}),
             "ev_estimate": {"win_prob": 0.0, "avg_win_pct": 0.0, "avg_loss_pct": 0.0, "expected_value_pct": 0.0}
         }
 
-    # Guardrails: enforce skip if any *_ok false
+    # Guardrails: enforce skip if any *_ok false (liquidity checks removed)
     try:
         chk = out.get("checklist", {})
-        gates = ["liquidity_ok", "spread_ok", "delta_band_ok", "dte_band_ok",
+        gates = ["delta_band_ok", "dte_band_ok",
                  "em_vs_breakeven_ok", "mtf_trend_alignment", "sr_headroom_ok", "no_event_risk"]
         if any(chk.get(k) is False for k in gates):
             out["decision"] = "skip"
@@ -751,8 +745,6 @@ def _active_config_dict() -> Dict[str, Any]:
         "thresholds": {
             "volume_min_for_llm": VOLUME_MIN_FOR_LLM,
             "oi_min_for_llm": OI_MIN_FOR_LLM,
-            "opt_spread_max_pct": OPT_SPREAD_MAX_PCT,
-            "quote_age_max_sec":   QUOTE_AGE_MAX_SEC,
             "em_vs_be_ratio_min":  EM_VS_BE_RATIO_MIN,
             "headroom_min_r":      HEADROOM_MIN_R,
             "prescore": {
@@ -767,12 +759,11 @@ def _active_config_dict() -> Dict[str, Any]:
                 "intraday": {"min": DTE_MIN_INTRADAY, "max": DTE_MAX_INTRADAY},
                 "swing":    {"min": DTE_MIN_SWING,    "max": DTE_MAX_SWING},
             },
-
             "llm_window": {
-            "cutoff_tz": LLM_CUTOFF_TZ,
-            "cutoff_hhmm": LLM_CUTOFF_HHMM,
-            "inclusive": True
-        },
+                "cutoff_tz": LLM_CUTOFF_TZ,
+                "cutoff_hhmm": LLM_CUTOFF_HHMM,
+                "inclusive": True
+            },
         },
     }
 
@@ -902,13 +893,8 @@ async def webhook_tradingview(request: Request):
 
     base_gate_ok = (vol >= VOLUME_MIN_FOR_LLM) or (oi >= OI_MIN_FOR_LLM)
 
-    # ---------- New hard liquidity gates ----------
-    sp_ok = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= OPT_SPREAD_MAX_PCT)
-    qa_ok = (f.get("quote_age_sec") is not None and f["quote_age_sec"] <= QUOTE_AGE_MAX_SEC)
-
     # ---------- Band checks ----------
-    delta = f.get("delta")
-    delta_band_ok = (delta is not None and f["bands"]["delta_min"] <= abs(float(delta)) <= f["bands"]["delta_max"])
+    delta_band_ok = (f.get("delta") is not None and f["bands"]["delta_min"] <= abs(float(f["delta"])) <= f["bands"]["delta_max"])
     dte_band_ok = (f["bands"]["dte_min"] <= f.get("dte", 0) <= f["bands"]["dte_max"]) if f.get("dte") is not None else False
 
     # ---------- Event risk prefilter ----------
@@ -971,16 +957,13 @@ async def webhook_tradingview(request: Request):
     decision_final = "skip"
     decision_path = ""
 
-    # Auto-skip ladders
+    # Auto-skip ladders (liquidity gates removed)
     if in_cooldown:
         llm_reason = cooldown_reason
         decision_path = "skip.cooldown"
     elif not base_gate_ok:
         llm_reason = f"Below thresholds: vol {vol} < {VOLUME_MIN_FOR_LLM} AND OI {oi} < {OI_MIN_FOR_LLM}."
         decision_path = "skip.base_gate"
-    elif not sp_ok or not qa_ok:
-      llm_reason = f"Liquidity gate failed: spread_ok={sp_ok}, quote_age_ok={qa_ok}"
-       decision_path = "skip.liquidity" 
     elif not delta_band_ok or not dte_band_ok:
         llm_reason = f"Band gate failed: delta_band_ok={delta_band_ok}, dte_band_ok={dte_band_ok}"
         decision_path = "skip.bands"
@@ -994,7 +977,7 @@ async def webhook_tradingview(request: Request):
         llm_reason = f"Daily LLM quota reached ({llm_quota_snapshot()['used']}/{llm_quota_snapshot()['max']})."
         decision_path = "skip.quota"
     elif not _is_within_llm_window(datetime.now(timezone.utc)):
-        # After 11:30 AM CST (by default), do NOT run LLM. Autos still applied above.
+        # After morning cutoff (default 10:30 AM CST), do NOT run LLM. Autos still applied above.
         llm_reason = f"LLM window closed (allowed until {LLM_CUTOFF_HHMM} {LLM_CUTOFF_TZ})."
         decision_path = "skip.llm_window"
     else:
@@ -1073,13 +1056,11 @@ async def webhook_tradingview(request: Request):
         "thresholds": {
             "volume_min_for_llm": VOLUME_MIN_FOR_LLM,
             "oi_min_for_llm": OI_MIN_FOR_LLM,
-            "opt_spread_max_pct": OPT_SPREAD_MAX_PCT,
-            "quote_age_max_sec": QUOTE_AGE_MAX_SEC,
             "prescore_auto_buy": PRESCORE_AUTO_BUY,
             "prescore_auto_skip": PRESCORE_AUTO_SKIP,
         },
         "telegram": {"sent": bool(tg_result) if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else False, "result": tg_result},
-        "notes": "Hybrid gating: liquidity/bands -> pre-score -> LLM for gray zone. Educational demo; not financial advice.",
+        "notes": "Hybrid gating: bands -> pre-score -> LLM for gray zone. Educational demo; not financial advice.",
     }
 
 if __name__ == "__main__":
