@@ -55,8 +55,8 @@ EM_VS_BE_RATIO_MIN  = float(os.getenv("EM_VS_BE_RATIO_MIN", "0.80"))
 HEADROOM_MIN_R      = float(os.getenv("HEADROOM_MIN_R", "1.0"))
 
 # Hybrid pre-score thresholds
-PRESCORE_AUTO_BUY   = int(os.getenv("PRESCORE_AUTO_BUY", "80"))
-PRESCORE_AUTO_SKIP  = int(os.getenv("PRESCORE_AUTO_SKIP","50"))
+PRESCORE_AUTO_BUY   = int(os.getenv("PRESCORE_AUTO_BUY", "10"))
+PRESCORE_AUTO_SKIP  = int(os.getenv("PRESCORE_AUTO_SKIP","10"))
 
 # LLM morning window (default: allow until 10:30 AM CST)
 LLM_CUTOFF_TZ    = os.getenv("LLM_CUTOFF_TZ", "America/Chicago")
