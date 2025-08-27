@@ -24,7 +24,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Quota is tracked but NOT used for gating anymore
-MAX_LLM_PER_DAY     = int(os.getenv("MAX_LLM_PER_DAY", "50"))
+MAX_LLM_PER_DAY     = int(os.getenv("MAX_LLM_PER_DAY", "20"))
 
 # Cooldown + daily report (cooldown no longer gates; left for future use/telemetry if needed)
 COOLDOWN_SECONDS    = int(os.getenv("COOLDOWN_SECONDS", "600"))  # 10m
