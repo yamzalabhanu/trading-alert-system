@@ -19,7 +19,7 @@ from openai import OpenAI
 # =======================
 # Configuration / Knobs
 # =======================
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
