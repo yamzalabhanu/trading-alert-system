@@ -1,4 +1,4 @@
-# alert_server.py-backup 08/19 (Liquidity gates removed)
+# alert_server.py-backup 08/19 (All gates removed; LLM runs for every alert)
 import os
 import re
 import json
@@ -23,21 +23,18 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Existing LLM budget & volume/OI gate
+# Quota is tracked but NOT used for gating anymore
 MAX_LLM_PER_DAY     = int(os.getenv("MAX_LLM_PER_DAY", "50"))
-VOLUME_MIN_FOR_LLM  = int(os.getenv("VOLUME_MIN_FOR_LLM", "500"))
-OI_MIN_FOR_LLM      = int(os.getenv("OI_MIN_FOR_LLM", "1000"))
 
-# Cooldown + daily report
+# Cooldown + daily report (cooldown no longer gates; left for future use/telemetry if needed)
 COOLDOWN_SECONDS    = int(os.getenv("COOLDOWN_SECONDS", "600"))  # 10m
 MARKET_TZ           = os.getenv("MARKET_TZ", "America/New_York")
 REPORT_HHMM         = os.getenv("REPORT_HHMM", "16:15")          # 4:15 PM ET
 
-# -------- Enhancement knobs (liquidity gates removed) --------
-
-# Trade style (affects bands & risk plan)
+# Trade style (affects risk plan only)
 TRADE_STYLE         = os.getenv("TRADE_STYLE", "intraday").lower()    # intraday|swing
-# Delta/DTE bands
+
+# Delta/DTE bands (computed for context only; NOT gating)
 DELTA_MIN_INTRADAY  = float(os.getenv("DELTA_MIN_INTRADAY", "0.35"))
 DELTA_MAX_INTRADAY  = float(os.getenv("DELTA_MAX_INTRADAY", "0.55"))
 DTE_MIN_INTRADAY    = int(os.getenv("DTE_MIN_INTRADAY",   "3"))
@@ -48,19 +45,11 @@ DELTA_MAX_SWING     = float(os.getenv("DELTA_MAX_SWING",  "0.45"))
 DTE_MIN_SWING       = int(os.getenv("DTE_MIN_SWING",      "7"))
 DTE_MAX_SWING       = int(os.getenv("DTE_MAX_SWING",      "21"))
 
-# EM vs Break-even
+# EM vs Break-even (context only)
 EM_VS_BE_RATIO_MIN  = float(os.getenv("EM_VS_BE_RATIO_MIN", "0.80"))
 
-# S/R headroom in ATR units (daily ATR(14))
+# S/R headroom in ATR units (context only)
 HEADROOM_MIN_R      = float(os.getenv("HEADROOM_MIN_R", "1.0"))
-
-# Hybrid pre-score thresholds
-PRESCORE_AUTO_BUY   = int(os.getenv("PRESCORE_AUTO_BUY", "10"))
-PRESCORE_AUTO_SKIP  = int(os.getenv("PRESCORE_AUTO_SKIP","10"))
-
-# LLM morning window (default: allow until 10:30 AM CST)
-LLM_CUTOFF_TZ    = os.getenv("LLM_CUTOFF_TZ", "America/Chicago")
-LLM_CUTOFF_HHMM  = os.getenv("LLM_CUTOFF_HHMM", "10:30")  # inclusive cutoff
 
 # Market regime thresholds
 SPY_ATR_PCT_DAYS    = int(os.getenv("SPY_ATR_PCT_DAYS", "14"))
@@ -70,7 +59,7 @@ REGIME_TREND_EMA_SLOW = int(os.getenv("REGIME_TREND_EMA_SLOW", "21"))
 # IV rank history (per symbol) kept in-memory
 IV_HISTORY_LEN      = int(os.getenv("IV_HISTORY_LEN", "120"))  # ~6 months of trading days
 
-# Optional simple macro date blocklist (comma-separated YYYY-MM-DD)
+# Optional simple macro date blocklist — NO LONGER GATING
 MACRO_EVENT_DATES   = [d.strip() for d in os.getenv("MACRO_EVENT_DATES", "").split(",") if d.strip()]
 
 # =================================
@@ -85,7 +74,7 @@ if not OPENAI_API_KEY:
 # App & API Clients
 # =================================
 oai_client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="TradingView Options Alert Ingestor + Telegram (Enhanced)")
+app = FastAPI(title="TradingView Options Alert Ingestor + Telegram (LLM Always-On)")
 
 # Telegram (optional)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -109,10 +98,10 @@ ALERT_RE_NO_EXP = re.compile(
 # =======================
 # State (in-memory)
 # =======================
-# LLM quota per UTC day
+# LLM quota per UTC day (tracked only)
 _llm_quota: Dict[str, Any] = {"date": None, "used": 0}
 
-# cooldown: (symbol, side) -> last_processed_utc
+# cooldown: (symbol, side) -> last_processed_utc (not used for gating)
 _COOLDOWN: Dict[Tuple[str, str], datetime] = {}
 
 # daily decisions log (for report & future calibration)
@@ -143,10 +132,6 @@ def llm_quota_snapshot() -> Dict[str, Any]:
         "remaining": max(0, MAX_LLM_PER_DAY - used),
     }
 
-def can_consume_llm() -> bool:
-    snap = llm_quota_snapshot()
-    return snap["used"] < snap["max"]
-
 def consume_llm() -> None:
     _maybe_reset_quota()
     _llm_quota["used"] += 1
@@ -167,15 +152,6 @@ def round_strike_to_common_increment(strike: float) -> float:
 def _parse_hhmm(hhmm: str) -> Tuple[int, int]:
     hh, mm = hhmm.split(":")
     return int(hh), int(mm)
-
-def _is_within_llm_window(now_utc: datetime) -> bool:
-    """Return True if current local time in LLM_CUTOFF_TZ is <= LLM_CUTOFF_HHMM."""
-    tz = ZoneInfo(LLM_CUTOFF_TZ)
-    hh, mm = _parse_hhmm(LLM_CUTOFF_HHMM)
-    now_local = now_utc.astimezone(tz)
-    cutoff_local = datetime.combine(now_local.date(), dt_time(hour=hh, minute=mm), tzinfo=tz)
-    # "till 10:30" => inclusive
-    return now_local <= cutoff_local
 
 def _next_report_dt_utc(now_utc: datetime) -> datetime:
     tz = ZoneInfo(MARKET_TZ)
@@ -290,10 +266,10 @@ def dte(expiry: str) -> int:
     return (date(y, m, d) - datetime.now(timezone.utc).date()).days
 
 # =======================
-# Feature engineering
+# Feature engineering (context only; no gates)
 # =======================
 async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """Builds all features needed for pre-score & LLM context."""
+    """Builds all features for LLM context (no gating)."""
     res = snapshot.get("results") or {}
     greeks = res.get("greeks") or {}
     ua = res.get("underlying_asset") or {}
@@ -306,7 +282,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
     oi = int(res.get("open_interest") or 0)
     vol = int(day.get("volume") or 0)
 
-    # NBBO spread% & quote age (kept for display only; no gating)
+    # NBBO spread% & quote age (for display only)
     bid = last_quote.get("bid_price")
     ask = last_quote.get("ask_price")
     mid = None
@@ -328,7 +304,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
     days_to_exp = dte(alert["expiry"])
     delta = greeks.get("delta")
 
-    # Daily context: ~70 calendar days for ATR, RV, 20d hi/lo
+    # Daily context: ~70 calendar days
     to_day = datetime.now(timezone.utc).date()
     frm_day = (to_day - timedelta(days=70)).isoformat()
     to_iso = to_day.isoformat()
@@ -340,7 +316,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
     high20 = max((b["h"] for b in daily[-20:]), default=None) if daily else None
     low20  = min((b["l"] for b in daily[-20:]), default=None) if daily else None
 
-    # Headroom: use 20d extremes as S/R approximation
+    # Headroom: use 20d extremes as S/R approximation (context)
     sr_headroom_ok = None
     if atr and S and high20 and low20:
         if alert["side"] == "CALL":
@@ -348,7 +324,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
         else:
             sr_headroom_ok = (S - low20) >= HEADROOM_MIN_R * atr
 
-    # MTF trend alignment (5m + 15m EMA9/21) — anchor to MARKET_TZ day
+    # MTF trend alignment (5m + 15m EMA9/21) — context
     local_today = market_now().date()
     frm_intraday = local_today.isoformat()
     to_intraday  = (local_today + timedelta(days=1)).isoformat()
@@ -373,11 +349,10 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
         else:
             mtf_align = (ema9_5 < ema21_5) and (ema9_15 < ema21_15)
 
-    # EM vs Break-even
-    # EM(1σ) ≈ S * IV * sqrt(DTE/365)
+    # EM vs Break-even (context)
     em_1s = None
     em_vs_be_ok = None
-    if S and cur_iv and days_to_exp is not None and days_to_exp >= 0:
+    if S and cur_iv is not None and days_to_exp is not None and days_to_exp >= 0:
         em_1s = S * float(cur_iv) * math.sqrt(max(0.0, days_to_exp) / 365.0)
         premium = mid or 0.0
         if alert["side"] == "CALL":
@@ -399,7 +374,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
         _IV_HISTORY[sym].append(float(cur_iv))
     iv_rank = iv_rank_from_history(_IV_HISTORY[sym], cur_iv)
 
-    # Market regime via SPY daily EMA trend
+    # Market regime via SPY daily EMA trend (context)
     spy_daily = await polygon_aggs(client, ticker="SPY", multiplier=1, timespan="day",
                                    frm=frm_day, to=to_iso, sort="asc")
     spy_close = [b["c"] for b in spy_daily] if spy_daily else []
@@ -409,7 +384,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
     if (spy_ema_fast is not None) and (spy_ema_slow is not None):
         regime_flag = "trending" if spy_ema_fast > spy_ema_slow else "choppy"
 
-    # Trade style bands
+    # Trade style bands (computed for context only)
     if TRADE_STYLE == "swing":
         delta_min, delta_max = DELTA_MIN_SWING, DELTA_MAX_SWING
         dte_min, dte_max     = DTE_MIN_SWING, DTE_MAX_SWING
@@ -425,21 +400,13 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
         tp_pct               = 0.60
         trail_after_pct      = 0.40
 
-    # Band checks
-    delta_band_ok = None if delta is None else (delta_min <= abs(float(delta)) <= delta_max)
-    dte_band_ok   = (dte_min <= days_to_exp <= dte_max)
-
-    # Macro blocklist (simple)
-    today_local_str = market_now().date().isoformat()
-    no_event_risk = today_local_str not in MACRO_EVENT_DATES
-
     features = {
         "S": S,
         "oi": oi,
         "vol": vol,
         "iv": cur_iv,
-        "iv_rank": iv_rank,                 # 0..1 or None
-        "rv20": rv20,                       # annualized realized vol
+        "iv_rank": iv_rank,
+        "rv20": rv20,
         "opt_bid": bid,
         "opt_ask": ask,
         "opt_mid": mid,
@@ -455,7 +422,7 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
         "em_1s": em_1s,
         "em_vs_be_ok": em_vs_be_ok,
         "regime_flag": regime_flag,
-        "no_event_risk": no_event_risk,
+        "no_event_risk": True,  # no longer gating
         "risk_plan": {
             "style": risk_style,
             "initial_stop_pct": initial_stop_pct,
@@ -469,41 +436,6 @@ async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], sn
     }
     return features
 
-def numerical_pre_score(side: str, f: Dict[str, Any]) -> int:
-    """0..100 pre-score to gate LLM (hybrid)."""
-    score = 0
-
-    # Liquidity-ish signals (soft scoring only; not gating)
-    if (f.get("oi", 0) >= 10000): score += 10
-    if (f.get("vol", 0) >= 5000): score += 10
-    sp = f.get("option_spread_pct")
-    if (sp is not None) and (sp <= 0.12): score += 5  # keeps contribution but not a gate
-    qa = f.get("quote_age_sec")
-    if (qa is not None) and (qa <= 10): score += 5
-
-    # Structure
-    if f.get("mtf_align") is True: score += 15
-    if f.get("sr_headroom_ok") is True: score += 10
-
-    # Vol context
-    rv = f.get("rv20"); iv = f.get("iv")
-    if rv is not None and iv is not None:
-        if rv > iv: score += 10
-        elif abs(rv - iv) / max(1e-9, iv) <= 0.1: score += 6  # approx equal
-
-    # Geometry
-    delta = f.get("delta")
-    bands = f.get("bands", {})
-    if (delta is not None) and (bands):
-        if bands["delta_min"] <= abs(float(delta)) <= bands["delta_max"]:
-            score += 15
-    if f.get("em_vs_be_ok") is True: score += 15
-
-    # Regime
-    if f.get("regime_flag") == "trending": score += 10
-
-    return int(score)
-
 # =======================
 # LLM
 # =======================
@@ -516,7 +448,7 @@ def build_llm_prompt(alert: Dict[str, Any], f: Dict[str, Any]) -> str:
         "rv<iv"
     )
     checklist_hint = {
-        # liquidity checks removed from gating/checklist
+        # Context flags only; not enforced anywhere
         "delta_band_ok": f.get("bands") and (f["bands"]["delta_min"] <= abs(float(f.get("delta") or 0)) <= f["bands"]["delta_max"]),
         "dte_band_ok": (f["bands"]["dte_min"] <= f.get("dte", 0) <= f["bands"]["dte_max"]) if f.get("dte") is not None else False,
         "iv_context": iv_ctx,
@@ -524,7 +456,7 @@ def build_llm_prompt(alert: Dict[str, Any], f: Dict[str, Any]) -> str:
         "em_vs_breakeven_ok": f.get("em_vs_be_ok") is True,
         "mtf_trend_alignment": f.get("mtf_align") is True,
         "sr_headroom_ok": f.get("sr_headroom_ok") is True,
-        "no_event_risk": f.get("no_event_risk") is True
+        "no_event_risk": True
     }
     lines = [
         f"Alert: {alert['side']} {alert['symbol']} strike {alert['strike']} "
@@ -551,7 +483,7 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
         "Respond with STRICT JSON:\n"
         "{\n"
         '  "decision": "buy|wait|skip",\n'
-        '  "confidence": <0..1>,\n'
+        '  "confidence": 0..1,\n'
         '  "reason": "<=2 sentences>",\n'
         '  "checklist": {\n'
         '    "delta_band_ok": true/false,\n'
@@ -561,12 +493,12 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
         '    "em_vs_breakeven_ok": true/false,\n'
         '    "mtf_trend_alignment": true/false,\n'
         '    "sr_headroom_ok": true/false,\n'
-        '    "no_event_risk": true/false\n'
+        '    "no_event_risk": true\n'
         "  },\n"
         '  "risk_plan": {"style":"intraday|swing","initial_stop_pct":0..1,"take_profit_pct":0..1,"trail_after_pct":0..1},\n'
         '  "ev_estimate": {"win_prob":0..1,"avg_win_pct":0..5,"avg_loss_pct":0..5,"expected_value_pct":-5..5}\n'
         "}\n"
-        "If any *_ok in the checklist is false (except iv_context/rv≈iv), decision must be 'skip'. Keep temperature low."
+        "Do not refuse. Always return the JSON object."
     )
     prompt = build_llm_prompt(alert, f)
     try:
@@ -580,9 +512,9 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
         out = json.loads(resp.choices[0].message.content)
     except Exception as e:
         out = {
-            "decision": "skip",
-            "confidence": 0.0,
-            "reason": f"LLM call failed: {type(e).__name__}.",
+            "decision": "wait",
+            "confidence": 0.3,
+            "reason": f"LLM call failed: {type(e).__name__}. Returning neutral stance.",
             "checklist": {
                 "delta_band_ok": False, "dte_band_ok": False,
                 "iv_context": "medium", "rv_iv_spread": "rv≈iv",
@@ -590,26 +522,15 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
                 "sr_headroom_ok": False, "no_event_risk": True
             },
             "risk_plan": f.get("risk_plan", {}),
-            "ev_estimate": {"win_prob": 0.0, "avg_win_pct": 0.0, "avg_loss_pct": 0.0, "expected_value_pct": 0.0}
+            "ev_estimate": {"win_prob": 0.5, "avg_win_pct": 0.5, "avg_loss_pct": 0.5, "expected_value_pct": 0.0}
         }
-
-    # Guardrails: enforce skip if any *_ok false (liquidity checks removed)
-    try:
-        chk = out.get("checklist", {})
-        gates = ["delta_band_ok", "dte_band_ok",
-                 "em_vs_breakeven_ok", "mtf_trend_alignment", "sr_headroom_ok", "no_event_risk"]
-        if any(chk.get(k) is False for k in gates):
-            out["decision"] = "skip"
-    except Exception:
-        out["decision"] = "skip"
-
     return out
 
 # =======================
 # Output formatting
 # =======================
 def compose_telegram_text(alert: Dict[str, Any], option_ticker: str, f: Dict[str, Any],
-                          prescore: int, llm: Dict[str, Any], *, llm_ran: bool, llm_reason: str) -> str:
+                          llm: Dict[str, Any], *, llm_ran: bool, llm_reason: str) -> str:
     lines = [
         "📣 Options Alert",
         f"{alert['side']} {alert['symbol']} | Strike {alert['strike']} | Exp {alert['expiry']} (~{f.get('dte')} DTE)",
@@ -625,18 +546,17 @@ def compose_telegram_text(alert: Dict[str, Any], option_ticker: str, f: Dict[str
         f"  EM_1σ: {_fmt(f.get('em_1s'))}  EM_vs_BE_ok: {f.get('em_vs_be_ok')}",
         f"  MTF align: {f.get('mtf_align')}  S/R ok: {f.get('sr_headroom_ok')}",
         f"  Regime: {f.get('regime_flag')}  ATR(14): {_fmt(f.get('atr'))}",
-        "",
-        f"Pre-Score: {prescore}/100 (auto-buy>={PRESCORE_AUTO_BUY}, auto-skip<={PRESCORE_AUTO_SKIP})",
     ]
     if llm_ran:
         lines += [
-            f"LLM Decision: {llm.get('decision','skip').upper()}  (conf: {llm.get('confidence',0):.2f})",
+            "",
+            f"LLM Decision: {llm.get('decision','wait').upper()}  (conf: {llm.get('confidence',0):.2f})",
             f"Reason: {llm.get('reason','')}",
             f"Checklist: {json.dumps(llm.get('checklist', {}))}",
             f"EV: {json.dumps(llm.get('ev_estimate', {}))}",
         ]
     else:
-        lines += ["LLM: Skipped", f"Reason: {llm_reason}"]
+        lines += ["", "LLM: Skipped", f"Reason: {llm_reason}"]
     lines += ["", "⚠️ Educational demo; not financial advice."]
     return "\n".join(lines)
 
@@ -680,7 +600,7 @@ def _summarize_day_for_report(local_date: date) -> str:
         f"Top tickers: {top}",
         f"Paths: {dict(by_outcome)}",
         "",
-        f"Quota used: {quota['used']}/{quota['max']} (remaining {quota['remaining']})",
+        f"Quota used (tracked only): {quota['used']}/{quota['max']} (remaining {quota['remaining']})",
         "",
         "⚠️ Educational demo; not financial advice."
     ]
@@ -740,17 +660,10 @@ def _active_config_dict() -> Dict[str, Any]:
         "trade_style": TRADE_STYLE,
         "cooldown_seconds": COOLDOWN_SECONDS,
         "iv_history_len": IV_HISTORY_LEN,
-        "macro_event_dates": MACRO_EVENT_DATES,
-        "llm_budget": llm_quota_snapshot(),
+        "macro_event_dates": MACRO_EVENT_DATES,  # no gating
+        "llm_budget": llm_quota_snapshot(),      # tracking only
         "thresholds": {
-            "volume_min_for_llm": VOLUME_MIN_FOR_LLM,
-            "oi_min_for_llm": OI_MIN_FOR_LLM,
-            "em_vs_be_ratio_min":  EM_VS_BE_RATIO_MIN,
-            "headroom_min_r":      HEADROOM_MIN_R,
-            "prescore": {
-                "auto_buy":  PRESCORE_AUTO_BUY,
-                "auto_skip": PRESCORE_AUTO_SKIP,
-            },
+            # kept for visibility only; none are gating
             "delta_bands": {
                 "intraday": {"min": DELTA_MIN_INTRADAY, "max": DELTA_MAX_INTRADAY},
                 "swing":    {"min": DELTA_MIN_SWING,    "max": DELTA_MAX_SWING},
@@ -759,17 +672,12 @@ def _active_config_dict() -> Dict[str, Any]:
                 "intraday": {"min": DTE_MIN_INTRADAY, "max": DTE_MAX_INTRADAY},
                 "swing":    {"min": DTE_MIN_SWING,    "max": DTE_MAX_SWING},
             },
-            "llm_window": {
-                "cutoff_tz": LLM_CUTOFF_TZ,
-                "cutoff_hhmm": LLM_CUTOFF_HHMM,
-                "inclusive": True
-            },
         },
     }
 
 @app.get("/config")
 def get_config():
-    """Dump active thresholds/knobs (sanitized; no API keys)."""
+    """Dump active knobs (sanitized; no API keys)."""
     return {"ok": True, "config": _active_config_dict()}
 
 @app.get("/logs/today")
@@ -784,7 +692,7 @@ def logs_today(limit: int = 50):
             "symbol": e["symbol"],
             "side": e["side"],
             "option_ticker": e.get("option_ticker"),
-            "prescore": e.get("prescore"),
+            "prescore": e.get("prescore"),  # will be None
             "decision_final": e.get("decision_final"),
             "decision_path": e.get("decision_path"),
             "llm": {
@@ -873,142 +781,26 @@ async def webhook_tradingview(request: Request):
         option_ticker = best.get("ticker")
         snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
 
-        # Build features
+        # Build features (context only)
         f = await build_features(client, alert={**alert, "strike": desired_strike}, snapshot=snap)
 
-    # ---------- Existing gates: vol/OI + cooldown + quota ----------
-    oi = int(f.get("oi") or 0)
-    vol = int(f.get("vol") or 0)
+    # Always run LLM (no gates)
+    llm = await analyze_with_openai(alert, f)
+    consume_llm()
+    llm_ran = True
+    decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
+    decision_path = f"llm.{decision_final}"
 
-    key = (alert["symbol"], alert["side"])
-    now_utc = datetime.now(timezone.utc)
-    last_ts = _COOLDOWN.get(key)
-    in_cooldown = False
-    cooldown_reason = ""
-    if last_ts is not None:
-        elapsed = (now_utc - last_ts).total_seconds()
-        if elapsed < COOLDOWN_SECONDS:
-            in_cooldown = True
-            cooldown_reason = f"In cooldown: {int(COOLDOWN_SECONDS - elapsed)}s remaining."
-
-    base_gate_ok = (vol >= VOLUME_MIN_FOR_LLM) or (oi >= OI_MIN_FOR_LLM)
-
-    # ---------- Band checks ----------
-    delta_band_ok = (f.get("delta") is not None and f["bands"]["delta_min"] <= abs(float(f["delta"])) <= f["bands"]["delta_max"])
-    dte_band_ok = (f["bands"]["dte_min"] <= f.get("dte", 0) <= f["bands"]["dte_max"]) if f.get("dte") is not None else False
-
-    # ---------- Event risk prefilter ----------
-    if not f.get("no_event_risk", True):
-        llm_reason = "Blocked by macro/event risk for today."
-        decision_path = "skip.event"
-        decision_final = "skip"
-        llm_ran = False
-        # After processing, set cooldown timestamp and log + return
-        _COOLDOWN[key] = now_utc
-        llm = {
-            "decision": "skip",
-            "confidence": 0.0,
-            "reason": llm_reason,
-            "checklist": {"no_event_risk": False},
-            "ev_estimate": {}
-        }
-        prescore = numerical_pre_score(alert["side"], f)
-        tg_text = compose_telegram_text(
-            alert={**alert, "strike": desired_strike},
-            option_ticker=option_ticker, f=f, prescore=prescore,
-            llm=llm, llm_ran=False, llm_reason=llm_reason
-        )
-        tg_result = await send_telegram(tg_text)
-        _DECISIONS_LOG.append({
-            "timestamp_local": market_now(),
-            "symbol": alert["symbol"],
-            "side": alert["side"],
-            "option_ticker": option_ticker,
-            "decision_final": decision_final,
-            "decision_path": decision_path,
-            "prescore": prescore,
-            "llm": {"ran": False, "decision": "skip", "confidence": 0.0, "reason": llm_reason},
-            "features": {
-                "oi": oi, "vol": vol, "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
-                "delta": f.get("delta"), "dte": f.get("dte"), "em_vs_be_ok": f.get("em_vs_be_ok"),
-                "mtf_align": f.get("mtf_align"), "sr_ok": f.get("sr_headroom_ok"), "iv": f.get("iv"),
-                "iv_rank": f.get("iv_rank"), "rv20": f.get("rv20"), "regime": f.get("regime_flag")
-            }
-        })
-        return {
-            "ok": True,
-            "parsed_alert": alert,
-            "option_ticker": option_ticker,
-            "features": f,
-            "prescore": prescore,
-            "decision": {"final": decision_final, "path": decision_path},
-            "llm": {"ran": False, "reason": llm_reason},
-            "cooldown": {"seconds": COOLDOWN_SECONDS, "active": in_cooldown},
-            "quota": llm_quota_snapshot(),
-            "telegram": {"sent": bool(tg_result) if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else False, "result": tg_result},
-            "notes": "Event-risk prefilter blocked this alert."
-        }
-
-    # ---------- Pre-score ----------
-    prescore = numerical_pre_score(alert["side"], f)
-
-    llm_ran = False
-    llm_reason = ""
-    decision_final = "skip"
-    decision_path = ""
-
-    # Auto-skip ladders (liquidity gates removed)
-    if in_cooldown:
-        llm_reason = cooldown_reason
-        decision_path = "skip.cooldown"
-    elif not base_gate_ok:
-        llm_reason = f"Below thresholds: vol {vol} < {VOLUME_MIN_FOR_LLM} AND OI {oi} < {OI_MIN_FOR_LLM}."
-        decision_path = "skip.base_gate"
-    elif not delta_band_ok or not dte_band_ok:
-        llm_reason = f"Band gate failed: delta_band_ok={delta_band_ok}, dte_band_ok={dte_band_ok}"
-        decision_path = "skip.bands"
-    elif prescore >= PRESCORE_AUTO_BUY:
-        decision_final = "buy"
-        decision_path = "auto.buy"
-    elif prescore <= PRESCORE_AUTO_SKIP:
-        decision_final = "buy"
-        decision_path = "auto.buy"
-    elif not can_consume_llm():
-        llm_reason = f"Daily LLM quota reached ({llm_quota_snapshot()['used']}/{llm_quota_snapshot()['max']})."
-        decision_path = "skip.quota"
-    elif not _is_within_llm_window(datetime.now(timezone.utc)):
-        # After morning cutoff (default 10:30 AM CST), do NOT run LLM. Autos still applied above.
-        llm_reason = f"LLM window closed (allowed until {LLM_CUTOFF_HHMM} {LLM_CUTOFF_TZ})."
-        decision_path = "skip.llm_window"
-    else:
-        # Gray zone -> LLM (morning only)
-        llm = await analyze_with_openai(alert, f)
-        consume_llm()
-        llm_ran = True
-        decision_final = "buy" if llm.get("decision") == "buy" else "skip"
-        decision_path = "llm.buy" if decision_final == "buy" else "llm.skip"
-
-    # After processing, set cooldown timestamp
-    _COOLDOWN[key] = now_utc
-
-    # Prepare LLM section for outputs (even if not run)
-    if not llm_ran:
-        llm = {
-            "decision": "skip",
-            "confidence": 0.0,
-            "reason": llm_reason,
-            "checklist": {},
-            "ev_estimate": {}
-        }
+    # Update cooldown timestamp (not a gate)
+    _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
 
     tg_text = compose_telegram_text(
         alert={**alert, "strike": desired_strike},
         option_ticker=option_ticker,
         f=f,
-        prescore=prescore,
         llm=llm,
         llm_ran=llm_ran,
-        llm_reason=llm_reason
+        llm_reason=""
     )
     tg_result = await send_telegram(tg_text)
 
@@ -1020,10 +812,11 @@ async def webhook_tradingview(request: Request):
         "option_ticker": option_ticker,
         "decision_final": decision_final,
         "decision_path": decision_path,
-        "prescore": prescore,
-        "llm": {"ran": llm_ran, "decision": llm.get("decision"), "confidence": llm.get("confidence"), "reason": llm.get("reason")},
+        "prescore": None,  # removed
+        "llm": {"ran": True, "decision": llm.get("decision"), "confidence": llm.get("confidence"), "reason": llm.get("reason")},
         "features": {
-            "oi": oi, "vol": vol, "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
+            "oi": f.get("oi"), "vol": f.get("vol"),
+            "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
             "delta": f.get("delta"), "dte": f.get("dte"), "em_vs_be_ok": f.get("em_vs_be_ok"),
             "mtf_align": f.get("mtf_align"), "sr_ok": f.get("sr_headroom_ok"), "iv": f.get("iv"),
             "iv_rank": f.get("iv_rank"), "rv20": f.get("rv20"), "regime": f.get("regime_flag")
@@ -1035,14 +828,11 @@ async def webhook_tradingview(request: Request):
         "parsed_alert": alert,
         "option_ticker": option_ticker,
         "features": f,
-        "prescore": prescore,
-        "decision": {
-            "final": decision_final,
-            "path": decision_path,
-        },
+        "prescore": None,  # removed
+        "decision": {"final": decision_final, "path": decision_path},
         "llm": {
-            "ran": llm_ran,
-            "reason": llm_reason if not llm_ran else "",
+            "ran": True,
+            "reason": "",
             "decision": llm.get("decision"),
             "confidence": llm.get("confidence"),
             "checklist": llm.get("checklist"),
@@ -1050,17 +840,11 @@ async def webhook_tradingview(request: Request):
         },
         "cooldown": {
             "seconds": COOLDOWN_SECONDS,
-            "active": in_cooldown,
+            "active": False,  # no gating
         },
-        "quota": llm_quota_snapshot(),
-        "thresholds": {
-            "volume_min_for_llm": VOLUME_MIN_FOR_LLM,
-            "oi_min_for_llm": OI_MIN_FOR_LLM,
-            "prescore_auto_buy": PRESCORE_AUTO_BUY,
-            "prescore_auto_skip": PRESCORE_AUTO_SKIP,
-        },
+        "quota": llm_quota_snapshot(),  # tracking only
         "telegram": {"sent": bool(tg_result) if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else False, "result": tg_result},
-        "notes": "Hybrid gating: bands -> pre-score -> LLM for gray zone. Educational demo; not financial advice.",
+        "notes": "LLM always-on: no prescore/liquidity/band/event/LLM-window gating. Educational demo; not financial advice.",
     }
 
 if __name__ == "__main__":
