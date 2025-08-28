@@ -1,4 +1,5 @@
-# alert_server.py-backup 08/27 (Windows in CDT; Polygon features enhanced; LLM/Telegram only inside windows)
+# alert_server.py — 2025-08-27
+# Windows in CDT; Polygon features enhanced; LLM/Telegram only inside windows
 import os
 import re
 import json
@@ -19,7 +20,7 @@ from openai import OpenAI
 # =======================
 # Configuration / Knobs
 # =======================
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -145,6 +146,14 @@ def _next_report_dt_utc(now_utc: datetime) -> datetime:
 def _fmt(val):
     return "—" if val is None else (f"{val:.4f}" if isinstance(val, float) else str(val))
 
+def _fmt_pct(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{100.0 * float(x):.1f}%"
+    except Exception:
+        return "—"
+
 # =======================
 # NEW: Processing windows (CDT)
 # =======================
@@ -153,8 +162,7 @@ CDT_TZ = ZoneInfo("America/Chicago")
 def _now_cdt() -> datetime:
     return datetime.now(CDT_TZ)
 
-# Windows requested:
-#   08:30–11:30 CDT and 14:00–15:00 CDT
+# Windows requested: 08:30–11:30 CDT and 14:00–15:00 CDT
 WINDOWS_CDT = [
     (dt_time(8, 30, tzinfo=CDT_TZ), dt_time(11, 30, tzinfo=CDT_TZ)),
     (dt_time(14, 0, tzinfo=CDT_TZ), dt_time(15, 0, tzinfo=CDT_TZ)),
@@ -219,7 +227,7 @@ def ema(values: List[float], period: int) -> Optional[float]:
 def atr14(daily: List[Dict[str, Any]]) -> Optional[float]:
     if len(daily) < 15:
         return None
-    bars = sorted(daily, key=lambda x: x["t"])
+    bars = sorted(daily, key=lambda x: x["t"])  # ascending
     trs = []
     prev_close = bars[0]["c"]
     for b in bars[1:]:
@@ -665,9 +673,54 @@ async def send_telegram(text: str) -> Optional[Dict[str, Any]]:
         return {"status_code": r.status_code, "text": r.text}
 
 # =======================
-# Daily report
+# Daily report (expanded)
 # =======================
-def _summarize_day_for_report(local_date: date) -> str:
+def _format_contract_lines(entries: List[Dict[str, Any]]) -> List[str]:
+    """One line per processed alert with contract + key features and LLM outcome."""
+    lines = []
+    for e in entries:
+        sym   = e.get("symbol")
+        side  = e.get("side")
+        ct    = e.get("option_ticker") or "—"
+        f     = e.get("features", {})
+        llm   = e.get("llm", {})
+        dte_v = f.get("dte")
+        delta = f.get("delta")
+        iv    = f.get("iv")
+        mid   = f.get("opt_mid")
+        spr   = f.get("spread_pct")   # fraction, e.g., 0.12
+        oi    = f.get("oi")
+        vol   = f.get("vol")
+        dec   = e.get("decision_final")
+        conf  = llm.get("confidence")
+
+        line = (
+            f"- {sym} {side} | {ct} | "
+            f"DTE={dte_v if dte_v is not None else '—'}  "
+            f"Δ={_fmt(delta)}  IV={_fmt(iv)}  mid={_fmt(mid)}  "
+            f"spread={_fmt_pct(spr)}  OI={_fmt(oi)}  Vol={_fmt(vol)}  "
+            f"→ {dec.upper() if dec else '—'} (conf={_fmt(conf)})"
+        )
+        lines.append(line)
+    return lines
+
+def _chunk_lines_for_telegram(lines: List[str], prefix: str = "", max_chars: int = 3500) -> List[str]:
+    """Chunk many lines into multiple messages under max_chars (Telegram hard limit ~4096)."""
+    chunks = []
+    cur = prefix.strip() + ("\n" if prefix else "")
+    for ln in lines:
+        add_len = (1 if cur else 0) + len(ln)
+        if len(cur) + add_len > max_chars:
+            if cur:
+                chunks.append(cur)
+            cur = ln
+        else:
+            cur = (cur + ("\n" if cur and not cur.endswith("\n") else "")) + ln
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+def _summarize_day_for_report(local_date: date) -> Dict[str, Any]:
     entries = [e for e in _DECISIONS_LOG if e["timestamp_local"].date() == local_date]
     total_alerts = len(entries)
     llm_runs = sum(1 for e in entries if e["llm"]["ran"])
@@ -679,6 +732,7 @@ def _summarize_day_for_report(local_date: date) -> str:
     top = ", ".join(f"{sym}({cnt})" for sym, cnt in by_symbol.most_common(5)) or "—"
     by_outcome = Counter((e["decision_path"] for e in entries))
     quota = llm_quota_snapshot()
+
     header = f"📊 Daily Report — {local_date.isoformat()} ({MARKET_TZ})"
     body = [
         f"Alerts: {total_alerts} | LLM ran: {llm_runs} | skips: {llm_skips}",
@@ -691,13 +745,25 @@ def _summarize_day_for_report(local_date: date) -> str:
         "",
         "⚠️ Educational demo; not financial advice."
     ]
-    return header + "\n" + "\n".join(body)
+    header_text = header + "\n" + "\n".join(body)
+
+    contract_lines = _format_contract_lines(entries)
+    return {"header": header_text, "contracts": contract_lines, "count": total_alerts}
 
 async def _send_daily_report_now() -> Dict[str, Any]:
     today_local = market_now().date()
-    text = _summarize_day_for_report(today_local)
-    tg_result = await send_telegram(text)
-    return {"ok": True, "sent": bool(tg_result), "result": tg_result}
+    rep = _summarize_day_for_report(today_local)
+
+    sent = []
+    first = await send_telegram(rep["header"])
+    sent.append(first)
+
+    if rep["contracts"]:
+        chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
+        for msg in chunks:
+            sent.append(await send_telegram(msg))
+
+    return {"ok": True, "sent": any(bool(x) for x in sent), "result": sent}
 
 async def _daily_report_scheduler():
     while True:
@@ -827,6 +893,13 @@ async def run_daily_report():
     res = await _send_daily_report_now()
     return {"ok": True, "trigger": "manual", **res}
 
+@app.get("/report/preview")
+def report_preview():
+    today_local = market_now().date()
+    rep = _summarize_day_for_report(today_local)
+    chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
+    return {"ok": True, "header": rep["header"], "contract_chunks": chunks, "count": rep["count"]}
+
 async def _get_alert_text(request: Request) -> str:
     ctype = request.headers.get("content-type", "")
     if "application/json" in ctype:
@@ -862,7 +935,7 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
     raise HTTPException(status_code=400, detail='Alert must be like: "CALL Signal: TICKER at 123.45 Strike: 123" or with expiry: "... Expiry: YYYY-MM-DD"')
 
 # =======================
-# Webhook (now window-gated for LLM+Telegram in CDT)
+# Webhook (window-gated LLM+Telegram in CDT)
 # =======================
 @app.post("/webhook", response_class=JSONResponse)
 @app.post("/webhook/tradingview", response_class=JSONResponse)
@@ -886,7 +959,6 @@ async def webhook_tradingview(request: Request):
         # Build features (context only)
         f = await build_features(client, alert={**alert, "strike": desired_strike}, snapshot=snap)
 
-    # Determine if we should run LLM + Telegram based on CDT windows
     in_window = allowed_now_cdt()
     llm_ran = False
     llm_reason = ""
