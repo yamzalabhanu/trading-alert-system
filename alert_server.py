@@ -127,6 +127,13 @@ def same_week_friday(today: date) -> date:
         offset += 7
     return today + timedelta(days=offset)
 
+def two_weeks_friday(today: date) -> date:
+    """
+    Friday two weeks out from *this* week's Friday.
+    Example: if today is Wed 2025-08-27, same_week_friday=2025-08-29 → +14d → 2025-09-12
+    """
+    return same_week_friday(today) + timedelta(days=14)
+    
 def round_strike_to_common_increment(strike: float) -> float:
     return round(strike * 2) / 2.0
 
@@ -942,23 +949,27 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
 async def webhook_tradingview(request: Request):
     payload = await _get_alert_text(request)
     alert = parse_alert_text(payload)
-    desired_strike = round_strike_to_common_increment(alert["strike"])
+
+    # === Recommendation policy ===
+    # Strike: +5% (CALL) / -5% (PUT) of underlying (from alert)
+    # Expiry: Friday two weeks out (ignores alert-provided expiry)
+    ul_px = float(alert["underlying_price_from_alert"])
+   raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
+    desired_strike = round_strike_to_common_increment(raw_reco_strike)
+    target_expiry = two_weeks_friday(datetime.now(timezone.utc).date()).isoformat()
 
     async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-        contracts = await polygon_list_contracts_for_expiry(
-            client, symbol=alert["symbol"], expiry=alert["expiry"], side=alert["side"], limit=250
-        )
+         contracts = await polygon_list_contracts_for_expiry(client,
+          symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250)
         if not contracts:
-            raise HTTPException(status_code=404, detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {alert['expiry']}.")
+           raise HTTPException(status_code=404, detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {target_expiry}.")
         best = pick_nearest_strike(contracts, desired_strike)
         if not best:
-            raise HTTPException(status_code=404, detail=f"No strikes near {desired_strike} for {alert['symbol']} on {alert['expiry']}.")
+            raise HTTPException(status_code=404, detail=f"No strikes near {desired_strike} for {alert['symbol']} on {target_expiry}.")
         option_ticker = best.get("ticker")
-        snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
-
-        # Build features (context only)
-        f = await build_features(client, alert={**alert, "strike": desired_strike}, snapshot=snap)
-
+       snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
+        # Build features with recommended strike/expiry baked into alert context
+        f = await build_features(client, alert={**alert, "strike": desired_strike, "expiry": target_expiry}, snapshot=snap)
     in_window = allowed_now_cdt()
     llm_ran = False
     llm_reason = ""
@@ -974,7 +985,8 @@ async def webhook_tradingview(request: Request):
         decision_path = f"llm.{decision_final}"
 
         tg_text = compose_telegram_text(
-            alert={**alert, "strike": desired_strike},
+             # Ensure the message shows the recommendation (strike/expiry)
+            alert={**alert, "strike": desired_strike, "expiry": target_expiry},
             option_ticker=option_ticker,
             f=f,
             llm=llm,
@@ -1006,6 +1018,8 @@ async def webhook_tradingview(request: Request):
         "prescore": None,
         "llm": {"ran": llm_ran, "decision": llm.get("decision"), "confidence": llm.get("confidence"), "reason": llm.get("reason")},
         "features": {
+             # expose recommendation context for audit
+            "reco_expiry": target_expiry,
             "oi": f.get("oi"), "vol": f.get("vol"),
             "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
             "delta": f.get("delta"), "gamma": f.get("gamma"), "theta": f.get("theta"), "vega": f.get("vega"),
@@ -1026,6 +1040,14 @@ async def webhook_tradingview(request: Request):
         "option_ticker": option_ticker,
         "features": f,
         "prescore": None,
+                "recommendation": {
+            "side": alert["side"],
+            "underlying_from_alert": ul_px,
+            "strike_policy": "+5% for CALL / -5% for PUT (rounded)",
+            "strike_recommended": desired_strike,
+            "expiry_policy": "Friday two weeks out",
+            "expiry_recommended": target_expiry,
+        },
         "decision": {"final": decision_final, "path": decision_path},
         "llm": {
             "ran": llm_ran,
