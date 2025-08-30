@@ -133,7 +133,11 @@ def two_weeks_friday(today: date) -> date:
     Example: if today is Wed 2025-08-27, same_week_friday=2025-08-29 → +14d → 2025-09-12
     """
     return same_week_friday(today) + timedelta(days=14)
-    
+
+def is_same_week(date_a: date, date_b: date, tz: str = "America/Chicago") -> bool:
+    """Check if two dates fall in the same ISO week in the given market TZ."""
+    return (date_a.isocalendar()[:2] == date_b.isocalendar()[:2])
+
 def round_strike_to_common_increment(strike: float) -> float:
     return round(strike * 2) / 2.0
 
@@ -257,7 +261,6 @@ def realized_vol_annualized(daily_closes: List[float], window: int = 20) -> Opti
     return stdev * math.sqrt(252)
 
 def iv_rank_from_history(hist: deque, current_iv: Optional[float]) -> Optional[float]:
-    if current_iv is None or not hist:
     if current_iv is None or not hist:
         return None
     xs = list(hist)
@@ -627,10 +630,100 @@ async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[
     return out
 
 # =======================
+# Scoring & rating
+# =======================
+def _bool_score(v: Optional[bool], w_true: float = 1.0, w_false: float = -0.5) -> float:
+    if v is True:
+        return w_true
+    if v is False:
+        return w_false
+    return 0.0  # unknown / None
+
+def compute_decision_score(f: Dict[str, Any], llm: Dict[str, Any]) -> float:
+    """
+    Blend of heuristic feature checks and LLM confidence.
+    Scale returns 0..100.
+    """
+    checklist = llm.get("checklist", {}) if isinstance(llm, dict) else {}
+    pts = 0.0
+    # Core confirmations
+    pts += _bool_score(checklist.get("mtf_trend_alignment"), 8, -5)
+    pts += _bool_score(checklist.get("sr_headroom_ok"),       6, -4)
+    pts += _bool_score(checklist.get("em_vs_breakeven_ok"),   6, -6)
+    pts += _bool_score(checklist.get("delta_band_ok"),        5, -3)
+    pts += _bool_score(checklist.get("dte_band_ok"),          4, -6)
+
+    # Levels & VWAP context
+    pts += _bool_score(checklist.get("above_pdh"), 3, -1)
+    pts += _bool_score(checklist.get("below_pdl"), 3, -1)
+    pts += _bool_score(checklist.get("above_pmh"), 2, -1)
+    pts += _bool_score(checklist.get("below_pml"), 2, -1)
+
+    # Spread & liquidity mild penalty
+    spread = f.get("option_spread_pct")
+    if isinstance(spread, (int, float)):
+        if spread <= 0.08:  # tight
+            pts += 4
+        elif spread <= 0.15:
+            pts += 1
+        else:
+            pts -= 4
+
+    # OI/Vol sanity
+    oi = f.get("oi") or 0
+    vol = f.get("vol") or 0
+    if oi >= 500 and vol >= 250:
+        pts += 4
+    elif oi >= 200:
+        pts += 2
+    else:
+        pts -= 2
+
+    # Regime bonus if trending
+    if f.get("regime_flag") == "trending":
+        pts += 2
+
+    # IV context preference: medium/low often friendlier for long premium
+    iv_ctx = checklist.get("iv_context")
+    if iv_ctx == "low":
+        pts += 3
+    elif iv_ctx == "medium":
+        pts += 1
+    elif iv_ctx == "high":
+        pts -= 2
+
+    # LLM confidence weight
+    try:
+        conf = float(llm.get("confidence", 0.0))
+    except Exception:
+        conf = 0.0
+    pts += conf * 20.0  # up to +20
+
+    # Clamp and rescale to ~0..100
+    pts = max(0.0, min(100.0, 50.0 + pts))  # center 50, allow +/- 50 swing
+    return round(pts, 1)
+
+def map_score_to_rating(score: float, llm_decision: str) -> Optional[str]:
+    """
+    Convert numeric score + LLM decision to a graded recommendation.
+    Only defined for buy decisions.
+    """
+    if str(llm_decision).lower() != "buy":
+        return None
+    if score >= 80:
+        return "Strong Buy"
+    if score >= 60:
+        return "Moderate Buy"
+    if score >= 50:
+        return "Cautious Buy"
+    return None
+
+# =======================
 # Output formatting
 # =======================
 def compose_telegram_text(alert: Dict[str, Any], option_ticker: str, f: Dict[str, Any],
-                          llm: Dict[str, Any], *, llm_ran: bool, llm_reason: str) -> str:
+                          llm: Dict[str, Any], *, llm_ran: bool, llm_reason: str,
+                          score: Optional[float] = None, rating: Optional[str] = None) -> str:
     lines = [
         "📣 Options Alert",
         f"{alert['side']} {alert['symbol']} | Strike {alert['strike']} | Exp {alert['expiry']} (~{f.get('dte')} DTE)",
@@ -654,6 +747,12 @@ def compose_telegram_text(alert: Dict[str, Any], option_ticker: str, f: Dict[str
         lines += [
             "",
             f"LLM Decision: {llm.get('decision','wait').upper()}  (conf: {llm.get('confidence',0):.2f})",
+        ]
+        if rating:
+            lines += [f"Recommendation: {rating}"]
+        if score is not None:
+            lines += [f"Score: {score:.1f}/100"]
+        lines += [
             f"Reason: {llm.get('reason','')}",
             f"Checklist: {json.dumps(llm.get('checklist', {}))}",
             f"EV: {json.dumps(llm.get('ev_estimate', {}))}",
@@ -957,7 +1056,13 @@ async def webhook_tradingview(request: Request):
     ul_px = float(alert["underlying_price_from_alert"])
     raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
     desired_strike = round_strike_to_common_increment(raw_reco_strike)
-    target_expiry = two_weeks_friday(datetime.now(timezone.utc).date()).isoformat()
+    today_utc = datetime.now(timezone.utc).date()
+    target_expiry_date = two_weeks_friday(today_utc)
+    # Hard guard: never allow same-week expiry
+    swf = same_week_friday(today_utc)
+    if is_same_week(target_expiry_date, swf):
+        target_expiry_date = swf + timedelta(days=7)  # push to next week if ever equal
+    target_expiry = target_expiry_date.isoformat()
 
     async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
         contracts = await polygon_list_contracts_for_expiry(client,
@@ -971,18 +1076,31 @@ async def webhook_tradingview(request: Request):
         snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
         # Build features with recommended strike/expiry baked into alert context
         f = await build_features(client, alert={**alert, "strike": desired_strike, "expiry": target_expiry}, snapshot=snap)
+
     in_window = allowed_now_cdt()
     llm_ran = False
     llm_reason = ""
     tg_result = None
     decision_final = "skip"
     decision_path = "window.skip"
+    score: Optional[float] = None
+    rating: Optional[str] = None
+    llm: Dict[str, Any] = {
+        "decision": "wait",
+        "confidence": 0.0,
+        "reason": "",
+        "checklist": {},
+        "ev_estimate": {}
+    }
 
     if in_window:
         llm = await analyze_with_openai(alert, f)
         consume_llm()
         llm_ran = True
         decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
+        # Compute score + grade for buys
+        score = compute_decision_score(f, llm)
+        rating = map_score_to_rating(score, llm.get("decision"))
         decision_path = f"llm.{decision_final}"
 
         tg_text = compose_telegram_text(
@@ -992,17 +1110,12 @@ async def webhook_tradingview(request: Request):
             f=f,
             llm=llm,
             llm_ran=True,
-            llm_reason=""
+            llm_reason="",
+            score=score,
+            rating=rating
         )
         tg_result = await send_telegram(tg_text)
     else:
-        llm = {
-            "decision": "wait",
-            "confidence": 0.0,
-            "reason": "",
-            "checklist": {},
-            "ev_estimate": {}
-        }
         llm_reason = "Outside processing windows (Allowed: 08:30–11:30 & 14:00–15:00 CDT). LLM + Telegram skipped."
 
     # Cooldown timestamp (not a gate)
@@ -1046,10 +1159,15 @@ async def webhook_tradingview(request: Request):
             "underlying_from_alert": ul_px,
             "strike_policy": "+5% for CALL / -5% for PUT (rounded)",
             "strike_recommended": desired_strike,
-            "expiry_policy": "Friday two weeks out",
+            "expiry_policy": "Friday two weeks out (never same-week)",
             "expiry_recommended": target_expiry,
         },
-        "decision": {"final": decision_final, "path": decision_path},
+        "decision": {
+            "final": decision_final,
+            "path": decision_path,
+            "score": (score if in_window else None),
+            "rating": (rating if in_window else None)
+        },
         "llm": {
             "ran": llm_ran,
             "reason": llm_reason,
@@ -1061,7 +1179,7 @@ async def webhook_tradingview(request: Request):
         "cooldown": {"seconds": COOLDOWN_SECONDS, "active": False},
         "quota": llm_quota_snapshot(),
         "telegram": {"sent": bool(tg_result) if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else False, "result": tg_result},
-        "notes": "LLM/Telegram run only during 08:30–11:30 & 14:00–15:00 CDT. Polygon-enhanced features for LLM context.",
+        "notes": "LLM/Telegram run only during 08:30–11:30 & 14:00–15:00 CDT. Polygon-enhanced features for LLM context. Buys are graded into Strong/Moderate/Cautious.",
     }
 
 if __name__ == "__main__":
