@@ -258,6 +258,7 @@ def realized_vol_annualized(daily_closes: List[float], window: int = 20) -> Opti
 
 def iv_rank_from_history(hist: deque, current_iv: Optional[float]) -> Optional[float]:
     if current_iv is None or not hist:
+    if current_iv is None or not hist:
         return None
     xs = list(hist)
     lo, hi = min(xs), max(xs)
@@ -564,7 +565,7 @@ def build_llm_prompt(alert: Dict[str, Any], f: Dict[str, Any]) -> str:
         f"  Regime: {f.get('regime_flag')}  ATR(14): {f.get('atr')}",
         "Levels:",
         f"  PDH={f.get('prev_day_high')}  PDL={f.get('prev_day_low')}  PMH={f.get('premarket_high')}  PML={f.get('premarket_low')}",
-        f"  VWAP={f.get('vwap')}  VWAP_dist={f.get('vwap_dist')}",
+        f"  VWAP={f.get('vwap')}  VWAPΔ={f.get('vwap_dist')}",
         f"Checklist: {json.dumps(checklist_hint)}",
         "Return strict JSON per schema."
     ]
@@ -954,20 +955,20 @@ async def webhook_tradingview(request: Request):
     # Strike: +5% (CALL) / -5% (PUT) of underlying (from alert)
     # Expiry: Friday two weeks out (ignores alert-provided expiry)
     ul_px = float(alert["underlying_price_from_alert"])
-   raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
+    raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
     desired_strike = round_strike_to_common_increment(raw_reco_strike)
     target_expiry = two_weeks_friday(datetime.now(timezone.utc).date()).isoformat()
 
     async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-         contracts = await polygon_list_contracts_for_expiry(client,
-          symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250)
+        contracts = await polygon_list_contracts_for_expiry(client,
+            symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250)
         if not contracts:
-           raise HTTPException(status_code=404, detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {target_expiry}.")
+            raise HTTPException(status_code=404, detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {target_expiry}.")
         best = pick_nearest_strike(contracts, desired_strike)
         if not best:
             raise HTTPException(status_code=404, detail=f"No strikes near {desired_strike} for {alert['symbol']} on {target_expiry}.")
         option_ticker = best.get("ticker")
-       snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
+        snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
         # Build features with recommended strike/expiry baked into alert context
         f = await build_features(client, alert={**alert, "strike": desired_strike, "expiry": target_expiry}, snapshot=snap)
     in_window = allowed_now_cdt()
@@ -985,7 +986,7 @@ async def webhook_tradingview(request: Request):
         decision_path = f"llm.{decision_final}"
 
         tg_text = compose_telegram_text(
-             # Ensure the message shows the recommendation (strike/expiry)
+            # Ensure the message shows the recommendation (strike/expiry)
             alert={**alert, "strike": desired_strike, "expiry": target_expiry},
             option_ticker=option_ticker,
             f=f,
@@ -1018,7 +1019,7 @@ async def webhook_tradingview(request: Request):
         "prescore": None,
         "llm": {"ran": llm_ran, "decision": llm.get("decision"), "confidence": llm.get("confidence"), "reason": llm.get("reason")},
         "features": {
-             # expose recommendation context for audit
+            # expose recommendation context for audit
             "reco_expiry": target_expiry,
             "oi": f.get("oi"), "vol": f.get("vol"),
             "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
@@ -1040,7 +1041,7 @@ async def webhook_tradingview(request: Request):
         "option_ticker": option_ticker,
         "features": f,
         "prescore": None,
-                "recommendation": {
+        "recommendation": {
             "side": alert["side"],
             "underlying_from_alert": ul_px,
             "strike_policy": "+5% for CALL / -5% for PUT (rounded)",
