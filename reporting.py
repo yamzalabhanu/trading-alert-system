@@ -119,3 +119,57 @@ async def _send_daily_report_now() -> Dict[str, Any]:
         "preview_first_chunk": (chunks[0] if chunks else ""),
         "results": results,
     }
+
+# --- Daily report scheduler (3:15 PM CDT = 4:15 PM ET) ---
+
+import asyncio
+from datetime import timedelta
+
+_report_task = None  # type: ignore[var-annotated]
+
+async def _scheduler_runner():
+    """
+    Background loop that sleeps until 15:15:00 CDT each day and then sends the report.
+    """
+    while True:
+        now = datetime.now(CDT_TZ)
+        target = now.replace(hour=15, minute=15, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        sleep_s = (target - now).total_seconds()
+        try:
+            await asyncio.sleep(sleep_s)
+            await _send_daily_report_now()
+            # small buffer so we don't immediately re-evaluate 'now' at the same time
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            # graceful shutdown
+            break
+        except Exception:
+            # swallow and continue loop (do not crash the app if telegram fails)
+            await asyncio.sleep(5.0)
+
+async def _daily_report_scheduler():
+    """
+    Create the background task if not already running.
+    Safe to call multiple times (idempotent).
+    """
+    global _report_task
+    if _report_task is None or _report_task.done():
+        _report_task = asyncio.create_task(_scheduler_runner())
+    return {"started": True}
+
+async def _stop_daily_report_scheduler():
+    """
+    Cancel the background task on shutdown.
+    """
+    global _report_task
+    if _report_task and not _report_task.done():
+        _report_task.cancel()
+        try:
+            await _report_task
+        except asyncio.CancelledError:
+            pass
+    _report_task = None
+    return {"stopped": True}
+
