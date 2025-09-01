@@ -1,7 +1,6 @@
 # config.py
 import os
 from zoneinfo import ZoneInfo
-from datetime import time as dt_time, datetime
 from typing import List, Tuple, Union
 
 # Timezones
@@ -49,25 +48,3 @@ WINDOWS_CDT: List[Union[Tuple[dt_time, dt_time], Tuple[int, int, int, int]]] = [
     (dt_time(8, 30, tzinfo=CDT_TZ), dt_time(11, 30, tzinfo=CDT_TZ)),
     (dt_time(14, 0, tzinfo=CDT_TZ), dt_time(15, 0, tzinfo=CDT_TZ)),
 ]
-
-def allowed_now_cdt() -> bool:
-    """
-    Accepts WINDOWS_CDT as either:
-      - [(dt_time(..., tzinfo=CDT_TZ), dt_time(..., tzinfo=CDT_TZ)), ...]  OR
-      - [(8,30,11,30), (14,0,15,0)]
-    """
-    now = market_now().time()  # aware time in CDT
-    for win in WINDOWS_CDT:
-        # Case 1: (start_time, end_time) as datetime.time objects
-        if isinstance(win, (tuple, list)) and len(win) == 2 \
-           and isinstance(win[0], dt_time) and isinstance(win[1], dt_time):
-            start, end = win
-            if start <= now <= end:
-                return True
-        # Case 2: (sh, sm, eh, em) as integers
-        elif isinstance(win, (tuple, list)) and len(win) == 4:
-            sh, sm, eh, em = win
-            if dt_time(sh, sm, tzinfo=CDT_TZ) <= now <= dt_time(eh, em, tzinfo=CDT_TZ):
-                return True
-        # Unknown format → ignore
-    return False
