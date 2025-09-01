@@ -1,10 +1,18 @@
 # routes.py
+# at top
+import os
+from fastapi import Query
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 import httpx
 import re
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone, timedelta, date, time as dt_time
+
+
+
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # optional, for checks
+
 
 from config import (
     COOLDOWN_SECONDS,
@@ -241,46 +249,72 @@ def report_preview():
 
 @router.post("/webhook", response_class=JSONResponse)
 @router.post("/webhook/tradingview", response_class=JSONResponse)
-async def webhook_tradingview(request: Request):
+async def webhook_tradingview(request: Request, offline: int = Query(default=0)):
     payload = await _get_alert_text(request)
     if not payload:
         raise HTTPException(status_code=400, detail="Empty alert payload")
     alert = parse_alert_text(payload)
 
-    # === Recommendation policy ===
+    # === Recommendation policy (unchanged) ===
     ul_px = float(alert["underlying_price_from_alert"])
     raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
     desired_strike = round_strike_to_common_increment(raw_reco_strike)
-
     today_utc = datetime.now(timezone.utc).date()
     target_expiry_date = two_weeks_friday(today_utc)
-    # Hard guard: never allow same-week expiry
     swf = same_week_friday(today_utc)
     if is_same_week(target_expiry_date, swf):
         target_expiry_date = swf + timedelta(days=7)
     target_expiry = target_expiry_date.isoformat()
 
-    async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-        contracts = await polygon_list_contracts_for_expiry(
-            client, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
-        )
-        if not contracts:
-            raise HTTPException(status_code=404, detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {target_expiry}.")
-        # pick nearest strike
-        best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike)) if contracts else None
-        if not best:
-            raise HTTPException(status_code=404, detail=f"No strikes near {desired_strike} for {alert['symbol']} on {target_expiry}.")
-        option_ticker = best.get("ticker") or best.get("symbol")
-        if not option_ticker:
-            raise HTTPException(status_code=500, detail="Polygon returned contract without ticker")
+    option_ticker = "OFFLINE-TICKER"
+    f = {}
 
-        snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
-        # Build features with recommended strike/expiry baked into alert context
-        f = await build_features(
-            client,
-            alert={**alert, "strike": desired_strike, "expiry": target_expiry},
-            snapshot=snap
-        )
+    try:
+        if offline or not POLYGON_API_KEY:
+            # ---- OFFLINE MODE: skip Polygon, fabricate minimal features ----
+            f = {
+                "bid": None, "ask": None, "mid": None,
+                "option_spread_pct": None, "quote_age_sec": None,
+                "oi": None, "vol": None,
+                "delta": None, "gamma": None, "theta": None, "vega": None,
+                "iv": None, "iv_rank": None, "rv20": None,
+                "dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days,
+                "em_vs_be_ok": None,
+                "mtf_align": None, "sr_headroom_ok": None, "regime_flag": "trending",
+                "prev_day_high": None, "prev_day_low": None,
+                "premarket_high": None, "premarket_low": None,
+                "vwap": None, "vwap_dist": None,
+                "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
+            }
+        else:
+            # ---- ONLINE MODE: real Polygon calls ----
+            async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
+                contracts = await polygon_list_contracts_for_expiry(
+                    client, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
+                )
+                if not contracts:
+                    raise HTTPException(status_code=404, detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {target_expiry}.")
+                best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike)) if contracts else None
+                if not best:
+                    raise HTTPException(status_code=404, detail=f"No strikes near {desired_strike} for {alert['symbol']} on {target_expiry}.")
+                option_ticker = best.get("ticker") or best.get("symbol")
+                if not option_ticker:
+                    raise HTTPException(status_code=500, detail="Polygon returned contract without ticker")
+
+                snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
+                f = await build_features(
+                    client,
+                    alert={**alert, "strike": desired_strike, "expiry": target_expiry},
+                    snapshot=snap
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Make it a clear 502 instead of a generic 500
+        raise HTTPException(status_code=502, detail=f"Upstream error in Polygon/features: {type(e).__name__}: {e}")
+
+    # ... keep the rest of the function exactly as we already have ...
+
 
     in_window = allowed_now_cdt()
     llm_ran = False
