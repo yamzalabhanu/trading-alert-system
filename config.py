@@ -41,3 +41,23 @@ WINDOWS_CDT = [
     (dt_time(8, 30, tzinfo=CDT_TZ), dt_time(11, 30, tzinfo=CDT_TZ)),
     (dt_time(14, 0, tzinfo=CDT_TZ), dt_time(15, 0, tzinfo=CDT_TZ)),
 ]
+
+def allowed_now_cdt() -> bool:
+    """
+    Accepts WINDOWS_CDT as either:
+      - [(8,30,11,30), (14,0,15,0)], or
+      - [(dt_time(8,30, tzinfo=CDT_TZ), dt_time(11,30, tzinfo=CDT_TZ)), ...]
+    """
+    now = market_now().time()  # aware time in CDT
+    for win in WINDOWS_CDT:
+        # tuple-of-times case
+        if len(win) == 2 and isinstance(win[0], dt_time) and isinstance(win[1], dt_time):
+            start, end = win
+            if start <= now <= end:
+                return True
+        # ints case: (sh, sm, eh, em)
+        elif len(win) == 4:
+            sh, sm, eh, em = win
+            if dt_time(sh, sm, tzinfo=CDT_TZ) <= now <= dt_time(eh, em, tzinfo=CDT_TZ):
+                return True
+    return False
