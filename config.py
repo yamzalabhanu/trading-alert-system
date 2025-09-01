@@ -56,18 +56,18 @@ def allowed_now_cdt() -> bool:
       - [(dt_time(..., tzinfo=CDT_TZ), dt_time(..., tzinfo=CDT_TZ)), ...]  OR
       - [(8,30,11,30), (14,0,15,0)]
     """
-    now = datetime.now(CDT_TZ).time()
+    now = market_now().time()  # aware time in CDT
     for win in WINDOWS_CDT:
-        # Case 1: pair of time objects
+        # Case 1: (start_time, end_time) as datetime.time objects
         if isinstance(win, (tuple, list)) and len(win) == 2 \
            and isinstance(win[0], dt_time) and isinstance(win[1], dt_time):
             start, end = win
             if start <= now <= end:
                 return True
-        # Case 2: 4-tuple of ints
+        # Case 2: (sh, sm, eh, em) as integers
         elif isinstance(win, (tuple, list)) and len(win) == 4:
             sh, sm, eh, em = win
             if dt_time(sh, sm, tzinfo=CDT_TZ) <= now <= dt_time(eh, em, tzinfo=CDT_TZ):
                 return True
-        # Otherwise ignore
+        # Unknown format → ignore
     return False
