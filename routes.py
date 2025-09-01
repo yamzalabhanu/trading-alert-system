@@ -464,6 +464,20 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
 
                 limit_px = None if use_market else float(mid)
 
+                qty = int(request.query_params.get("qty", IBKR_DEFAULT_QTY))
+                mode = IBKR_ORDER_MODE
+                mid = f.get("mid")
+                
+                if mode == "market":
+                    use_market = True
+                elif mode == "limit":
+                    use_market = (mid is None)
+                else:  # auto
+                    use_market = not (IBKR_USE_MID_AS_LIMIT and (mid is not None))
+                
+                limit_px = None if use_market else float(mid)
+
+
                 ib_result_obj = await place_recommended_option_order(
                     symbol=alert["symbol"],
                     side=alert["side"],                # "CALL" or "PUT" (your ibkr_client should handle this)
