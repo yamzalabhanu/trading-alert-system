@@ -2,6 +2,11 @@
 import os
 from zoneinfo import ZoneInfo
 
+from datetime import time as dt_time
+
+
+CDT_TZ = ZoneInfo("America/Chicago")
+
 # All configuration constants from the original file
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
