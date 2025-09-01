@@ -222,8 +222,30 @@ def compose_telegram_text(
     return "\n".join([header, contract, "", snap, decision, reason, scoreline]).strip()
 
 def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
-    try:
+    # Nothing came back
+    if res is None:
+        return {"ok": False, "error": "ibkr_client returned None", "raw": None}
+
+    # If ibkr_client returned a dict, keep it intact
+    if isinstance(res, dict):
         return {
+            "ok": bool(res.get("ok", False)),
+            "order_id": res.get("order_id"),
+            "status": res.get("status"),
+            "filled": res.get("filled"),
+            "remaining": res.get("remaining"),
+            "avg_fill_price": res.get("avg_fill_price"),
+            "error": res.get("error"),
+            "raw": res.get("raw", res),  # keep full dict in raw
+        }
+
+    # If it returned a plain string
+    if isinstance(res, str):
+        return {"ok": False, "error": res, "raw": res}
+
+    # Fallback for object-like responses
+    try:
+        payload = {
             "ok": getattr(res, "ok", False),
             "order_id": getattr(res, "order_id", None),
             "status": getattr(res, "status", None),
@@ -231,10 +253,16 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
             "remaining": getattr(res, "remaining", None),
             "avg_fill_price": getattr(res, "avg_fill_price", None),
             "error": getattr(res, "error", None),
-            "raw": getattr(res, "raw", None),
         }
+        # Preserve a raw representation
+        try:
+            payload["raw"] = getattr(res, "raw", None) or repr(res)
+        except Exception:
+            payload["raw"] = repr(res)
+        return payload
     except Exception as e:
-        return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}"}
+        return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
+
 
 # Async wrappers for polygon_client (keeping your current call style)
 async def polygon_list_contracts_for_expiry(
