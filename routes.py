@@ -33,10 +33,14 @@ router = APIRouter()
 _llm_quota: Dict[str, Any] = {"date": None, "used": 0}
 _COOLDOWN: Dict[Tuple[str, str], datetime] = {}
 
-# --- IBKR toggles (env or query param) ---
-IBKR_ENABLED = os.getenv("IBKR_ENABLED", "0") == "1"  # set to 1 in env to enable by default
+# --- IBKR toggles (env defaults; can be overridden via query params) ---
+_IBKR_ENV_DEFAULT = os.getenv("IBKR_ENABLED", "0")
+def _env_truthy(s: str) -> bool:
+    return str(s).strip().lower() in ("1", "true", "yes", "on")
+
+IBKR_ENABLED = _env_truthy(_IBKR_ENV_DEFAULT)           # default behavior from env
 IBKR_DEFAULT_QTY = int(os.getenv("IBKR_DEFAULT_QTY", "1"))
-IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()       # e.g., DAY, GTC
+IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()         # e.g., DAY, GTC
 IBKR_ORDER_MODE = os.getenv("IBKR_ORDER_MODE", "auto").lower()   # auto | market | limit
 IBKR_USE_MID_AS_LIMIT = os.getenv("IBKR_USE_MID_AS_LIMIT", "1") == "1"
 
@@ -53,6 +57,18 @@ ALERT_RE_NO_EXP = re.compile(
 )
 
 # ========== Small utilities used here ==========
+
+def _truthy(s: str) -> bool:
+    return str(s).strip().lower() in ("1", "true", "yes", "on")
+
+def flag_from(req: Request, name: str, env_name: str, default: bool = False) -> bool:
+    """
+    Read a boolean flag with priority: query param -> env -> default.
+    """
+    qv = req.query_params.get(name)
+    if qv is not None:
+        return _truthy(qv)
+    return _truthy(os.getenv(env_name, "1" if default else "0"))
 
 def market_now() -> datetime:
     """Current time localized to market (CDT)."""
@@ -285,6 +301,11 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
         raise HTTPException(status_code=400, detail="Empty alert payload")
     alert = parse_alert_text(payload)
 
+    # === Flags (query param overrides env) ===
+    effective_ib_enabled = flag_from(request, "ib", "IBKR_ENABLED", default=IBKR_ENABLED)
+    force = 1 #flag_from(request, "force", "FORCE", default=False)
+    force_buy = 1 #flag_from(request, "force_buy", "FORCE_BUY", default=False)
+
     # === Recommendation policy ===
     ul_px = float(alert["underlying_price_from_alert"])
     raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
@@ -344,8 +365,8 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
         raise HTTPException(status_code=502, detail=f"Upstream error in Polygon/features: {type(e).__name__}: {e}")
 
     # ---------- Decisioning / LLM / Telegram / IBKR ----------
-   
-    in_window = allowed_now_cdt() or bool(int(request.query_params.get("force", "1")))
+    in_window = allowed_now_cdt() or force
+
     llm_ran = False
     llm_reason = ""
     tg_result = None
@@ -374,6 +395,11 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
         rating = map_score_to_rating(score, llm.get("decision"))
         decision_path = f"llm.{decision_final}"
 
+        # Optional decision override for deterministic testing
+        if force_buy:
+            decision_final = "buy"
+            decision_path = "force.buy"
+
         # Telegram
         tg_text = compose_telegram_text(
             alert={**alert, "strike": desired_strike, "expiry": target_expiry},
@@ -390,8 +416,7 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
 
         # IBKR optional placement (paper)
         try:
-            do_ib = (ib == 1) or IBKR_ENABLED  # query param wins OR env default
-            if decision_final == "buy" and do_ib:
+            if decision_final == "buy" and effective_ib_enabled:
                 ib_attempted = True
 
                 # Decide order style
@@ -413,11 +438,11 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
 
                 ib_result_obj = await place_recommended_option_order(
                     symbol=alert["symbol"],
-                    side=alert["side"],                # "CALL" or "PUT"
+                    side=alert["side"],                # "CALL" or "PUT" (your ibkr_client should handle this)
                     strike=float(desired_strike),     # recommended strike
-                    expiry_iso=target_expiry,         # two-weeks Friday rule
+                    expiry_iso=target_expiry,         # two-weeks Friday rule, ISO "YYYY-MM-DD"
                     quantity=int(os.getenv("IBKR_DEFAULT_QTY", str(IBKR_DEFAULT_QTY))),
-                    limit_price=limit_px,              # None => market
+                    limit_price=limit_px,             # None => market
                     action="BUY",
                     tif=IBKR_TIF,
                 )
@@ -497,7 +522,7 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
             "result": tg_result
         },
         "ibkr": {
-            "enabled": IBKR_ENABLED,
+            "enabled": effective_ib_enabled,
             "attempted": ib_attempted,
             "result": (_ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None),
         },
