@@ -1,284 +1,196 @@
 # feature_engine.py
-import math
-from typing import List, Dict, Any, Optional
-from collections import deque
-from config import IV_HISTORY_LEN, REGIME_TREND_EMA_FAST, REGIME_TREND_EMA_SLOW
-from polygon_client import get_aggs
+from __future__ import annotations
 
-# Global state for IV history
-_IV_HISTORY: Dict[str, deque] = {}
+from datetime import datetime, timezone, date
+from math import sqrt
+from typing import Any, Dict, Optional
 
-def ema(values: List[float], period: int) -> Optional[float]:
-        if not values or period <= 0 or len(values) < period:
+# If you have a proper market clock util, import and use it; otherwise use UTC now.
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
         return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
-    pass
 
-def atr14(daily: List[Dict[str, Any]]) -> Optional[float]:
-        if len(daily) < 15:
+def _mid(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+    if bid is None or ask is None:
         return None
-    bars = sorted(daily, key=lambda x: x["t"])  # ascending
-    trs = []
-    prev_close = bars[0]["c"]
-    for b in bars[1:]:
-        tr = max(b["h"] - b["l"], abs(b["h"] - prev_close), abs(b["l"] - prev_close))
-        trs.append(tr)
-        prev_close = b["c"]
-    if len(trs) < 14:
+    if ask <= 0:
         return None
-    return sum(trs[-14:]) / 14.0
-    pass
+    return (bid + ask) / 2.0
 
-def realized_vol_annualized(daily_closes: List[float], window: int = 20) -> Optional[float]:
-        if len(daily_closes) < window + 1:
+def _spread_pct(bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> Optional[float]:
+    if bid is None or ask is None or mid is None or mid <= 0:
         return None
-    import statistics
-    rets = []
-    for i in range(1, window + 1):
-        r = math.log(daily_closes[-i] / daily_closes[-i - 1])
-        rets.append(r)
-    stdev = statistics.pstdev(rets)
-    return stdev * math.sqrt(252)
-    pass
+    return (ask - bid) / mid
 
-def iv_rank_from_history(hist: deque, current_iv: Optional[float]) -> Optional[float]:
-        if current_iv is None or not hist:
+def _quote_age_seconds(last_quote_ts: Optional[int]) -> Optional[float]:
+    """
+    Polygon often reports nanosecond timestamps. Accept seconds or ns.
+    """
+    if last_quote_ts is None:
         return None
-    xs = list(hist)
-    lo, hi = min(xs), max(xs)
-    if hi <= lo:
-        return 0.0
-    return (current_iv - lo) / (hi - lo)
-    pass
-
-async def build_features(client: httpx.AsyncClient, *, alert: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
-     res = snapshot.get("results") or {}
-    greeks = res.get("greeks") or {}
-    ua = res.get("underlying_asset") or {}
-    day = res.get("day") or {}
-    last_quote = res.get("last_quote") or {}
-    last_trade = res.get("last_trade") or {}
-
-    S = ua.get("price") or alert["underlying_price_from_alert"]
-    cur_iv = res.get("implied_volatility")
-    oi = int(res.get("open_interest") or 0)
-    vol = int(day.get("volume") or 0)
-
-    # NBBO & spread
-    bid = last_quote.get("bid_price")
-    ask = last_quote.get("ask_price")
-    mid = None
-    opt_spread_pct = None
-    if (bid is not None) and (ask is not None) and (bid > 0) and (ask > 0):
-        mid = (bid + ask) / 2.0
-        if mid > 0:
-            opt_spread_pct = (ask - bid) / mid
-    if mid is None:
-        mid = last_trade.get("price")
-
-    # Quote age
-    quote_ts_ns = last_quote.get("sip_timestamp") or last_quote.get("last_updated")
-    now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
-    quote_age_sec = None
-    if isinstance(quote_ts_ns, (int, float)) and quote_ts_ns > 0:
-        quote_age_sec = max(0, (now_ns - int(quote_ts_ns)) / 1e9)
-
-    # DTE + greeks
-    days_to_exp = dte(alert["expiry"])
-    delta = greeks.get("delta")
-    gamma = greeks.get("gamma")
-    theta = greeks.get("theta")
-    vega  = greeks.get("vega")
-
-    # Daily context (70 cal days)
-    to_day = datetime.now(timezone.utc).date()
-    frm_day = (to_day - timedelta(days=70)).isoformat()
-    to_iso = to_day.isoformat()
-    daily = await polygon_aggs(client, ticker=alert["symbol"], multiplier=1, timespan="day", frm=frm_day, to=to_iso, sort="asc")
-    atr = atr14(daily) if daily else None
-    closes = [b["c"] for b in daily] if daily else []
-    rv20 = realized_vol_annualized(closes, window=20) if closes else None
-
-    # Previous day H/L
-    prev_day_high = prev_day_low = None
-    if daily and len(daily) >= 2:
-        prev = daily[-2]
-        prev_day_high = prev.get("h")
-        prev_day_low  = prev.get("l")
-
-    # Intraday minute bars today (ET)
-    et_open = _et_time(9, 30)
-    et_close = _et_time(16, 0)
-    et_from = _et_time(4, 0)      # earliest premarket slice
-    et_to   = _et_time(23, 59)    # safety
-
-    intraday = await polygon_aggs(client, ticker=alert["symbol"], multiplier=1, timespan="minute",
-                                  frm=et_from.date().isoformat(), to=et_to.date().isoformat(), sort="asc", limit=5000)
-
-    # Premarket H/L (before 09:30 ET)
-    pm_high = pm_low = None
-    if intraday:
-        pm = [b for b in intraday if b.get("t") and (datetime.fromtimestamp(b["t"]/1000, tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York")) < et_open)]
-        if pm:
-            pm_high = max(b["h"] for b in pm)
-            pm_low  = min(b["l"] for b in pm)
-
-    # VWAP since regular session open (simple cumulative TP*V/ΣV)
-    vwap = None
-    if intraday:
-        reg = [b for b in intraday if b.get("t") and (et_open <= datetime.fromtimestamp(b["t"]/1000, tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York")) <= et_close)]
-        if reg:
-            num = 0.0
-            den = 0.0
-            for b in reg:
-                tp = (b["h"] + b["l"] + b["c"]) / 3.0
-                v  = float(b.get("v") or 0.0)
-                num += tp * v
-                den += v
-            if den > 0:
-                vwap = num / den
-
-    # 20d extremes for S/R headroom
-    high20 = max((b["h"] for b in daily[-20:]), default=None) if daily else None
-    low20  = min((b["l"] for b in daily[-20:]), default=None) if daily else None
-
-    sr_headroom_ok = None
-    if atr and S and high20 and low20:
-        if alert["side"] == "CALL":
-            sr_headroom_ok = (high20 - S) >= HEADROOM_MIN_R * atr
+    # Detect ns vs s
+    try:
+        # If it's too large, treat as ns
+        if last_quote_ts > 10_000_000_000:  # > year 2286 in seconds; clearly ns
+            ts_sec = last_quote_ts / 1_000_000_000.0
         else:
-            sr_headroom_ok = (S - low20) >= HEADROOM_MIN_R * atr
+            ts_sec = float(last_quote_ts)
+        return max(0.0, _utcnow().timestamp() - ts_sec)
+    except Exception:
+        return None
 
-    # MTF trend alignment (5m + 15m EMA9/21)
-    local_today = market_now().date()
-    frm_intraday = local_today.isoformat()
-    to_intraday  = (local_today + timedelta(days=1)).isoformat()
+def _dte(expiry_iso: Optional[str]) -> Optional[float]:
+    if not expiry_iso:
+        return None
+    try:
+        exp = date.fromisoformat(expiry_iso)
+        today = _utcnow().date()
+        return float((exp - today).days)
+    except Exception:
+        return None
 
-    def _closes(bars: List[Dict[str, Any]]) -> List[float]:
-        return [b["c"] for b in bars]
+def _expected_move_pct(iv: Optional[float], dte_days: Optional[float]) -> Optional[float]:
+    if iv is None or dte_days is None or dte_days < 0:
+        return None
+    # simple 1σ move (annualized IV) scaled by sqrt(time)
+    return iv * sqrt(dte_days / 365.0)
 
-    fivem   = await polygon_aggs(client, ticker=alert["symbol"], multiplier=5,  timespan="minute", frm=frm_intraday, to=to_intraday, sort="asc", limit=5000)
-    fifteen = await polygon_aggs(client, ticker=alert["symbol"], multiplier=15, timespan="minute", frm=frm_intraday, to=to_intraday, sort="asc", limit=5000)
+async def build_features(
+    client,  # httpx.AsyncClient (unused directly here but kept for future fetches)
+    alert: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Normalize Polygon option snapshot + alert context into the fields routes.py expects.
+    This is intentionally defensive: any missing field becomes None, and booleans are derived simply.
+    """
 
-    ema9_5  = ema(_closes(fivem), 9) if fivem else None
-    ema21_5 = ema(_closes(fivem), 21) if fivem else None
-    ema9_15 = ema(_closes(fifteen), 9) if fifteen else None
-    ema21_15= ema(_closes(fifteen), 21) if fifteen else None
+    # --- Parse snapshot (Polygon shape can vary; handle multiple shapes) ---
+    # Common shapes:
+    # snapshot.get("last_quote", {"bid":..., "ask":..., "timestamp":...})
+    # snapshot.get("greeks", {"delta":..., "gamma":..., "theta":..., "vega":...})
+    # snapshot.get("implied_volatility"), snapshot.get("open_interest"), snapshot.get("day", {"volume":...})
+    lq = snapshot.get("last_quote") or snapshot.get("last_quote_us") or {}
+    bid = _safe_float(lq.get("bid"))
+    ask = _safe_float(lq.get("ask"))
+    last_quote_ts = lq.get("timestamp") or lq.get("t")  # ns or sec
 
-    mtf_align = None
-    if all(v is not None for v in [ema9_5, ema21_5, ema9_15, ema21_15]):
-        if alert["side"] == "CALL":
-            mtf_align = (ema9_5 > ema21_5) and (ema9_15 > ema21_15)
-        else:
-            mtf_align = (ema9_5 < ema21_5) and (ema9_15 < ema21_15)
+    greeks = snapshot.get("greeks") or {}
+    delta = _safe_float(greeks.get("delta"))
+    gamma = _safe_float(greeks.get("gamma"))
+    theta = _safe_float(greeks.get("theta"))
+    vega  = _safe_float(greeks.get("vega"))
 
-    # EM vs Break-even (context)
-    em_1s = None
+    iv = _safe_float(snapshot.get("implied_volatility") or snapshot.get("iv"))
+    oi = snapshot.get("open_interest")
+    oi = int(oi) if isinstance(oi, (int, float)) and oi == int(oi) else _safe_float(oi)
+    vol = snapshot.get("day", {}).get("volume")
+    vol = int(vol) if isinstance(vol, (int, float)) and vol == int(vol) else _safe_float(vol)
+
+    mid = _mid(bid, ask)
+    spread_pct = _spread_pct(bid, ask, mid)
+    quote_age_sec = _quote_age_seconds(last_quote_ts)
+
+    # --- From alert context (our recommendation policy already stamped strike/expiry) ---
+    expiry_iso = alert.get("expiry")
+    dte = _dte(expiry_iso)
+    side = (alert.get("side") or "").upper()
+    ul_px = _safe_float(alert.get("underlying_price_from_alert"))
+
+    # --- Simple IV rank placeholder (0..1) if not provided elsewhere ---
+    # If you later compute IV rank historically, pass it through snapshot/features and override here.
+    iv_rank = snapshot.get("iv_rank")
+    iv_rank = _safe_float(iv_rank)
+    if iv_rank is None and iv is not None:
+        # Crude proxy: clamp IV to [0.05, 1.00] and normalize
+        iv_rank = max(0.0, min(1.0, (iv - 0.05) / (1.00 - 0.05)))
+
+    # --- RV20 placeholder (set None unless you fetch history) ---
+    rv20 = _safe_float(snapshot.get("rv20"))
+
+    # --- Expected move vs breakeven sanity (very rough heuristic) ---
+    em_pct = _expected_move_pct(iv, dte)
+    # Use mid as premium proxy; breakeven distance ≈ mid/ul (calls) or mid/ul (puts)
+    be_pct = None
+    if ul_px and mid:
+        be_pct = mid / ul_px
     em_vs_be_ok = None
-    if S and cur_iv is not None and days_to_exp is not None and days_to_exp >= 0:
-        em_1s = S * float(cur_iv) * math.sqrt(max(0.0, days_to_exp) / 365.0)
-        premium = mid or 0.0
-        if alert["side"] == "CALL":
-            be_price = alert["strike"] + premium
-            be_dist  = max(0.0, be_price - S)
-        else:
-            be_price = alert["strike"] - premium
-            be_dist  = max(0.0, S - be_price)
-        if be_dist == 0.0:
-            em_vs_be_ok = True
-        elif em_1s is not None:
-            em_vs_be_ok = (em_1s >= EM_VS_BE_RATIO_MIN * be_dist)
+    if em_pct is not None and be_pct is not None:
+        # If expected 1σ move covers breakeven within ~2 weeks, call it "ok"
+        em_vs_be_ok = em_pct >= (be_pct * 0.8)
 
-    # IV rank memory
-    sym = alert["symbol"]
-    if sym not in _IV_HISTORY:
-        _IV_HISTORY[sym] = deque(maxlen=IV_HISTORY_LEN)
-    if cur_iv is not None:
-        _IV_HISTORY[sym].append(float(cur_iv))
-    iv_rank = iv_rank_from_history(_IV_HISTORY[sym], cur_iv)
+    # --- Liquidity sanity checks / regime placeholders ---
+    # If you compute a real regime elsewhere, pass it through snapshot and override here.
+    regime_flag = snapshot.get("regime") or "trending"
 
-    # Market regime via SPY EMA trend
-    spy_daily = await polygon_aggs(client, ticker="SPY", multiplier=1, timespan="day", frm=frm_day, to=to_iso, sort="asc")
-    spy_close = [b["c"] for b in spy_daily] if spy_daily else []
-    spy_ema_fast = ema(spy_close, REGIME_TREND_EMA_FAST) if spy_close else None
-    spy_ema_slow = ema(spy_close, REGIME_TREND_EMA_SLOW) if spy_close else None
-    regime_flag = None
-    if (spy_ema_fast is not None) and (spy_ema_slow is not None):
-        regime_flag = "trending" if spy_ema_fast > spy_ema_slow else "choppy"
+    # Levels/VWAP placeholders (routes.py only displays them; leave None if you don't compute them elsewhere)
+    prev_day_high = _safe_float(snapshot.get("prev_day_high"))
+    prev_day_low  = _safe_float(snapshot.get("prev_day_low"))
+    premarket_high = _safe_float(snapshot.get("premarket_high"))
+    premarket_low  = _safe_float(snapshot.get("premarket_low"))
+    vwap = _safe_float(snapshot.get("vwap"))
+    vwap_dist = None
+    if vwap is not None and ul_px is not None and vwap > 0:
+        vwap_dist = (ul_px - vwap) / vwap
 
-    # Style presets
-    if TRADE_STYLE == "swing":
-        delta_min, delta_max = DELTA_MIN_SWING, DELTA_MAX_SWING
-        dte_min, dte_max     = DTE_MIN_SWING, DTE_MAX_SWING
-        risk_style           = "swing"
-        initial_stop_pct     = 0.30
-        tp_pct               = 0.60
-        trail_after_pct      = 0.40
-    else:
-        delta_min, delta_max = DELTA_MIN_INTRADAY, DELTA_MAX_INTRADAY
-        dte_min, dte_max     = DTE_MIN_INTRADAY, DTE_MAX_INTRADAY
-        risk_style           = "intraday"
-        initial_stop_pct     = 0.30
-        tp_pct               = 0.60
-        trail_after_pct      = 0.40
+    above_pdh = (ul_px is not None and prev_day_high is not None and ul_px > prev_day_high) or None
+    below_pdl = (ul_px is not None and prev_day_low  is not None and ul_px < prev_day_low) or None
+    above_pmh = (ul_px is not None and premarket_high is not None and ul_px > premarket_high) or None
+    below_pml = (ul_px is not None and premarket_low  is not None and ul_px < premarket_low) or None
 
-    # Relative position flags (helps LLM)
-    above_pdh = (S is not None and prev_day_high is not None and S > prev_day_high)
-    below_pdl = (S is not None and prev_day_low  is not None and S < prev_day_low)
-    above_pmh = (S is not None and pm_high is not None and S > pm_high) if pm_high is not None else None
-    below_pml = (S is not None and pm_low  is not None and S < pm_low)  if pm_low  is not None else None
-    vwap_dist = (S - vwap) if (S is not None and vwap is not None) else None
+    # MTF alignment & S/R headroom placeholders (replace with your real logic if available)
+    mtf_align = snapshot.get("mtf_align")
+    if mtf_align is None:
+        mtf_align = bool(above_pdh) if side == "CALL" else bool(below_pdl) if side == "PUT" else None
 
-    features = {
-        "S": S,
+    sr_headroom_ok = snapshot.get("sr_headroom_ok")
+    if sr_headroom_ok is None:
+        # crude: require spread sane and OI/Vol not terrible
+        sr_headroom_ok = (spread_pct is not None and spread_pct <= 0.25) and \
+                         ((oi or 0) >= 100 or (vol or 0) >= 100)
+
+    # Return the normalized feature dict
+    return {
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "option_spread_pct": spread_pct,
+        "quote_age_sec": quote_age_sec,
+
         "oi": oi,
         "vol": vol,
-        "iv": cur_iv,
-        "iv_rank": iv_rank,
-        "rv20": rv20,
-        "opt_bid": bid,
-        "opt_ask": ask,
-        "opt_mid": mid,
-        "option_spread_pct": opt_spread_pct,
-        "quote_age_sec": quote_age_sec,
+
         "delta": delta,
         "gamma": gamma,
         "theta": theta,
-        "vega":  vega,
-        "dte": days_to_exp,
-        "atr": atr,
-        "high20": high20,
-        "low20": low20,
+        "vega": vega,
+
+        "iv": iv,
+        "iv_rank": iv_rank,
+        "rv20": rv20,
+
+        "dte": dte,
+        "em_vs_be_ok": em_vs_be_ok,
+
+        "mtf_align": mtf_align,
+        "sr_headroom_ok": sr_headroom_ok,
+        "regime_flag": regime_flag,
+
         "prev_day_high": prev_day_high,
         "prev_day_low": prev_day_low,
-        "premarket_high": pm_high,
-        "premarket_low": pm_low,
+        "premarket_high": premarket_high,
+        "premarket_low": premarket_low,
+
         "vwap": vwap,
         "vwap_dist": vwap_dist,
+
         "above_pdh": above_pdh,
         "below_pdl": below_pdl,
         "above_pmh": above_pmh,
         "below_pml": below_pml,
-        "sr_headroom_ok": sr_headroom_ok,
-        "mtf_align": mtf_align,
-        "em_1s": em_1s,
-        "em_vs_be_ok": em_vs_be_ok,
-        "regime_flag": regime_flag,
-        "no_event_risk": True,
-        "risk_plan": {
-            "style": risk_style,
-            "initial_stop_pct": initial_stop_pct,
-            "take_profit_pct": tp_pct,
-            "trail_after_pct": trail_after_pct,
-        },
-        "bands": {
-            "delta_min": delta_min, "delta_max": delta_max,
-            "dte_min": dte_min, "dte_max": dte_max,
-        }
     }
-    return features
-    pass
