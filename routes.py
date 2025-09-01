@@ -68,16 +68,30 @@ def consume_llm(n: int = 1) -> None:
     _reset_quota_if_new_day()
     _llm_quota["used"] = int(_llm_quota.get("used", 0)) + n
 
+##from datetime import time as dt_time  # ensure this import exists at top
+
 def allowed_now_cdt() -> bool:
     """
-    Check if current CDT time is inside any configured window.
-    WINDOWS_CDT is expected like [(8,30,11,30), (14,0,15,0)] -> 08:30–11:30, 14:00–15:00.
+    Accepts WINDOWS_CDT as either:
+      - [(dt_time(..., tzinfo=CDT_TZ), dt_time(..., tzinfo=CDT_TZ)), ...]  OR
+      - [(8,30,11,30), (14,0,15,0)]
     """
-    now = market_now().time()
-    for (sh, sm, eh, em) in WINDOWS_CDT:
-        if (dt_time(sh, sm) <= now <= dt_time(eh, em)):
-            return True
+    now = market_now().time()  # aware time in CDT
+    for win in WINDOWS_CDT:
+        # Case 1: (start_time, end_time) as datetime.time objects
+        if isinstance(win, (tuple, list)) and len(win) == 2 \
+           and isinstance(win[0], dt_time) and isinstance(win[1], dt_time):
+            start, end = win
+            if start <= now <= end:
+                return True
+        # Case 2: (sh, sm, eh, em) as integers
+        elif isinstance(win, (tuple, list)) and len(win) == 4:
+            sh, sm, eh, em = win
+            if dt_time(sh, sm, tzinfo=CDT_TZ) <= now <= dt_time(eh, em, tzinfo=CDT_TZ):
+                return True
+        # Unknown format → ignore
     return False
+
 
 def round_strike_to_common_increment(val: float) -> float:
     """
