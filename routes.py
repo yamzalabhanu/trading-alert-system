@@ -344,7 +344,8 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
         raise HTTPException(status_code=502, detail=f"Upstream error in Polygon/features: {type(e).__name__}: {e}")
 
     # ---------- Decisioning / LLM / Telegram / IBKR ----------
-    in_window = allowed_now_cdt()
+   // in_window = allowed_now_cdt()
+    in_window = allowed_now_cdt() or bool(int(request.query_params.get("force", "1")))
     llm_ran = False
     llm_reason = ""
     tg_result = None
