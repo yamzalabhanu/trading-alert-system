@@ -313,6 +313,28 @@ def logs_today(limit: int = 50):
 async def run_daily_report():
     res = await _send_daily_report_now()
     return {"ok": True, "trigger": "manual", **res}
+@router.get("/net/debug")
+async def net_debug():
+    import socket, httpx, os
+    host = os.getenv("IBKR_HOST", "127.0.0.1")
+    port = int(os.getenv("IBKR_PORT", "7497"))
+    out_ip = None
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            out_ip = (await c.get("https://ifconfig.me/ip")).text.strip()
+    except Exception as e:
+        out_ip = f"fetch-failed: {e.__class__.__name__}"
+
+    can_connect = None
+    err = None
+    try:
+        s = socket.create_connection((host, port), timeout=3)
+        s.close()
+        can_connect = True
+    except Exception as e:
+        can_connect = False
+        err = f"{e.__class__.__name__}: {e}"
+    return {"ibkr_host": host, "ibkr_port": port, "egress_ip": out_ip, "connect_test": can_connect, "error": err}
 
 @router.get("/report/preview")
 def report_preview():
