@@ -1,109 +1,166 @@
 # llm_client.py
-import json
-from openai import OpenAI
-from config import OPENAI_API_KEY, OPENAI_MODEL
+# Compatible with openai>=1.0 (Responses API or Chat Completions).
+# Uses AsyncOpenAI so routes.py can `await analyze_with_openai(...)`.
 
-oai_client = OpenAI(api_key=OPENAI_API_KEY)
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Dict, Tuple
+
+from openai import AsyncOpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+def _iv_ctx(iv: float | None, iv_rank: float | None) -> str:
+    """
+    Classify IV context into 'low' / 'medium' / 'high' based on IV rank.
+    """
+    if iv_rank is None:
+        return "medium"
+    if iv_rank < 0.33:
+        return "low"
+    if iv_rank > 0.66:
+        return "high"
+    return "medium"
+
 
 def build_llm_prompt(alert: Dict[str, Any], f: Dict[str, Any]) -> str:
-        iv_rank = f.get("iv_rank")
-    iv_ctx = "low" if (iv_rank is not None and iv_rank < 0.33) else "high" if (iv_rank is not None and iv_rank > 0.66) else "medium"
-    rv_iv_spread = (
-        "rv>iv" if (f.get("rv20") and f.get("iv") and f["rv20"] > f["iv"]) else
-        "rv≈iv" if (f.get("rv20") and f.get("iv") and abs(f["rv20"] - f["iv"]) / max(1e-9, f["iv"]) <= 0.1) else
-        "rv<iv"
-    )
-    checklist_hint = {
-        "delta_band_ok": f.get("bands") and (f["bands"]["delta_min"] <= abs(float(f.get("delta") or 0)) <= f["bands"]["delta_max"]),
-        "dte_band_ok": (f["bands"]["dte_min"] <= f.get("dte", 0) <= f["bands"]["dte_max"]) if f.get("dte") is not None else False,
-        "iv_context": iv_ctx,
-        "rv_iv_spread": rv_iv_spread,
-        "em_vs_breakeven_ok": f.get("em_vs_be_ok") is True,
-        "mtf_trend_alignment": f.get("mtf_align") is True,
-        "sr_headroom_ok": f.get("sr_headroom_ok") is True,
-        "no_event_risk": True,
-        # New context flags
-        "above_pdh": f.get("above_pdh"),
-        "below_pdl": f.get("below_pdl"),
-        "above_pmh": f.get("above_pmh"),
-        "below_pml": f.get("below_pml"),
-        "vwap_dist": f.get("vwap_dist"),
+    """
+    Build a compact, JSON-friendly instruction for the LLM.
+    The model must choose one of: BUY / SKIP / WAIT.
+    """
+    # derive a few readable flags
+    iv_rank = f.get("iv_rank")
+    iv = f.get("iv")
+    iv_context = _iv_ctx(iv, iv_rank)
+
+    # short, clear facts block
+    facts = {
+        "symbol": alert.get("symbol"),
+        "side": alert.get("side"),
+        "underlying_from_alert": alert.get("underlying_price_from_alert"),
+        "reco_strike": alert.get("strike"),
+        "reco_expiry": alert.get("expiry"),
+        "dte": f.get("dte"),
+        "greeks": {
+            "delta": f.get("delta"),
+            "gamma": f.get("gamma"),
+            "theta": f.get("theta"),
+            "vega": f.get("vega"),
+        },
+        "nbbo": {
+            "bid": f.get("bid"),
+            "ask": f.get("ask"),
+            "mid": f.get("mid"),
+            "spread_pct": f.get("option_spread_pct"),
+            "quote_age_sec": f.get("quote_age_sec"),
+        },
+        "liquidity": {"oi": f.get("oi"), "vol": f.get("vol")},
+        "volatility": {"iv": iv, "iv_rank": iv_rank, "iv_context": iv_context, "rv20": f.get("rv20")},
+        "edges": {
+            "em_vs_be_ok": f.get("em_vs_be_ok"),
+            "mtf_align": f.get("mtf_align"),
+            "sr_headroom_ok": f.get("sr_headroom_ok"),
+            "regime": f.get("regime_flag"),
+        },
+        "levels": {
+            "prev_day_high": f.get("prev_day_high"),
+            "prev_day_low": f.get("prev_day_low"),
+            "premarket_high": f.get("premarket_high"),
+            "premarket_low": f.get("premarket_low"),
+            "above_pdh": f.get("above_pdh"),
+            "below_pdl": f.get("below_pdl"),
+            "above_pmh": f.get("above_pmh"),
+            "below_pml": f.get("below_pml"),
+            "vwap": f.get("vwap"),
+            "vwap_dist": f.get("vwap_dist"),
+        },
     }
-    lines = [
-        f"Alert: {alert['side']} {alert['symbol']} strike {alert['strike']} exp {alert['expiry']} (~{f.get('dte')} DTE) at underlying ≈ {f.get('S')}",
-        f"Trade style: {f['risk_plan']['style']}",
-        "Snapshot:",
-        f"  IV: {f.get('iv')}",
-        f"  IV_rank: {iv_rank}",
-        f"  OI: {f.get('oi')}  Vol: {f.get('vol')}",
-        f"  NBBO: bid={f.get('opt_bid')} ask={f.get('opt_ask')} mid={f.get('opt_mid')} spread%={f.get('option_spread_pct')}",
-        f"  Quote age (s): {f.get('quote_age_sec')}",
-        f"  Greeks: delta={f.get('delta')} gamma={f.get('gamma')} theta={f.get('theta')} vega={f.get('vega')}",
-        f"  EM_1s: {f.get('em_1s')}  EM_vs_BE_ok: {f.get('em_vs_be_ok')}",
-        f"  MTF align: {f.get('mtf_align')}  S/R ok: {f.get('sr_headroom_ok')}",
-        f"  Regime: {f.get('regime_flag')}  ATR(14): {f.get('atr')}",
-        "Levels:",
-        f"  PDH={f.get('prev_day_high')}  PDL={f.get('prev_day_low')}  PMH={f.get('premarket_high')}  PML={f.get('premarket_low')}",
-        f"  VWAP={f.get('vwap')}  VWAPΔ={f.get('vwap_dist')}",
-        f"Checklist: {json.dumps(checklist_hint)}",
-        "Return strict JSON per schema."
-    ]
-    return "\n".join(lines)
-    pass
 
-async def analyze_with_openai(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
-        system = (
-        "You are a disciplined options trading analyst. Use the provided snapshot & checklist.\n"
-        "Respond with STRICT JSON:\n"
-        "{\n"
-        '  "decision": "buy|wait|skip",\n'
-        '  "confidence": 0..1,\n'
-        '  "reason": "<=2 sentences>",\n'
-        '  "checklist": {\n'
-        '    "delta_band_ok": true/false,\n'
-        '    "dte_band_ok": true/false,\n'
-        '    "iv_context": "low|medium|high",\n'
-        '    "rv_iv_spread": "rv>iv|rv≈iv|rv<iv",\n'
-        '    "em_vs_breakeven_ok": true/false,\n'
-        '    "mtf_trend_alignment": true/false,\n'
-        '    "sr_headroom_ok": true/false,\n'
-        '    "no_event_risk": true,\n'
-        '    "above_pdh": true/false|null,\n'
-        '    "below_pdl": true/false|null,\n'
-        '    "above_pmh": true/false|null,\n'
-        '    "below_pml": true/false|null,\n'
-        '    "vwap_dist": number|null\n'
-        "  },\n"
-        '  "risk_plan": {"style":"intraday|swing","initial_stop_pct":0..1,"take_profit_pct":0..1,"trail_after_pct":0..1},\n'
-        '  "ev_estimate": {"win_prob":0..1,"avg_win_pct":0..5,"avg_loss_pct":0..5,"expected_value_pct":-5..5}\n'
-        "}\n"
-        "Do not refuse. Always return the JSON object."
+    # instruction: **must** return strict JSON so our parser is reliable
+    instruction = (
+        "You are an options-trading assistant. Decide whether to BUY, SKIP, or WAIT on the suggested contract.\n"
+        "- BUY only if the setup quality is good (liquidity ok, spread reasonable, alignment ok, edge present).\n"
+        "- SKIP if risk is poor or data quality/liquidity is bad.\n"
+        "- WAIT if unclear and more confirmation is needed.\n\n"
+        "Return strict JSON ONLY with keys: decision, confidence, reason, checklist, ev_estimate.\n"
+        "decision ∈ {buy, skip, wait}; confidence ∈ [0,1].\n"
+        "checklist should include booleans like delta_band_ok, dte_band_ok, iv_context, rv_iv_spread, em_vs_breakeven_ok,\n"
+        "mtf_trend_alignment, sr_headroom_ok, no_event_risk.\n"
+        "ev_estimate should include win_prob, avg_win_pct, avg_loss_pct, expected_value_pct.\n"
     )
-    prompt = build_llm_prompt(alert, f)
-    try:
-        resp = oai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": prompt}],
-            temperature=0.1,
-        )
-        out = json.loads(resp.choices[0].message.content)
-    except Exception as e:
-        out = {
-            "decision": "wait",
-            "confidence": 0.3,
-            "reason": f"LLM call failed: {type(e).__name__}. Returning neutral stance.",
-            "checklist": {
-                "delta_band_ok": False, "dte_band_ok": False,
-                "iv_context": "medium", "rv_iv_spread": "rv≈iv",
-                "em_vs_breakeven_ok": False, "mtf_trend_alignment": False,
-                "sr_headroom_ok": False, "no_event_risk": True,
-                "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None, "vwap_dist": None
-            },
-            "risk_plan": f.get("risk_plan", {}),
-            "ev_estimate": {"win_prob": 0.5, "avg_win_pct": 0.5, "avg_loss_pct": 0.5, "expected_value_pct": 0.0}
-        }
-    return out
 
-    pass
+    prompt = {
+        "role": "user",
+        "content": instruction + "\nFacts:\n" + json.dumps(facts, separators=(",", ":"), ensure_ascii=False),
+    }
+    return json.dumps(prompt, ensure_ascii=False)
+
+
+async def _call_openai_for_json(prompt_payload: str) -> Dict[str, Any]:
+    """
+    Calls OpenAI; returns a parsed JSON dict or raises.
+    Uses Chat Completions for maximum compatibility with openai>=1.0.
+    """
+    # Convert back to the messages list Chat Completions expects.
+    user_msg = json.loads(prompt_payload)
+    messages = [user_msg] if isinstance(user_msg, dict) else [{"role": "user", "content": prompt_payload}]
+
+    resp = await _client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=400,
+        response_format={"type": "json_object"},
+    )
+    content = resp.choices[0].message.content or "{}"
+    return json.loads(content)
+
+
+def _fallback_wait(reason: str) -> Dict[str, Any]:
+    return {
+        "decision": "wait",
+        "confidence": 0.0,
+        "reason": reason,
+        "checklist": {},
+        "ev_estimate": {},
+    }
+
+
+async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Orchestrates prompt build + OpenAI call and returns normalized structure.
+    """
+    try:
+        prompt_payload = build_llm_prompt(alert, features)
+    except Exception as e:
+        return _fallback_wait(f"Prompt build failed: {e}")
+
+    try:
+        out = await _call_openai_for_json(prompt_payload)
+        # Normalize & guard fields
+        decision = str(out.get("decision", "wait")).lower()
+        if decision not in {"buy", "skip", "wait"}:
+            decision = "wait"
+
+        confidence = out.get("confidence")
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.0
+
+        return {
+            "decision": decision,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": out.get("reason", ""),
+            "checklist": out.get("checklist", {}),
+            "ev_estimate": out.get("ev_estimate", {}),
+        }
+    except Exception as e:
+        # Keep the app resilient if OpenAI is unreachable or responds with a schema error.
+        return _fallback_wait(f"LLM call failed: {e}")
