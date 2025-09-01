@@ -1,95 +1,112 @@
 # scoring.py
+from __future__ import annotations
+
 from typing import Dict, Any, Optional
 
-def _bool_score(v: Optional[bool], w_true: float = 1.0, w_false: float = -0.5) -> float:
-       if v is True:
-        return w_true
-    if v is False:
-        return w_false
-    return 0.0  # unknown / None
-    pass
 
-def compute_decision_score(f: Dict[str, Any], llm: Dict[str, Any]) -> float:
-      """
-    Blend of heuristic feature checks and LLM confidence.
-    Scale returns 0..100.
-    """
-    checklist = llm.get("checklist", {}) if isinstance(llm, dict) else {}
-    pts = 0.0
-    # Core confirmations
-    pts += _bool_score(checklist.get("mtf_trend_alignment"), 8, -5)
-    pts += _bool_score(checklist.get("sr_headroom_ok"),       6, -4)
-    pts += _bool_score(checklist.get("em_vs_breakeven_ok"),   6, -6)
-    pts += _bool_score(checklist.get("delta_band_ok"),        5, -3)
-    pts += _bool_score(checklist.get("dte_band_ok"),          4, -6)
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
 
-    # Levels & VWAP context
-    pts += _bool_score(checklist.get("above_pdh"), 3, -1)
-    pts += _bool_score(checklist.get("below_pdl"), 3, -1)
-    pts += _bool_score(checklist.get("above_pmh"), 2, -1)
-    pts += _bool_score(checklist.get("below_pml"), 2, -1)
 
-    # Spread & liquidity mild penalty
-    spread = f.get("option_spread_pct")
-    if isinstance(spread, (int, float)):
-        if spread <= 0.08:  # tight
-            pts += 4
-        elif spread <= 0.15:
-            pts += 1
-        else:
-            pts -= 4
-
-    # OI/Vol sanity
-    oi = f.get("oi") or 0
-    vol = f.get("vol") or 0
-    if oi >= 500 and vol >= 250:
-        pts += 4
-    elif oi >= 200:
-        pts += 2
-    else:
-        pts -= 2
-
-    # Regime bonus if trending
-    if f.get("regime_flag") == "trending":
-        pts += 2
-
-    # IV context preference: medium/low often friendlier for long premium
-    iv_ctx = checklist.get("iv_context")
-    if iv_ctx == "low":
-        pts += 3
-    elif iv_ctx == "medium":
-        pts += 1
-    elif iv_ctx == "high":
-        pts -= 2
-
-    # LLM confidence weight
+def _nz_num(v: Optional[float]) -> Optional[float]:
     try:
-        conf = float(llm.get("confidence", 0.0))
+        return float(v)
     except Exception:
-        conf = 0.0
-    pts += conf * 20.0  # up to +20
-
-    # Clamp and rescale to ~0..100
-    pts = max(0.0, min(100.0, 50.0 + pts))  # center 50, allow +/- 50 swing
-    return round(pts, 1)
-    pass
-
-def map_score_to_rating(score: float, llm_decision: str) -> Optional[str]:
-       """
-    Convert numeric score + LLM decision to a graded recommendation.
-    Only defined for buy decisions.
-    """
-    if str(llm_decision).lower() != "buy":
         return None
-    if score >= 80:
-        return "Strong Buy"
-    if score >= 60:
-        return "Moderate Buy"
-    if score >= 50:
-        return "Cautious Buy"
+
+
+def _bool01(v: Any) -> float:
+    # Treat None/False as 0, True as 1
+    return 1.0 if v is True else 0.0
+
+
+def _delta_band_ok(side: str, delta: Optional[float]) -> Optional[bool]:
+    if delta is None:
+        return None
+    side = (side or "").upper()
+    if side == "CALL":
+        return 0.30 <= delta <= 0.60
+    if side == "PUT":
+        return -0.60 <= delta <= -0.30
     return None
 
-# =======================
-# Output formatting
-# =======================
-    pass
+
+def _dte_band_ok(dte: Optional[float]) -> Optional[bool]:
+    if dte is None:
+        return None
+    return 7.0 <= dte <= 21.0
+
+
+def compute_decision_score(features: Dict[str, Any], llm: Dict[str, Any]) -> float:
+    """
+    Heuristic 0..1 score for BUY quality.
+    Uses only 'features' (Polygon-derived) + a few simple rules.
+    """
+    oi = _nz_num(features.get("oi"))            # open interest (contracts)
+    vol = _nz_num(features.get("vol"))          # day volume (contracts)
+    spr = _nz_num(features.get("option_spread_pct"))
+    qage = _nz_num(features.get("quote_age_sec"))
+    delta = _nz_num(features.get("delta"))
+    dte = _nz_num(features.get("dte"))
+    iv_rank = _nz_num(features.get("iv_rank"))
+    side = str(llm.get("side") or features.get("side") or "").upper()
+
+    # Subscores (each 0..1), with weights summing ~1.0
+    score = 0.0
+
+    # Liquidity: OI and VOL (0.30 total)
+    if oi is not None:
+        score += _clamp01(oi / 1000.0) * 0.15
+    if vol is not None:
+        score += _clamp01(vol / 1000.0) * 0.15
+
+    # Spread tightness (0.15): 0% is perfect, >=30% is bad
+    if spr is not None:
+        score += (1.0 - _clamp01(spr / 0.30)) * 0.15
+
+    # Quote freshness (0.05): 0s is perfect, >=60s is stale
+    if qage is not None:
+        score += (1.0 - _clamp01(qage / 60.0)) * 0.05
+
+    # Greeks delta band (0.10)
+    d_ok = _delta_band_ok(side, delta)
+    if d_ok is not None:
+        score += _bool01(d_ok) * 0.10
+
+    # DTE band (0.10): prefer ~1–3 weeks
+    dte_ok = _dte_band_ok(dte)
+    if dte_ok is not None:
+        score += _bool01(dte_ok) * 0.10
+
+    # Expected-move vs breakeven (0.10)
+    score += _bool01(features.get("em_vs_be_ok")) * 0.10
+
+    # Alignment (0.10)
+    score += _bool01(features.get("mtf_align")) * 0.10
+
+    # S/R headroom (0.10)
+    score += _bool01(features.get("sr_headroom_ok")) * 0.10
+
+    # IV rank (0.05): prefer mid regime ~[0.33, 0.66]
+    if iv_rank is not None:
+        iv_mid = 1.0 if 0.33 <= iv_rank <= 0.66 else 0.0
+        score += iv_mid * 0.05
+
+    return _clamp01(score)
+
+
+def map_score_to_rating(score: Optional[float], decision: Optional[str]) -> Optional[str]:
+    """
+    Map score to a label but only if the LLM (or system) decided to BUY.
+    """
+    if score is None:
+        return None
+    if str(decision or "").lower() != "buy":
+        return None
+    if score >= 0.75:
+        return "Strong Buy"
+    if score >= 0.55:
+        return "Moderate Buy"
+    if score >= 0.40:
+        return "Cautious Buy"
+    return "Cautious Buy"  # still a buy, but weak edge
