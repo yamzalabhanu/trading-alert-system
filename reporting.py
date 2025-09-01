@@ -1,123 +1,121 @@
 # reporting.py
-import asyncio
-import contextlib
-from datetime import datetime, timezone, date
-from typing import List, Dict, Any
-from collections import Counter
-from config import MARKET_TZ
-from telegram_client import send_telegram
+from __future__ import annotations
 
-# Global state for decisions log
+from typing import List, Dict, Any
+from datetime import datetime
+from config import CDT_TZ
+from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+# Public log the rest of the app can append to
 _DECISIONS_LOG: List[Dict[str, Any]] = []
 
-def _format_contract_lines(entries: List[Dict[str, Any]]) -> List[str]:
-        """One line per processed alert with contract + key features and LLM outcome."""
-    lines = []
-    for e in entries:
-        sym   = e.get("symbol")
-        side  = e.get("side")
-        ct    = e.get("option_ticker") or "—"
-        f     = e.get("features", {})
-        llm   = e.get("llm", {})
-        dte_v = f.get("dte")
-        delta = f.get("delta")
-        iv    = f.get("iv")
-        mid   = f.get("opt_mid")
-        spr   = f.get("spread_pct")   # fraction, e.g., 0.12
-        oi    = f.get("oi")
-        vol   = f.get("vol")
-        dec   = e.get("decision_final")
-        conf  = llm.get("confidence")
 
-        line = (
-            f"- {sym} {side} | {ct} | "
-            f"DTE={dte_v if dte_v is not None else '—'}  "
-            f"Δ={_fmt(delta)}  IV={_fmt(iv)}  mid={_fmt(mid)}  "
-            f"spread={_fmt_pct(spr)}  OI={_fmt(oi)}  Vol={_fmt(vol)}  "
-            f"→ {dec.upper() if dec else '—'} (conf={_fmt(conf)})"
-        )
-        lines.append(line)
-    return lines
+def _format_contract_line(e: Dict[str, Any]) -> str:
+    sym = e.get("symbol", "?")
+    side = e.get("side", "?")
+    otkr = e.get("option_ticker") or "—"
+    path = e.get("decision_path") or "n/a"
+    fin = e.get("decision_final") or "n/a"
+    fz = e.get("features") or {}
+    ivr = fz.get("iv_rank")
+    oi = fz.get("oi")
+    vol = fz.get("vol")
+    spr = fz.get("spread_pct") or fz.get("option_spread_pct")
+    dte = fz.get("dte")
 
-    pass
+    bits = [f"{sym} {side}", f"{otkr}", f"→ {fin} [{path}]"]
+    extras = []
+    if dte is not None:
+        extras.append(f"DTE:{dte}")
+    if ivr is not None:
+        extras.append(f"IVr:{round(ivr,3)}")
+    if oi is not None:
+        extras.append(f"OI:{oi}")
+    if vol is not None:
+        extras.append(f"Vol:{vol}")
+    if spr is not None:
+        extras.append(f"Spr%:{round(spr,3)}")
+    if extras:
+        bits.append("(" + ", ".join(map(str, extras)) + ")")
+    return " ".join(map(str, bits))
+
 
 def _chunk_lines_for_telegram(lines: List[str], prefix: str = "", max_chars: int = 3500) -> List[str]:
-      """Chunk many lines into multiple messages under max_chars (Telegram hard limit ~4096)."""
-    chunks = []
-    cur = prefix.strip() + ("\n" if prefix else "")
-    for ln in lines:
-        add_len = (1 if cur else 0) + len(ln)
-        if len(cur) + add_len > max_chars:
-            if cur:
-                chunks.append(cur)
-            cur = ln
-        else:
-            cur = (cur + ("\n" if cur and not cur.endswith("\n") else "")) + ln
-    if cur:
-        chunks.append(cur)
+    """
+    Telegram has a ~4096 char message limit. We keep a safe margin.
+    Returns a list of message chunks (each is a string).
+    """
+    chunks: List[str] = []
+    current = prefix.strip()
+    if current:
+        current += "\n"
+
+    for line in lines:
+        line = str(line)
+        # +1 for newline if we add this line
+        if len(current) + len(line) + 1 > max_chars:
+            if current.strip():
+                chunks.append(current.rstrip())
+            current = ""
+        current += line + "\n"
+
+    if current.strip():
+        chunks.append(current.rstrip())
     return chunks
-    pass
 
-def _summarize_day_for_report(local_date: date) -> Dict[str, Any]:
-        entries = [e for e in _DECISIONS_LOG if e["timestamp_local"].date() == local_date]
-    total_alerts = len(entries)
-    llm_runs = sum(1 for e in entries if e["llm"]["ran"])
-    llm_skips = total_alerts - llm_runs
-    buys = sum(1 for e in entries if e["decision_final"] == "buy")
-    skips = total_alerts - buys
-    avg_conf = (sum(float(e["llm"].get("confidence") or 0.0) for e in entries if e["llm"]["ran"]) / llm_runs) if llm_runs else 0.0
-    by_symbol = Counter((e["symbol"] for e in entries))
-    top = ", ".join(f"{sym}({cnt})" for sym, cnt in by_symbol.most_common(5)) or "—"
-    by_outcome = Counter((e["decision_path"] for e in entries))
-    quota = llm_quota_snapshot()
 
-    header = f"📊 Daily Report — {local_date.isoformat()} ({MARKET_TZ})"
-    body = [
-        f"Alerts: {total_alerts} | LLM ran: {llm_runs} | skips: {llm_skips}",
-        f"Decisions — BUY: {buys} | SKIP: {skips}",
-        f"Avg LLM confidence (when ran): {avg_conf:.2f}",
-        f"Top tickers: {top}",
-        f"Paths: {dict(by_outcome)}",
-        "",
-        f"Quota used (tracked only): {quota['used']}/{quota['max']} (remaining {quota['remaining']})",
-        "",
-        "⚠️ Educational demo; not financial advice."
-    ]
-    header_text = header + "\n" + "\n".join(body)
+def _summarize_day_for_report(day_date) -> Dict[str, Any]:
+    """
+    Build a simple daily summary from _DECISIONS_LOG for the given local date (CDT).
+    Returns: {header, count, contracts:[...]}
+    """
+    day_items = []
+    for e in _DECISIONS_LOG:
+        ts = e.get("timestamp_local")
+        if isinstance(ts, datetime) and ts.astimezone(CDT_TZ).date() == day_date:
+            day_items.append(e)
 
-    contract_lines = _format_contract_lines(entries)
-    return {"header": header_text, "contracts": contract_lines, "count": total_alerts}
-    pass
+    # Sort newest first
+    day_items.sort(key=lambda x: x.get("timestamp_local") or datetime.now(CDT_TZ), reverse=True)
+
+    count = len(day_items)
+    header = f"📊 Daily Report — {day_date.isoformat()} (CDT) — {count} decisions"
+    contracts = [_format_contract_line(e) for e in day_items]
+    return {"header": header, "count": count, "contracts": contracts}
+
 
 async def _send_daily_report_now() -> Dict[str, Any]:
-    today_local = market_now().date()
+    """
+    Compose today's report (CDT) and send it to Telegram if configured.
+    Returns metadata about what would/were sent.
+    """
+    today_local = datetime.now(CDT_TZ).date()
     rep = _summarize_day_for_report(today_local)
+    chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
 
-    sent = []
-    first = await send_telegram(rep["header"])
-    sent.append(first)
+    sent = 0
+    results: List[Dict[str, Any]] = []
 
-    if rep["contracts"]:
-        chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
-        for msg in chunks:
-            sent.append(await send_telegram(msg))
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        # Send header first, then the chunks
+        hres = await send_telegram(rep["header"])
+        results.append(hres or {"note": "not_configured"})
+        sent += 1 if hres and not hres.get("error") else 0
 
-    return {"ok": True, "sent": any(bool(x) for x in sent), "result": sent}
-    pass
+        for c in chunks:
+            r = await send_telegram(c)
+            results.append(r or {"note": "not_configured"})
+            sent += 1 if r and not r.get("error") else 0
+    else:
+        # Not configured — return what we'd send
+        results.append({"note": "telegram_not_configured"})
 
-async def _daily_report_scheduler():
-      while True:
-        now_utc = datetime.now(timezone.utc)
-        next_utc = _next_report_dt_utc(now_utc)
-        sleep_s = max(1, int((next_utc - now_utc).total_seconds()))
-        try:
-            await asyncio.sleep(sleep_s)
-            await _send_daily_report_now()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            await asyncio.sleep(1)
-    pass
-
-async def send_daily_report():
-    return await _send_daily_report_now()
+    return {
+        "date": str(today_local),
+        "count": rep["count"],
+        "chunks": len(chunks),
+        "sent": sent,
+        "preview_header": rep["header"],
+        "preview_first_chunk": (chunks[0] if chunks else ""),
+        "results": results,
+    }
