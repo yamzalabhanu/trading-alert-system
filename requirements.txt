@@ -13,3 +13,5 @@ numpy
 micropip
 openai
 router
+ib-insync>=0.9.86
+
