@@ -9,20 +9,19 @@ import re
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone, timedelta, date, time as dt_time
 
-
+from ibkr_client import place_recommended_option_order
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # optional, for checks
-
 
 from config import (
     COOLDOWN_SECONDS,
     CDT_TZ,
-    WINDOWS_CDT,          # e.g. [(8,30,11,30), (14,0,15,0)] in local CDT
-    MAX_LLM_PER_DAY,      # make sure this exists in config; default in your app
+    WINDOWS_CDT,          # e.g. [(dt_time, dt_time)] or [(8,30,11,30)]
+    MAX_LLM_PER_DAY,
 )
 from models import Alert, WebhookResponse
 from polygon_client import list_contracts_for_expiry, get_option_snapshot
-from llm_client import analyze_with_openai, build_llm_prompt
+from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
@@ -33,6 +32,13 @@ router = APIRouter()
 # ========== Global state ==========
 _llm_quota: Dict[str, Any] = {"date": None, "used": 0}
 _COOLDOWN: Dict[Tuple[str, str], datetime] = {}
+
+# --- IBKR toggles (env or query param) ---
+IBKR_ENABLED = os.getenv("IBKR_ENABLED", "0") == "1"  # set to 1 in env to enable by default
+IBKR_DEFAULT_QTY = int(os.getenv("IBKR_DEFAULT_QTY", "1"))
+IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()       # e.g., DAY, GTC
+IBKR_ORDER_MODE = os.getenv("IBKR_ORDER_MODE", "auto").lower()   # auto | market | limit
+IBKR_USE_MID_AS_LIMIT = os.getenv("IBKR_USE_MID_AS_LIMIT", "1") == "1"
 
 # ========== Regex patterns ==========
 ALERT_RE_WITH_EXP = re.compile(
@@ -68,8 +74,6 @@ def consume_llm(n: int = 1) -> None:
     _reset_quota_if_new_day()
     _llm_quota["used"] = int(_llm_quota.get("used", 0)) + n
 
-##from datetime import time as dt_time  # ensure this import exists at top
-
 def allowed_now_cdt() -> bool:
     """
     Accepts WINDOWS_CDT as either:
@@ -85,13 +89,12 @@ def allowed_now_cdt() -> bool:
             if start <= now <= end:
                 return True
         # Case 2: (sh, sm, eh, em) as integers
-        elif isinstance(win, (tuple, list)) and len(win) == 4:
+        elif isinstance(win, (tuple, list)) and len(win) == 4 and all(isinstance(x, int) for x in win):
             sh, sm, eh, em = win
             if dt_time(sh, sm, tzinfo=CDT_TZ) <= now <= dt_time(eh, em, tzinfo=CDT_TZ):
                 return True
         # Unknown format → ignore
     return False
-
 
 def round_strike_to_common_increment(val: float) -> float:
     """
@@ -202,6 +205,21 @@ def compose_telegram_text(
         scoreline = ""
     return "\n".join([header, contract, "", snap, decision, reason, scoreline]).strip()
 
+def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
+    try:
+        return {
+            "ok": getattr(res, "ok", False),
+            "order_id": getattr(res, "order_id", None),
+            "status": getattr(res, "status", None),
+            "filled": getattr(res, "filled", None),
+            "remaining": getattr(res, "remaining", None),
+            "avg_fill_price": getattr(res, "avg_fill_price", None),
+            "error": getattr(res, "error", None),
+            "raw": getattr(res, "raw", None),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}"}
+
 # Async wrappers for polygon_client (keeping your current call style)
 async def polygon_list_contracts_for_expiry(
     client: httpx.AsyncClient,
@@ -231,8 +249,6 @@ def quota():
 
 @router.get("/config")
 def get_config():
-    # If you have an _active_config_dict elsewhere, import and return it here.
-    # To avoid a NameError, we return a minimal snapshot from config.
     cfg = {
         "COOLDOWN_SECONDS": COOLDOWN_SECONDS,
         "WINDOWS_CDT": WINDOWS_CDT,
@@ -245,8 +261,8 @@ def get_config():
 def logs_today(limit: int = 50):
     limit = max(1, min(int(limit), 500))
     today_local = market_now().date()
-    # Filter today's logs (assumes _DECISIONS_LOG entries have 'timestamp_local' as datetime)
-    todays = [x for x in reversed(_DECISIONS_LOG) if isinstance(x.get("timestamp_local"), datetime) and x["timestamp_local"].date() == today_local]
+    todays = [x for x in reversed(_DECISIONS_LOG)
+              if isinstance(x.get("timestamp_local"), datetime) and x["timestamp_local"].date() == today_local]
     return {"ok": True, "count": len(todays[:limit]), "items": todays[:limit]}
 
 @router.post("/run/daily_report")
@@ -263,13 +279,13 @@ def report_preview():
 
 @router.post("/webhook", response_class=JSONResponse)
 @router.post("/webhook/tradingview", response_class=JSONResponse)
-async def webhook_tradingview(request: Request, offline: int = Query(default=0)):
+async def webhook_tradingview(request: Request, offline: int = Query(default=0), ib: int = Query(default=0)):
     payload = await _get_alert_text(request)
     if not payload:
         raise HTTPException(status_code=400, detail="Empty alert payload")
     alert = parse_alert_text(payload)
 
-    # === Recommendation policy (unchanged) ===
+    # === Recommendation policy ===
     ul_px = float(alert["underlying_price_from_alert"])
     raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
     desired_strike = round_strike_to_common_increment(raw_reco_strike)
@@ -281,11 +297,12 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0))
     target_expiry = target_expiry_date.isoformat()
 
     option_ticker = "OFFLINE-TICKER"
-    f = {}
+    f: Dict[str, Any] = {}
 
+    # ---------- Data prep (Polygon/features) ----------
     try:
         if offline or not POLYGON_API_KEY:
-            # ---- OFFLINE MODE: skip Polygon, fabricate minimal features ----
+            # OFFLINE MODE: fabricate minimal features
             f = {
                 "bid": None, "ask": None, "mid": None,
                 "option_spread_pct": None, "quote_age_sec": None,
@@ -301,7 +318,7 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0))
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # ---- ONLINE MODE: real Polygon calls ----
+            # ONLINE MODE: real Polygon calls
             async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
                 contracts = await polygon_list_contracts_for_expiry(
                     client, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
@@ -324,12 +341,9 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0))
     except HTTPException:
         raise
     except Exception as e:
-        # Make it a clear 502 instead of a generic 500
         raise HTTPException(status_code=502, detail=f"Upstream error in Polygon/features: {type(e).__name__}: {e}")
 
-    # ... keep the rest of the function exactly as we already have ...
-
-
+    # ---------- Decisioning / LLM / Telegram / IBKR ----------
     in_window = allowed_now_cdt()
     llm_ran = False
     llm_reason = ""
@@ -346,6 +360,9 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0))
         "ev_estimate": {}
     }
 
+    ib_attempted = False
+    ib_result_obj: Optional[Any] = None
+
     if in_window:
         llm = await analyze_with_openai(alert, f)
         consume_llm()
@@ -356,6 +373,7 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0))
         rating = map_score_to_rating(score, llm.get("decision"))
         decision_path = f"llm.{decision_final}"
 
+        # Telegram
         tg_text = compose_telegram_text(
             alert={**alert, "strike": desired_strike, "expiry": target_expiry},
             option_ticker=option_ticker,
@@ -368,8 +386,46 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0))
         )
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             tg_result = await send_telegram(tg_text)
+
+        # IBKR optional placement (paper)
+        try:
+            do_ib = (ib == 1) or IBKR_ENABLED  # query param wins OR env default
+            if decision_final == "buy" and do_ib:
+                ib_attempted = True
+
+                # Decide order style
+                #   auto: use limit @ mid if available (and IBKR_USE_MID_AS_LIMIT=1), else market
+                #   limit: always limit; if mid missing -> market
+                #   market: always market
+                use_market = False
+                mode = IBKR_ORDER_MODE
+                mid = f.get("mid")
+
+                if mode == "market":
+                    use_market = True
+                elif mode == "limit":
+                    use_market = (mid is None)
+                else:  # auto
+                    use_market = not (IBKR_USE_MID_AS_LIMIT and (mid is not None))
+
+                limit_px = None if use_market else float(mid)
+
+                ib_result_obj = await place_recommended_option_order(
+                    symbol=alert["symbol"],
+                    side=alert["side"],                # "CALL" or "PUT"
+                    strike=float(desired_strike),     # recommended strike
+                    expiry_iso=target_expiry,         # two-weeks Friday rule
+                    quantity=int(os.getenv("IBKR_DEFAULT_QTY", str(IBKR_DEFAULT_QTY))),
+                    limit_price=limit_px,              # None => market
+                    action="BUY",
+                    tif=IBKR_TIF,
+                )
+        except Exception as e:
+            ib_result_obj = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     else:
         llm_reason = "Outside processing windows (Allowed: 08:30–11:30 & 14:00–15:00 CDT). LLM + Telegram skipped."
+        ib_attempted = False
+        ib_result_obj = None
 
     # Cooldown timestamp (not a gate)
     _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
@@ -438,6 +494,11 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0))
         "telegram": {
             "sent": bool(tg_result) if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else False,
             "result": tg_result
+        },
+        "ibkr": {
+            "enabled": IBKR_ENABLED,
+            "attempted": ib_attempted,
+            "result": (_ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None),
         },
         "notes": "LLM/Telegram run only during 08:30–11:30 & 14:00–15:00 CDT. Polygon-enhanced features for LLM context. Buys are graded into Strong/Moderate/Cautious.",
     }
