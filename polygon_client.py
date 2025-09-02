@@ -24,8 +24,16 @@ async def list_contracts_for_expiry(client: httpx.AsyncClient, *, symbol: str, e
     })
     return (js or {}).get("results", []) or []
 
-async def get_option_snapshot(client: httpx.AsyncClient, *, underlying: str, option_ticker: str) -> Dict[str, Any]:
-    return await _poly_get(client, f"/v3/snapshot/options/{underlying}/{option_ticker}", {})
+
+
+async def get_option_snapshot(symbol: str, contract: str):
+    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}/{contract}"
+    params = {"apiKey": POLYGON_API_KEY}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("results", {})
 
 async def get_aggs(client: httpx.AsyncClient, *, ticker: str, multiplier: int, timespan: str,
                    frm: str, to: str, limit: int = 50000, sort: str = "asc") -> List[Dict[str, Any]]:
