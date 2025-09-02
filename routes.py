@@ -1,11 +1,14 @@
 # routes.py
 # at top
 import os
+import asyncio
+import socket
+import json
+import re
 from fastapi import Query
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 import httpx
-import re
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone, timedelta, date, time as dt_time
 
@@ -29,16 +32,21 @@ from reporting import _DECISIONS_LOG, _send_daily_report_now, _summarize_day_for
 
 router = APIRouter()
 
-# ========== Global state ==========
+# =========================
+# Global state / resources
+# =========================
 _llm_quota: Dict[str, Any] = {"date": None, "used": 0}
 _COOLDOWN: Dict[Tuple[str, str], datetime] = {}
 
+# Shared HTTP client + background queue/worker
+HTTP: httpx.AsyncClient | None = None
+WORK_Q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1000)
+
 # --- IBKR toggles (env defaults; can be overridden via query params) ---
-_IBKR_ENV_DEFAULT = os.getenv("IBKR_ENABLED", "0")
 def _env_truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
 
-IBKR_ENABLED = _env_truthy(_IBKR_ENV_DEFAULT)           # default behavior from env
+IBKR_ENABLED = _env_truthy(os.getenv("IBKR_ENABLED", "0"))           # default behavior from env
 IBKR_DEFAULT_QTY = int(os.getenv("IBKR_DEFAULT_QTY", "1"))
 IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()         # e.g., DAY, GTC
 IBKR_ORDER_MODE = os.getenv("IBKR_ORDER_MODE", "auto").lower()   # auto | market | limit
@@ -263,7 +271,6 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
 
-
 # Async wrappers for polygon_client (keeping your current call style)
 async def polygon_list_contracts_for_expiry(
     client: httpx.AsyncClient,
@@ -279,84 +286,70 @@ async def polygon_get_option_snapshot(
     underlying: str,
     option_ticker: str,
 ) -> Dict[str, Any]:
-    return await get_option_snapshot(client, underlying=underlying, option_ticker=option_ticker)
+    # keep compatibility if your polygon_client exposes get_option_snapshot(symbol, contract)
+    return await get_option_snapshot(client, symbol=underlying, contract=option_ticker) \
+        if "client" in get_option_snapshot.__code__.co_varnames else await get_option_snapshot(underlying, option_ticker)
 
-# ========== Routes ==========
+# =========================
+# Lifespan: startup/shutdown
+# =========================
 
-@router.get("/health")
-def health():
-    return {"ok": True, "component": "alert_server", "fastapi_available": True}
+@router.on_event("startup")
+async def _startup():
+    global HTTP
+    HTTP = httpx.AsyncClient(
+        http2=True,
+        timeout=httpx.Timeout(read=6.0, write=6.0, connect=3.0, pool=3.0),
+        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+    )
+    # Start N workers
+    for _ in range(int(os.getenv("WORKERS", "3"))):
+        asyncio.create_task(_worker())
 
-@router.get("/quota")
-def quota():
-    return {"ok": True, "quota": llm_quota_snapshot()}
+@router.on_event("shutdown")
+async def _shutdown():
+    global HTTP
+    if HTTP:
+        await HTTP.aclose()
 
-@router.get("/config")
-def get_config():
-    cfg = {
-        "COOLDOWN_SECONDS": COOLDOWN_SECONDS,
-        "WINDOWS_CDT": WINDOWS_CDT,
-        "MAX_LLM_PER_DAY": MAX_LLM_PER_DAY,
-        "CDT_TZ": str(CDT_TZ),
-    }
-    return {"ok": True, "config": cfg}
+async def _worker():
+    """Background worker that processes TradingView jobs."""
+    while True:
+        job = await WORK_Q.get()
+        try:
+            await _process_tradingview_job(job)
+        except Exception as e:
+            print(f"[worker] error: {e!r}")
+        finally:
+            WORK_Q.task_done()
 
-@router.get("/logs/today")
-def logs_today(limit: int = 50):
-    limit = max(1, min(int(limit), 500))
-    today_local = market_now().date()
-    todays = [x for x in reversed(_DECISIONS_LOG)
-              if isinstance(x.get("timestamp_local"), datetime) and x["timestamp_local"].date() == today_local]
-    return {"ok": True, "count": len(todays[:limit]), "items": todays[:limit]}
+# =========================
+# Core processing (moved off-path)
+# =========================
+async def _process_tradingview_job(job: Dict[str, Any]) -> None:
+    """
+    job keys:
+      - alert_text (str)
+      - flags: dict(ib_enabled, force, force_buy, qty)
+    """
+    global HTTP
+    if HTTP is None:
+        print("[worker] HTTP client not ready")
+        return
 
-@router.post("/run/daily_report")
-async def run_daily_report():
-    res = await _send_daily_report_now()
-    return {"ok": True, "trigger": "manual", **res}
-@router.get("/net/debug")
-async def net_debug():
-    import socket, httpx, os
-    host = os.getenv("IBKR_HOST", "127.0.0.1")
-    port = int(os.getenv("IBKR_PORT", "7497"))
-    out_ip = None
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            out_ip = (await c.get("https://ifconfig.me/ip")).text.strip()
+        alert = parse_alert_text(job["alert_text"])
     except Exception as e:
-        out_ip = f"fetch-failed: {e.__class__.__name__}"
+        print(f"[worker] bad alert payload: {e}")
+        return
 
-    can_connect = None
-    err = None
-    try:
-        s = socket.create_connection((host, port), timeout=3)
-        s.close()
-        can_connect = True
-    except Exception as e:
-        can_connect = False
-        err = f"{e.__class__.__name__}: {e}"
-    return {"ibkr_host": host, "ibkr_port": port, "egress_ip": out_ip, "connect_test": can_connect, "error": err}
+    # Flags
+    ib_enabled = bool(job["flags"].get("ib_enabled", IBKR_ENABLED))
+    force = bool(job["flags"].get("force", False))
+    force_buy = bool(job["flags"].get("force_buy", False))
+    qty = int(job["flags"].get("qty", IBKR_DEFAULT_QTY))
 
-@router.get("/report/preview")
-def report_preview():
-    today_local = market_now().date()
-    rep = _summarize_day_for_report(today_local)
-    chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
-    return {"ok": True, "header": rep["header"], "contract_chunks": chunks, "count": rep["count"]}
-
-@router.post("/webhook", response_class=JSONResponse)
-@router.post("/webhook/tradingview", response_class=JSONResponse)
-async def webhook_tradingview(request: Request, offline: int = Query(default=0), ib: int = Query(default=0)):
-    payload = await _get_alert_text(request)
-    if not payload:
-        raise HTTPException(status_code=400, detail="Empty alert payload")
-    alert = parse_alert_text(payload)
-
-    # === Flags (query param overrides env) ===
-    effective_ib_enabled = flag_from(request, "ib", "IBKR_ENABLED", default=IBKR_ENABLED)
-    force = 1 #flag_from(request, "force", "FORCE", default=False)
-    force_buy = 1 #flag_from(request, "force_buy", "FORCE_BUY", default=False)
-
-    # === Recommendation policy ===
+    # Recommendation policy
     ul_px = float(alert["underlying_price_from_alert"])
     raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
     desired_strike = round_strike_to_common_increment(raw_reco_strike)
@@ -370,10 +363,10 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
     option_ticker = "OFFLINE-TICKER"
     f: Dict[str, Any] = {}
 
-    # ---------- Data prep (Polygon/features) ----------
+    # Data prep (Polygon/features)
     try:
-        if offline or not POLYGON_API_KEY:
-            # OFFLINE MODE: fabricate minimal features
+        if (not POLYGON_API_KEY):
+            # OFFLINE MODE
             f = {
                 "bid": None, "ask": None, "mid": None,
                 "option_spread_pct": None, "quote_age_sec": None,
@@ -389,30 +382,29 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # ONLINE MODE: real Polygon calls
-            async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-                contracts = await polygon_list_contracts_for_expiry(
-                    client, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
-                )
-                if not contracts:
-                    raise HTTPException(status_code=404, detail=f"No contracts found for {alert['symbol']} {alert['side']} exp {target_expiry}.")
-                best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike)) if contracts else None
-                if not best:
-                    raise HTTPException(status_code=404, detail=f"No strikes near {desired_strike} for {alert['symbol']} on {target_expiry}.")
-                option_ticker = best.get("ticker") or best.get("symbol")
-                if not option_ticker:
-                    raise HTTPException(status_code=500, detail="Polygon returned contract without ticker")
+            # ONLINE MODE
+            contracts = await polygon_list_contracts_for_expiry(
+                HTTP, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
+            )
+            if not contracts:
+                raise RuntimeError(f"No contracts for {alert['symbol']} {alert['side']} exp {target_expiry}")
+            best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike)) if contracts else None
+            if not best:
+                raise RuntimeError(f"No strikes near {desired_strike} for {alert['symbol']} on {target_expiry}")
+            option_ticker = best.get("ticker") or best.get("symbol") or best.get("contract")
+            if not option_ticker:
+                raise RuntimeError("Polygon returned contract without ticker")
 
-                snap = await polygon_get_option_snapshot(client, underlying=alert["symbol"], option_ticker=option_ticker)
-                f = await build_features(
-                    client,
-                    alert={**alert, "strike": desired_strike, "expiry": target_expiry},
-                    snapshot=snap
-                )
-    except HTTPException:
-        raise
+            snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+            f = await build_features(
+                HTTP,
+                alert={**alert, "strike": desired_strike, "expiry": target_expiry},
+                snapshot=snap
+            )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error in Polygon/features: {type(e).__name__}: {e}")
+        print(f"[worker] Polygon/features error: {e}")
+        # keep minimal f so we can still log/notify
+        f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
     # ---------- Decisioning / LLM / Telegram / IBKR ----------
     in_window = allowed_now_cdt() or force
@@ -436,76 +428,69 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
     ib_result_obj: Optional[Any] = None
 
     if in_window:
-        llm = await analyze_with_openai(alert, f)
-        consume_llm()
+        try:
+            llm = await analyze_with_openai(alert, f)
+            consume_llm()
+        except Exception as e:
+            llm = {"decision": "wait", "confidence": 0.0, "reason": f"LLM error: {e}", "checklist": {}, "ev_estimate": {}}
+
         llm_ran = True
         decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
         # Compute score + grade for buys
-        score = compute_decision_score(f, llm)
-        rating = map_score_to_rating(score, llm.get("decision"))
+        try:
+            score = compute_decision_score(f, llm)
+            rating = map_score_to_rating(score, llm.get("decision"))
+        except Exception:
+            score, rating = None, None
         decision_path = f"llm.{decision_final}"
 
-        # Optional decision override for deterministic testing
+        # Optional decision override
         if force_buy:
             decision_final = "buy"
             decision_path = "force.buy"
 
         # Telegram
-        tg_text = compose_telegram_text(
-            alert={**alert, "strike": desired_strike, "expiry": target_expiry},
-            option_ticker=option_ticker,
-            f=f,
-            llm=llm,
-            llm_ran=True,
-            llm_reason="",
-            score=score,
-            rating=rating
-        )
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            tg_result = await send_telegram(tg_text)
+        try:
+            tg_text = compose_telegram_text(
+                alert={**alert, "strike": desired_strike, "expiry": target_expiry},
+                option_ticker=option_ticker,
+                f=f,
+                llm=llm,
+                llm_ran=True,
+                llm_reason="",
+                score=score,
+                rating=rating
+            )
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                tg_result = await send_telegram(tg_text)
+        except Exception as e:
+            print(f"[worker] Telegram error: {e}")
 
         # IBKR optional placement (paper)
         try:
-            if decision_final == "buy" and effective_ib_enabled:
+            if decision_final == "buy" and ib_enabled:
                 ib_attempted = True
 
                 # Decide order style
                 #   auto: use limit @ mid if available (and IBKR_USE_MID_AS_LIMIT=1), else market
                 #   limit: always limit; if mid missing -> market
                 #   market: always market
-                use_market = False
                 mode = IBKR_ORDER_MODE
                 mid = f.get("mid")
-
                 if mode == "market":
                     use_market = True
                 elif mode == "limit":
                     use_market = (mid is None)
                 else:  # auto
                     use_market = not (IBKR_USE_MID_AS_LIMIT and (mid is not None))
-
-                limit_px = None if use_market else float(mid)
-
-                qty = int(request.query_params.get("qty", IBKR_DEFAULT_QTY))
-                mode = IBKR_ORDER_MODE
-                mid = f.get("mid")
-                
-                if mode == "market":
-                    use_market = True
-                elif mode == "limit":
-                    use_market = (mid is None)
-                else:  # auto
-                    use_market = not (IBKR_USE_MID_AS_LIMIT and (mid is not None))
-                
-                limit_px = None if use_market else float(mid)
-
+                limit_px = None if use_market else float(mid) if mid is not None else None
 
                 ib_result_obj = await place_recommended_option_order(
                     symbol=alert["symbol"],
                     side=alert["side"],                # "CALL" or "PUT" (your ibkr_client should handle this)
                     strike=float(desired_strike),     # recommended strike
                     expiry_iso=target_expiry,         # two-weeks Friday rule, ISO "YYYY-MM-DD"
-                    quantity=int(os.getenv("IBKR_DEFAULT_QTY", str(IBKR_DEFAULT_QTY))),
+                    quantity=int(qty),
                     limit_price=limit_px,             # None => market
                     action="BUY",
                     tif=IBKR_TIF,
@@ -551,44 +536,108 @@ async def webhook_tradingview(request: Request, offline: int = Query(default=0),
         }
     })
 
-    return {
-        "ok": True,
-        "parsed_alert": alert,
-        "option_ticker": option_ticker,
-        "features": f,
-        "prescore": None,
-        "recommendation": {
-            "side": alert["side"],
-            "underlying_from_alert": ul_px,
-            "strike_policy": "+5% for CALL / -5% for PUT (rounded)",
-            "strike_recommended": desired_strike,
-            "expiry_policy": "Friday two weeks out (never same-week)",
-            "expiry_recommended": target_expiry,
-        },
-        "decision": {
-            "final": decision_final,
-            "path": decision_path,
-            "score": (score if in_window else None),
-            "rating": (rating if in_window else None)
-        },
-        "llm": {
-            "ran": llm_ran,
-            "reason": llm_reason,
-            "decision": llm.get("decision"),
-            "confidence": llm.get("confidence"),
-            "checklist": llm.get("checklist"),
-            "ev_estimate": llm.get("ev_estimate"),
-        },
-        "cooldown": {"seconds": COOLDOWN_SECONDS, "active": False},
-        "quota": llm_quota_snapshot(),
-        "telegram": {
-            "sent": bool(tg_result) if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else False,
-            "result": tg_result
-        },
-        "ibkr": {
-            "enabled": effective_ib_enabled,
-            "attempted": ib_attempted,
-            "result": (_ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None),
-        },
-        "notes": "LLM/Telegram run only during 08:30–11:30 & 14:00–15:00 CDT. Polygon-enhanced features for LLM context. Buys are graded into Strong/Moderate/Cautious.",
+# =========================
+# Routes
+# =========================
+
+@router.get("/health")
+def health():
+    return {"ok": True, "component": "alert_server", "fastapi_available": True}
+
+@router.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@router.get("/quota")
+def quota():
+    return {"ok": True, "quota": llm_quota_snapshot()}
+
+@router.get("/config")
+def get_config():
+    cfg = {
+        "COOLDOWN_SECONDS": COOLDOWN_SECONDS,
+        "WINDOWS_CDT": WINDOWS_CDT,
+        "MAX_LLM_PER_DAY": MAX_LLM_PER_DAY,
+        "CDT_TZ": str(CDT_TZ),
     }
+    return {"ok": True, "config": cfg}
+
+@router.get("/logs/today")
+def logs_today(limit: int = 50):
+    limit = max(1, min(int(limit), 500))
+    today_local = market_now().date()
+    todays = [x for x in reversed(_DECISIONS_LOG)
+              if isinstance(x.get("timestamp_local"), datetime) and x["timestamp_local"].date() == today_local]
+    return {"ok": True, "count": len(todays[:limit]), "items": todays[:limit]}
+
+@router.post("/run/daily_report")
+async def run_daily_report():
+    res = await _send_daily_report_now()
+    return {"ok": True, "trigger": "manual", **res}
+
+@router.get("/net/debug")
+async def net_debug():
+    host = os.getenv("IBKR_HOST", "127.0.0.1")
+    port = int(os.getenv("IBKR_PORT", "7497"))
+    out_ip = None
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            out_ip = (await c.get("https://ifconfig.me/ip")).text.strip()
+    except Exception as e:
+        out_ip = f"fetch-failed: {e.__class__.__name__}"
+
+    can_connect = None
+    err = None
+    try:
+        s = socket.create_connection((host, port), timeout=3)
+        s.close()
+        can_connect = True
+    except Exception as e:
+        can_connect = False
+        err = f"{e.__class__.__name__}: {e}"
+    return {"ibkr_host": host, "ibkr_port": port, "egress_ip": out_ip, "connect_test": can_connect, "error": err}
+
+@router.get("/report/preview")
+def report_preview():
+    today_local = market_now().date()
+    rep = _summarize_day_for_report(today_local)
+    chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
+    return {"ok": True, "header": rep["header"], "contract_chunks": chunks, "count": rep["count"]}
+
+# --- NEW: non-blocking webhook that immediately ACKs and enqueues work ---
+@router.post("/webhook", response_class=JSONResponse)
+@router.post("/webhook/tradingview", response_class=JSONResponse)
+async def webhook_tradingview(request: Request, offline: int = Query(default=0), ib: int = Query(default=0), qty: int = Query(default=IBKR_DEFAULT_QTY), force: int = Query(default=0), force_buy: int = Query(default=0)):
+    payload_text = await _get_alert_text(request)
+    if not payload_text:
+        raise HTTPException(status_code=400, detail="Empty alert payload")
+
+    # Validate early so we can return a crisp 400 instead of enqueueing junk
+    try:
+        _ = parse_alert_text(payload_text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid alert: {e}")
+
+    # Effective flags (query param -> env)
+    effective_ib_enabled = bool(ib) if request.query_params.get("ib") is not None else IBKR_ENABLED
+
+    job = {
+        "alert_text": payload_text,
+        "flags": {
+            "ib_enabled": effective_ib_enabled and (not offline),
+            "force": bool(force),
+            "force_buy": bool(force_buy),
+            "qty": int(qty),
+        }
+    }
+
+    try:
+        WORK_Q.put_nowait(job)
+    except asyncio.QueueFull:
+        # Backpressure without blocking the proxy
+        return JSONResponse({"status": "busy", "detail": "queue full"}, status_code=429)
+
+    # Immediate ACK → avoids proxy 502s even if processing is heavy/slow
+    return JSONResponse({"status": "accepted"}, status_code=202)
