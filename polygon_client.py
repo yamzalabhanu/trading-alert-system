@@ -1,45 +1,53 @@
-# polygon_client.py
-import httpx
-from typing import Dict, Any, List
-from config import POLYGON_API_KEY
+# routes.py (FastAPI)
+from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
+import httpx, os, json, asyncio
 
-async def _poly_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    p = dict(params or {})
-    p["apiKey"] = POLYGON_API_KEY
-    r = await client.get(f"https://api.polygon.io{path}", params=p, timeout=20.0)
-    if r.status_code in (402, 403, 404, 429):
-        return {}
-    r.raise_for_status()
+app = FastAPI()
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+async def process_tradingview(payload: dict):
+    # 1) Validate shape early
+    symbol = payload.get("symbol") or payload.get("ticker")
+    if not symbol:
+        return
+
+    # 2) Call Polygon with short, explicit timeouts
+    POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+    if not POLYGON_API_KEY:
+        return
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
+        # Example: get underlying quote to validate connectivity
+        try:
+            r = await client.get(
+                "https://api.polygon.io/v2/last/trade/" + symbol,
+                params={"apiKey": POLYGON_API_KEY},
+            )
+            r.raise_for_status()
+        except Exception as e:
+            # log and bail; never raise into request stack
+            print(f"[polygon] error: {e}")
+            return
+
+    # 3) TODO: enqueue for LLM/Telegram, etc.
+
+@app.post("/webhook/tradingview")
+async def webhook_tradingview(request: Request, bg: BackgroundTasks):
+    # 1) Parse body safely
     try:
-        return r.json()
+        payload = await request.json()
     except Exception:
-        return {}
+        # Even if not JSON, never blow up (TradingView sometimes sends text)
+        body = await request.body()
+        try:
+            payload = json.loads(body.decode("utf-8", errors="ignore"))
+        except Exception:
+            payload = {"raw": body.decode("utf-8", errors="ignore")}
 
-async def list_contracts_for_expiry(client: httpx.AsyncClient, *, symbol: str, expiry: str, side: str, limit: int = 250) -> List[Dict[str, Any]]:
-    js = await _poly_get(client, "/v3/reference/options/contracts", {
-        "underlying_ticker": symbol,
-        "expiration_date": expiry,
-        "contract_type": "call" if side == "CALL" else "put",
-        "limit": limit,
-    })
-    return (js or {}).get("results", []) or []
-
-
-
-async def get_option_snapshot(symbol: str, contract: str):
-    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}/{contract}"
-    params = {"apiKey": POLYGON_API_KEY}
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("results", {})
-
-async def get_aggs(client: httpx.AsyncClient, *, ticker: str, multiplier: int, timespan: str,
-                   frm: str, to: str, limit: int = 50000, sort: str = "asc") -> List[Dict[str, Any]]:
-    js = await _poly_get(client, f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{frm}/{to}", {
-        "adjusted": "true",
-        "sort": sort,
-        "limit": limit,
-    })
-    return (js or {}).get("results", []) or []
+    # 2) Kick background work and ACK immediately
+    bg.add_task(process_tradingview, payload)
+    return JSONResponse({"status": "ok"}, status_code=200)
