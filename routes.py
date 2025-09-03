@@ -151,8 +151,8 @@ def same_week_friday(d: date) -> date:
     return base_monday + timedelta(days=4)
 
 def two_weeks_friday(d: date) -> date:
-    """Friday two weeks out from date d (same week’s Friday + 14 days)."""
-    return _next_friday(d) + timedelta(days=7)  # next Friday + 1 week
+    """Friday two weeks out from date d (same week’s Friday + 1 week)."""
+    return _next_friday(d) + timedelta(days=7)
 
 def is_same_week(a: date, b: date) -> bool:
     am = a - timedelta(days=a.weekday())
@@ -234,11 +234,8 @@ def compose_telegram_text(
     return "\n".join([header, contract, "", snap, decision, reason, scoreline]).strip()
 
 def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
-    # Nothing came back
     if res is None:
         return {"ok": False, "error": "ibkr_client returned None", "raw": None}
-
-    # If ibkr_client returned a dict, keep it intact
     if isinstance(res, dict):
         return {
             "ok": bool(res.get("ok", False)),
@@ -248,14 +245,10 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
             "remaining": res.get("remaining"),
             "avg_fill_price": res.get("avg_fill_price"),
             "error": res.get("error"),
-            "raw": res.get("raw", res),  # keep full dict in raw
+            "raw": res.get("raw", res),
         }
-
-    # If it returned a plain string
     if isinstance(res, str):
         return {"ok": False, "error": res, "raw": res}
-
-    # Fallback for object-like responses
     try:
         payload = {
             "ok": getattr(res, "ok", False),
@@ -290,7 +283,6 @@ def _normalize_poly_strike(raw) -> Optional[float]:
         v = float(raw)
     except Exception:
         return None
-    # Heuristic: treat larger numbers as *1000 (covers 2000+ safely)
     return v / 1000.0 if v >= 2000 else v
 
 def _within_reasonable_strike(diff: float, step: float) -> bool:
@@ -338,7 +330,6 @@ async def polygon_get_option_snapshot(
 # =========================
 # Lifespan: startup/shutdown
 # =========================
-
 @router.on_event("startup")
 async def _startup():
     global HTTP, WORKER_COUNT
@@ -403,7 +394,6 @@ def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
         ns = int(ts_val)
     except Exception:
         return None
-    # Scale guess
     if ns >= 10**14:
         sec = ns / 1e9      # ns
     elif ns >= 10**11:
@@ -416,7 +406,7 @@ def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
     return round(age, 3)
 
 # =========================
-# OPTIONAL: snapshot backfill helpers
+# Backfill: multi-snapshot FIRST, then others
 # =========================
 async def _poly_option_backfill(
     client: httpx.AsyncClient,
@@ -425,12 +415,9 @@ async def _poly_option_backfill(
     today_utc: date,
 ) -> Dict[str, Any]:
     """
-    Backfill missing fields using:
-      1) Single-contract snapshot (preferred)
-      1b) Multi-snapshot list (by underlying + expiry + side), matched to our ticker
-      2) Previous-day open/close (OI/Vol)
-      3) Last quote (NBBO + quote age)
-    Returns only keys that are discovered (non-None).
+    Backfill missing fields preferring the multi-snapshot list FIRST (often richer),
+    then single snapshot, then open/close T+1 OI/Vol, then last quote for NBBO.
+    Returns only discovered (non-None) keys.
     """
     out: Dict[str, Any] = {}
     if not POLYGON_API_KEY:
@@ -439,16 +426,13 @@ async def _poly_option_backfill(
     def _apply_from_results(res: Dict[str, Any], out_dict: Dict[str, Any]) -> None:
         if not isinstance(res, dict):
             return
-        # OI
         oi = res.get("open_interest")
         if oi is not None:
             out_dict["oi"] = oi
-        # Volume block can vary: "day": {"volume": ...} (sometimes "v" on older payloads)
         day_block = res.get("day") or {}
         vol = day_block.get("volume", day_block.get("v"))
         if vol is not None:
             out_dict["vol"] = vol
-        # NBBO (single or multi snapshot use same key names)
         lq = res.get("last_quote") or {}
         bid_px = lq.get("bid_price")
         ask_px = lq.get("ask_price")
@@ -458,38 +442,25 @@ async def _poly_option_backfill(
             out_dict["ask"] = float(ask_px)
         if out_dict.get("mid") is None and out_dict.get("bid") is not None and out_dict.get("ask") is not None:
             out_dict["mid"] = round((out_dict["bid"] + out_dict["ask"]) / 2.0, 4)
-        # quote age (prefer SIP timestamp)
         ts = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp")
         age = _quote_age_from_ts(ts)
         if age is not None:
             out_dict["quote_age_sec"] = age
-        # Greeks
         greeks = res.get("greeks") or {}
-        for k_src, k_dst in [("delta", "delta"), ("gamma", "gamma"), ("theta", "theta"), ("vega", "vega")]:
+        for k_src in ("delta", "gamma", "theta", "vega"):
             v = greeks.get(k_src)
             if v is not None:
-                out_dict[k_dst] = v
-        # IV (either top-level or within greeks as "iv")
+                out_dict[k_src] = v
         iv = res.get("implied_volatility") or greeks.get("iv")
         if iv is not None:
             out_dict["iv"] = iv
 
-    # 1) Single-contract snapshot first
+    # 1) Multi-snapshot list (prefer)
     try:
-        snap = await polygon_get_option_snapshot(client, underlying=symbol, option_ticker=option_ticker)
-        if isinstance(snap, dict):
-            _apply_from_results(snap.get("results") or {}, out)
-    except Exception:
-        pass
-
-    # 1b) Multi-snapshot list (often has intraday OI/Vol when single is sparse)
-    try:
-        # Infer side + expiry from OCC ticker if possible (O:AMD250912P00155000)
         side = None
         expiry_iso = None
         m = re.search(r":([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8,9})$", option_ticker)
         if m:
-            # underlying YY MM DD side strike*1000
             yy, mm, dd, cp = m.group(2), m.group(3), m.group(4), m.group(5)
             expiry_iso = f"20{yy}-{mm}-{dd}"
             side = "call" if cp.upper() == "C" else "put"
@@ -507,23 +478,25 @@ async def _poly_option_backfill(
             )
             if rlist.status_code == 200:
                 js = rlist.json() or {}
-                # Polygon returns {"results":[{...,"details":{"ticker":"O:AMD..."},"open_interest":...,"day":{"volume":...},"last_quote":{...},"greeks":{...}}, ...]}
                 items = js.get("results") or []
-                # Try exact ticker match via "details.ticker" or top-level "ticker"
+                chosen = None
                 for it in items:
                     tkr = (it.get("details") or {}).get("ticker") or it.get("ticker")
                     if tkr == option_ticker:
-                        _apply_from_results(it, out)
+                        chosen = it
                         break
-                # If not found by exact, try nearest by normalized strike as soft fallback
-                if "oi" not in out and "vol" not in out and items:
-                    # parse normalized strike from each result if present
+                if chosen is None and items:
+                    desired = None
+                    mm3 = re.search(r"[CP](\d{8,9})$", option_ticker)
+                    if mm3:
+                        try:
+                            desired = int(mm3.group(1)) / 1000.0
+                        except Exception:
+                            desired = None
                     cands = []
                     for it in items:
-                        # details.strike may exist; otherwise parse from details.ticker
                         det = it.get("details") or {}
-                        s_raw = det.get("strike")
-                        s_norm = _normalize_poly_strike(s_raw)
+                        s_norm = _normalize_poly_strike(det.get("strike"))
                         if s_norm is None:
                             tk = det.get("ticker") or it.get("ticker") or ""
                             mm2 = re.search(r"[CP](\d{8,9})$", tk)
@@ -532,23 +505,26 @@ async def _poly_option_backfill(
                                     s_norm = int(mm2.group(1)) / 1000.0
                                 except Exception:
                                     s_norm = None
-                        if s_norm is not None:
-                            cands.append((s_norm, it))
-                    # try to infer desired strike from OCC
-                    desired = None
-                    mm3 = re.search(r"[CP](\d{8,9})$", option_ticker)
-                    if mm3:
-                        try:
-                            desired = int(mm3.group(1)) / 1000.0
-                        except Exception:
-                            desired = None
-                    if desired is not None and cands:
-                        cands.sort(key=lambda x: abs(x[0] - desired))
-                        _apply_from_results(cands[0][1], out)
+                        if s_norm is not None and desired is not None:
+                            cands.append((abs(s_norm - desired), it))
+                    if cands:
+                        cands.sort(key=lambda x: x[0])
+                        chosen = cands[0][1]
+                if chosen:
+                    _apply_from_results(chosen, out)
     except Exception:
         pass
 
-    # 2) Previous day open/close for OI / Volume (T+1 OI is common)
+    # 2) Single-contract snapshot (secondary)
+    if not out:
+        try:
+            snap = await polygon_get_option_snapshot(client, underlying=symbol, option_ticker=option_ticker)
+            if isinstance(snap, dict):
+                _apply_from_results(snap.get("results") or {}, out)
+        except Exception:
+            pass
+
+    # 3) Previous-day open/close (T+1 OI/Vol)
     try:
         yday = (today_utc - timedelta(days=1)).isoformat()
         r1 = await client.get(
@@ -567,7 +543,7 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 3) Last quote for NBBO (if still missing)
+    # 4) Last quote for NBBO/age
     try:
         r2 = await client.get(
             f"https://api.polygon.io/v3/quotes/options/{option_ticker}/last",
@@ -585,7 +561,7 @@ async def _poly_option_backfill(
             if out.get("ask") is None and ask_px is not None:
                 out["ask"] = float(ask_px)
             if out.get("mid") is None and out.get("bid") is not None and out.get("ask") is not None:
-                out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
+                out["mid"] = round((out["bid"] + (out["ask"])) / 2.0, 4)
             ts = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
             age = _quote_age_from_ts(ts)
             if age is not None and out.get("quote_age_sec") is None:
@@ -667,11 +643,21 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # ONLINE MODE — first try direct snapshot for our OCC contract
-            snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+            # ---- Prefer multi-snapshot enrichment first ----
+            extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
+            if debug_mode:
+                print({"_debug_backfill": {k: extra_from_snap.get(k) for k in ["oi","vol","bid","ask","mid","quote_age_sec","delta","gamma","theta","vega","iv"]}})
 
-            # Fallback: if snapshot looks empty (illiquid/missing), search the expiry and pick nearest strike (normalized)
-            if not snap or not snap.get("results"):
+            # ---- If still nothing, fetch single-contract snapshot ----
+            snap = None
+            if not extra_from_snap:
+                try:
+                    snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+                except Exception:
+                    snap = None
+
+            # ---- If snapshot also looks empty, as a last resort try listing contracts (normalized) and pick nearest ----
+            if (not extra_from_snap) and (not snap or not snap.get("results")):
                 contracts = await polygon_list_contracts_for_expiry(
                     HTTP, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
                 )
@@ -681,17 +667,15 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                         cs = _normalize_poly_strike(c.get("strike"))
                         if cs is None:
                             tk = c.get("ticker") or c.get("symbol") or c.get("contract") or ""
-                            m = re.search(r"[CP](\d{8,9})$", tk or "")
-                            if m:
+                            m2 = re.search(r"[CP](\d{8,9})$", tk or "")
+                            if m2:
                                 try:
-                                    cs = int(m.group(1)) / 1000.0
+                                    cs = int(m2.group(1)) / 1000.0
                                 except Exception:
                                     cs = None
                         if cs is not None:
                             diff = abs(cs - desired_strike)
                             candidates.append((diff, cs, c))
-
-                    # sort by closeness
                     candidates.sort(key=lambda x: x[0])
                     if debug_mode:
                         selection_debug["fallback_considered"] = [
@@ -702,10 +686,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                             }
                             for d, s, cand in candidates[:5]
                         ]
-
                     if candidates:
                         best_diff, best_strike_norm, best_contract = candidates[0]
-                        # sanity gate: only replace if reasonably close
                         step = 0.5 if ul_px < 25 else (1 if ul_px < 200 else (5 if ul_px < 1000 else 10))
                         if _within_reasonable_strike(best_diff, step):
                             fallback_ticker = (
@@ -718,25 +700,27 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                                 selection_debug["fallback_applied"] = True
                                 selection_debug["selected_ticker_fallback"] = option_ticker
                                 selection_debug["selected_strike_norm"] = best_strike_norm
-                                # fetch snapshot for the fallback
-                                snap = await polygon_get_option_snapshot(
-                                    HTTP, underlying=alert["symbol"], option_ticker=option_ticker
-                                )
+                                # re-enrich using fallback
+                                extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
+                                # and try snapshot again
+                                try:
+                                    snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+                                except Exception:
+                                    snap = None
 
+            # ---- Build features (with whatever we have) ----
             f = await build_features(
                 HTTP,
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
                 snapshot=snap
             )
 
-            # ---- Backfill: parse snapshot + other endpoints to fill sparse fields ----
-            extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
-            if extra_from_snap:
-                for k, v in extra_from_snap.items():
-                    if v is not None and (f.get(k) is None):
-                        f[k] = v
-                if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
-                    f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
+            # ---- Overlay enriched fields AFTER build_features so we don't overwrite good values ----
+            for k, v in (extra_from_snap or {}).items():
+                if v is not None and (f.get(k) is None):
+                    f[k] = v
+            if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
+                f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
 
     except Exception as e:
         print(f"[worker] Polygon/features error: {e}")
@@ -872,7 +856,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 # =========================
 # Routes
 # =========================
-
 @router.get("/health")
 def health():
     return {"ok": True, "component": "alert_server", "fastapi_available": True}
