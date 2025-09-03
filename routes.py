@@ -672,6 +672,14 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             if debug_mode:
                 print({"_debug_backfill": {k: extra_from_snap.get(k) for k in ["oi","vol","bid","ask","mid","quote_age_sec","delta","gamma","theta","vega","iv"]}})
 
+            # ---------- PRE-SEED features with enrichment ----------
+            f = {}
+            for k, v in (extra_from_snap or {}).items():
+                if v is not None:
+                    f[k] = v
+            # ------------------------------------------------------
+
+            # Try to get per-contract snapshot for build_features internal logic
             snap = None
             if not extra_from_snap:
                 try:
@@ -724,21 +732,26 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                                 selection_debug["selected_ticker_fallback"] = option_ticker
                                 selection_debug["selected_strike_norm"] = best_strike_norm
                                 extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
+                                # merge new enrichment into f (prefer non-null)
+                                for k, v in (extra_from_snap or {}).items():
+                                    if v is not None and f.get(k) is None:
+                                        f[k] = v
                                 try:
                                     snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
                                 except Exception:
                                     snap = None
 
-            # Build features
-            f = await build_features(
+            # Build core features (trend, regime, sr, iv_rank, etc.)
+            core = await build_features(
                 HTTP,
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
                 snapshot=snap
             )
-            # Overlay enriched fields after feature build
-            for k, v in (extra_from_snap or {}).items():
-                if v is not None and (f.get(k) is None):
+            # ---------- POST-MERGE core into f without clobbering good values ----------
+            for k, v in (core or {}).items():
+                if v is not None or k not in f:
                     f[k] = v
+            # Ensure mid if we at least have bid/ask
             if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
                 f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
 
