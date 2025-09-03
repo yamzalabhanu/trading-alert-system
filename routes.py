@@ -366,6 +366,31 @@ def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> D
     }
 
 # =========================
+# Time helpers
+# =========================
+def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
+    """
+    Try to compute age (seconds) from polygon timestamps (ns or us or ms).
+    """
+    if ts_val is None:
+        return None
+    try:
+        ns = int(ts_val)
+    except Exception:
+        return None
+    # Heuristic scale: ns (>=1e12), us (>=1e9), ms (>=1e6), else s
+    if ns >= 10**14:
+        sec = ns / 1e9
+    elif ns >= 10**11:
+        sec = ns / 1e6
+    elif ns >= 10**8:
+        sec = ns / 1e3
+    else:
+        sec = float(ns)
+    age = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
+    return round(age, 3)
+
+# =========================
 # OPTIONAL: snapshot backfill helpers
 # =========================
 async def _poly_option_backfill(
@@ -375,20 +400,63 @@ async def _poly_option_backfill(
     today_utc: date,
 ) -> Dict[str, Any]:
     """
-    Try to backfill missing fields using additional Polygon endpoints.
-    - Previous day open/close for OI / volume
-    - Last quote for bid/ask (+ derived mid) and quote age
+    Try to backfill missing fields using:
+      1) Snapshot again (parse nested fields into flat values: OI, Vol, NBBO, Greeks, quote_age)
+      2) Previous day open/close (OI/Vol)
+      3) Last quote (NBBO + quote age)
     Returns only keys that are discovered (non-None).
     """
     out: Dict[str, Any] = {}
-
     if not POLYGON_API_KEY:
         return out
 
-    # 1) Previous day open/close (OI / Volume)
+    # 1) Snapshot parse (preferred)
+    try:
+        snap = await polygon_get_option_snapshot(client, underlying=symbol, option_ticker=option_ticker)
+        if isinstance(snap, dict):
+            res = snap.get("results") or {}
+            if isinstance(res, dict):
+                # OI
+                oi = res.get("open_interest")
+                if oi is not None:
+                    out["oi"] = oi
+                # Volume
+                day_block = res.get("day") or {}
+                vol = day_block.get("volume")
+                if vol is not None:
+                    out["vol"] = vol
+                # NBBO + quote age
+                lq = res.get("last_quote") or {}
+                bid_px = lq.get("bid_price")
+                ask_px = lq.get("ask_price")
+                if bid_px is not None:
+                    out["bid"] = float(bid_px)
+                if ask_px is not None:
+                    out["ask"] = float(ask_px)
+                if out.get("bid") is not None and out.get("ask") is not None:
+                    out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
+                # quote age
+                ts = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp")
+                age = _quote_age_from_ts(ts)
+                if age is not None:
+                    out["quote_age_sec"] = age
+                # Greeks
+                greeks = res.get("greeks") or {}
+                for k_src, k_dst in [("delta", "delta"), ("gamma", "gamma"), ("theta", "theta"), ("vega", "vega")]:
+                    v = greeks.get(k_src)
+                    if v is not None:
+                        out[k_dst] = v
+                # IV (per-snapshot)
+                iv = res.get("implied_volatility") or greeks.get("iv")
+                if iv is not None:
+                    out["iv"] = iv
+    except Exception:
+        pass
+
+    # 2) Previous day open/close for OI / Volume
+    # Use market day "yesterday" in UTC terms; you can make this more robust by using a US market calendar.
     try:
         yday = (today_utc - timedelta(days=1)).isoformat()
-        # v1 open-close options: /v1/open-close/options/{option_ticker}/{date}
         r1 = await client.get(
             f"https://api.polygon.io/v1/open-close/options/{option_ticker}/{yday}",
             params={"apiKey": POLYGON_API_KEY},
@@ -398,16 +466,15 @@ async def _poly_option_backfill(
             js = r1.json() or {}
             oi = js.get("open_interest")
             vol = js.get("volume")
-            if oi is not None:
+            if (out.get("oi") is None) and (oi is not None):
                 out["oi"] = oi
-            if vol is not None:
+            if (out.get("vol") is None) and (vol is not None):
                 out["vol"] = vol
     except Exception:
         pass
 
-    # 2) Last quote (NBBO)
+    # 3) Last quote for NBBO (if still missing)
     try:
-        # /v3/quotes/options/{option_ticker}/last
         r2 = await client.get(
             f"https://api.polygon.io/v3/quotes/options/{option_ticker}/last",
             params={"apiKey": POLYGON_API_KEY},
@@ -416,36 +483,19 @@ async def _poly_option_backfill(
         if r2.status_code == 200:
             js = r2.json() or {}
             res = js.get("results") or {}
-            # Different shapes; try to normalize
             last = res.get("last") or res
-            # Common fields: askPrice/bidPrice
             bid_px = last.get("bidPrice")
             ask_px = last.get("askPrice")
-
-            # Some shapes might use "p" with an "x" (side code) — best-effort parsing:
-            if bid_px is None and last.get("x") == "BID" and last.get("p") is not None:
-                bid_px = last.get("p")
-            if ask_px is None and last.get("x") == "ASK" and last.get("p") is not None:
-                ask_px = last.get("p")
-
-            if bid_px is not None:
+            if out.get("bid") is None and bid_px is not None:
                 out["bid"] = float(bid_px)
-            if ask_px is not None:
+            if out.get("ask") is None and ask_px is not None:
                 out["ask"] = float(ask_px)
-            if out.get("bid") is not None and out.get("ask") is not None:
+            if out.get("mid") is None and out.get("bid") is not None and out.get("ask") is not None:
                 out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
-
-            # quote age estimation
             ts = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-            if ts:
-                try:
-                    ns = int(ts)
-                    # Heuristic: Polygon often returns ns
-                    sec = ns / 1e9 if ns > 1e12 else (ns / 1e3 if ns > 1e6 else ns)
-                    age = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
-                    out["quote_age_sec"] = round(age, 3)
-                except Exception:
-                    pass
+            age = _quote_age_from_ts(ts)
+            if age is not None:
+                out["quote_age_sec"] = age if out.get("quote_age_sec") is None else out["quote_age_sec"]
     except Exception:
         pass
 
@@ -520,12 +570,11 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
 
             # Fallback: if snapshot looks empty (illiquid/missing), search the expiry and pick nearest strike
-            if not snap or not snap.get("_raw"):
+            if not snap or not snap.get("results"):
                 contracts = await polygon_list_contracts_for_expiry(
                     HTTP, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
                 )
                 if contracts:
-                    # choose nearest strike and use its ticker if present
                     best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike))
                     fallback_ticker = best.get("ticker") or best.get("symbol") or best.get("contract")
                     if fallback_ticker:
@@ -538,21 +587,19 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 snapshot=snap
             )
 
-            # ---- Backfill if sparse fields ----
-            if (
-                f.get("oi") is None or f.get("vol") is None or
-                f.get("bid") is None or f.get("ask") is None or f.get("mid") is None
-            ):
-                extra = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
-                if extra:
-                    f.update({k: v for k, v in extra.items() if v is not None})
-                    # recompute mid if needed
-                    if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
-                        f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
+            # ---- Backfill: first parse snapshot to flatten nested fields ----
+            extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
+            if extra_from_snap:
+                # Only overlay missing fields
+                for k, v in extra_from_snap.items():
+                    if v is not None and (f.get(k) is None):
+                        f[k] = v
+                # ensure mid derives if now both bid/ask exist
+                if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
+                    f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
 
     except Exception as e:
         print(f"[worker] Polygon/features error: {e}")
-        # keep minimal f so we can still log/notify
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
     # ---------- Decisioning / LLM / Telegram / IBKR ----------
@@ -585,7 +632,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 
         llm_ran = True
         decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
-        # Compute score + grade for buys
         try:
             score = compute_decision_score(f, llm)
             rating = map_score_to_rating(score, llm.get("decision"))
@@ -593,12 +639,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             score, rating = None, None
         decision_path = f"llm.{decision_final}"
 
-        # Optional decision override
         if force_buy:
             decision_final = "buy"
             decision_path = "force.buy"
 
-        # Telegram
         try:
             tg_text = compose_telegram_text(
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
@@ -615,15 +659,9 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception as e:
             print(f"[worker] Telegram error: {e}")
 
-        # IBKR optional placement (paper)
         try:
             if decision_final == "buy" and ib_enabled:
                 ib_attempted = True
-
-                # Decide order style
-                #   auto: use limit @ mid if available (and IBKR_USE_MID_AS_LIMIT=1), else market
-                #   limit: always limit; if mid missing -> market
-                #   market: always market
                 mode = IBKR_ORDER_MODE
                 mid = f.get("mid")
                 if mode == "market":
@@ -636,11 +674,11 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 
                 ib_result_obj = await place_recommended_option_order(
                     symbol=alert["symbol"],
-                    side=alert["side"],                # "CALL" or "PUT"
-                    strike=float(desired_strike),     # ±5% recommended strike
-                    expiry_iso=target_expiry,         # two-weeks Friday rule, ISO "YYYY-MM-DD"
+                    side=alert["side"],
+                    strike=float(desired_strike),
+                    expiry_iso=target_expiry,
                     quantity=int(qty),
-                    limit_price=limit_px,             # None => market
+                    limit_price=limit_px,
                     action="BUY",
                     tif=IBKR_TIF,
                 )
@@ -651,10 +689,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         ib_attempted = False
         ib_result_obj = None
 
-    # Cooldown timestamp (not a gate)
     _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
 
-    # Log (even if skipped, so you can audit)
     _DECISIONS_LOG.append({
         "timestamp_local": market_now(),
         "symbol": alert["symbol"],
@@ -725,7 +761,6 @@ def logs_today(limit: int = 50):
 
 @router.get("/worker/stats")
 def worker_stats():
-    # Non-blocking queue size check
     return {
         "ok": True,
         "queue_size": WORK_Q.qsize(),
@@ -782,7 +817,6 @@ async def webhook_tradingview(
     if not payload_text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
 
-    # Validate early so we can return a crisp 400 instead of enqueueing junk
     try:
         _ = parse_alert_text(payload_text)
     except HTTPException:
@@ -790,7 +824,6 @@ async def webhook_tradingview(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid alert: {e}")
 
-    # Effective flags (query param -> env)
     effective_ib_enabled = bool(ib) if request.query_params.get("ib") is not None else IBKR_ENABLED
 
     job = {
@@ -806,8 +839,6 @@ async def webhook_tradingview(
     try:
         WORK_Q.put_nowait(job)
     except asyncio.QueueFull:
-        # Backpressure without blocking the proxy
         return JSONResponse({"status": "busy", "detail": "queue full"}, status_code=429)
 
-    # Immediate ACK → avoids proxy 502s even if processing is heavy/slow
     return JSONResponse({"status": "accepted"}, status_code=202)
