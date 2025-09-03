@@ -366,6 +366,92 @@ def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> D
     }
 
 # =========================
+# OPTIONAL: snapshot backfill helpers
+# =========================
+async def _poly_option_backfill(
+    client: httpx.AsyncClient,
+    symbol: str,
+    option_ticker: str,
+    today_utc: date,
+) -> Dict[str, Any]:
+    """
+    Try to backfill missing fields using additional Polygon endpoints.
+    - Previous day open/close for OI / volume
+    - Last quote for bid/ask (+ derived mid) and quote age
+    Returns only keys that are discovered (non-None).
+    """
+    out: Dict[str, Any] = {}
+
+    if not POLYGON_API_KEY:
+        return out
+
+    # 1) Previous day open/close (OI / Volume)
+    try:
+        yday = (today_utc - timedelta(days=1)).isoformat()
+        # v1 open-close options: /v1/open-close/options/{option_ticker}/{date}
+        r1 = await client.get(
+            f"https://api.polygon.io/v1/open-close/options/{option_ticker}/{yday}",
+            params={"apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        if r1.status_code == 200:
+            js = r1.json() or {}
+            oi = js.get("open_interest")
+            vol = js.get("volume")
+            if oi is not None:
+                out["oi"] = oi
+            if vol is not None:
+                out["vol"] = vol
+    except Exception:
+        pass
+
+    # 2) Last quote (NBBO)
+    try:
+        # /v3/quotes/options/{option_ticker}/last
+        r2 = await client.get(
+            f"https://api.polygon.io/v3/quotes/options/{option_ticker}/last",
+            params={"apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        if r2.status_code == 200:
+            js = r2.json() or {}
+            res = js.get("results") or {}
+            # Different shapes; try to normalize
+            last = res.get("last") or res
+            # Common fields: askPrice/bidPrice
+            bid_px = last.get("bidPrice")
+            ask_px = last.get("askPrice")
+
+            # Some shapes might use "p" with an "x" (side code) — best-effort parsing:
+            if bid_px is None and last.get("x") == "BID" and last.get("p") is not None:
+                bid_px = last.get("p")
+            if ask_px is None and last.get("x") == "ASK" and last.get("p") is not None:
+                ask_px = last.get("p")
+
+            if bid_px is not None:
+                out["bid"] = float(bid_px)
+            if ask_px is not None:
+                out["ask"] = float(ask_px)
+            if out.get("bid") is not None and out.get("ask") is not None:
+                out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
+
+            # quote age estimation
+            ts = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
+            if ts:
+                try:
+                    ns = int(ts)
+                    # Heuristic: Polygon often returns ns
+                    sec = ns / 1e9 if ns > 1e12 else (ns / 1e3 if ns > 1e6 else ns)
+                    age = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
+                    out["quote_age_sec"] = round(age, 3)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return out
+
+# =========================
 # Core processing (moved off-path)
 # =========================
 async def _process_tradingview_job(job: Dict[str, Any]) -> None:
@@ -451,6 +537,19 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
                 snapshot=snap
             )
+
+            # ---- Backfill if sparse fields ----
+            if (
+                f.get("oi") is None or f.get("vol") is None or
+                f.get("bid") is None or f.get("ask") is None or f.get("mid") is None
+            ):
+                extra = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
+                if extra:
+                    f.update({k: v for k, v in extra.items() if v is not None})
+                    # recompute mid if needed
+                    if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
+                        f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
+
     except Exception as e:
         print(f"[worker] Polygon/features error: {e}")
         # keep minimal f so we can still log/notify
