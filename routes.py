@@ -425,9 +425,10 @@ async def _poly_option_backfill(
     today_utc: date,
 ) -> Dict[str, Any]:
     """
-    Try to backfill missing fields using:
-      1) Snapshot again (parse nested fields into flat values: OI, Vol, NBBO, Greeks, quote_age)
-      2) Previous day open/close (OI/Vol)
+    Backfill missing fields using:
+      1) Single-contract snapshot (preferred)
+      1b) Multi-snapshot list (by underlying + expiry + side), matched to our ticker
+      2) Previous-day open/close (OI/Vol)
       3) Last quote (NBBO + quote age)
     Returns only keys that are discovered (non-None).
     """
@@ -435,49 +436,119 @@ async def _poly_option_backfill(
     if not POLYGON_API_KEY:
         return out
 
-    # 1) Snapshot parse (preferred)
+    def _apply_from_results(res: Dict[str, Any], out_dict: Dict[str, Any]) -> None:
+        if not isinstance(res, dict):
+            return
+        # OI
+        oi = res.get("open_interest")
+        if oi is not None:
+            out_dict["oi"] = oi
+        # Volume block can vary: "day": {"volume": ...} (sometimes "v" on older payloads)
+        day_block = res.get("day") or {}
+        vol = day_block.get("volume", day_block.get("v"))
+        if vol is not None:
+            out_dict["vol"] = vol
+        # NBBO (single or multi snapshot use same key names)
+        lq = res.get("last_quote") or {}
+        bid_px = lq.get("bid_price")
+        ask_px = lq.get("ask_price")
+        if bid_px is not None:
+            out_dict["bid"] = float(bid_px)
+        if ask_px is not None:
+            out_dict["ask"] = float(ask_px)
+        if out_dict.get("mid") is None and out_dict.get("bid") is not None and out_dict.get("ask") is not None:
+            out_dict["mid"] = round((out_dict["bid"] + out_dict["ask"]) / 2.0, 4)
+        # quote age (prefer SIP timestamp)
+        ts = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp")
+        age = _quote_age_from_ts(ts)
+        if age is not None:
+            out_dict["quote_age_sec"] = age
+        # Greeks
+        greeks = res.get("greeks") or {}
+        for k_src, k_dst in [("delta", "delta"), ("gamma", "gamma"), ("theta", "theta"), ("vega", "vega")]:
+            v = greeks.get(k_src)
+            if v is not None:
+                out_dict[k_dst] = v
+        # IV (either top-level or within greeks as "iv")
+        iv = res.get("implied_volatility") or greeks.get("iv")
+        if iv is not None:
+            out_dict["iv"] = iv
+
+    # 1) Single-contract snapshot first
     try:
         snap = await polygon_get_option_snapshot(client, underlying=symbol, option_ticker=option_ticker)
         if isinstance(snap, dict):
-            res = snap.get("results") or {}
-            if isinstance(res, dict):
-                # OI
-                oi = res.get("open_interest")
-                if oi is not None:
-                    out["oi"] = oi
-                # Volume
-                day_block = res.get("day") or {}
-                vol = day_block.get("volume")
-                if vol is not None:
-                    out["vol"] = vol
-                # NBBO + quote age
-                lq = res.get("last_quote") or {}
-                bid_px = lq.get("bid_price")
-                ask_px = lq.get("ask_price")
-                if bid_px is not None:
-                    out["bid"] = float(bid_px)
-                if ask_px is not None:
-                    out["ask"] = float(ask_px)
-                if out.get("bid") is not None and out.get("ask") is not None:
-                    out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
-                ts = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp")
-                age = _quote_age_from_ts(ts)
-                if age is not None:
-                    out["quote_age_sec"] = age
-                # Greeks
-                greeks = res.get("greeks") or {}
-                for k_src, k_dst in [("delta", "delta"), ("gamma", "gamma"), ("theta", "theta"), ("vega", "vega")]:
-                    v = greeks.get(k_src)
-                    if v is not None:
-                        out[k_dst] = v
-                # IV (per-snapshot)
-                iv = res.get("implied_volatility") or greeks.get("iv")
-                if iv is not None:
-                    out["iv"] = iv
+            _apply_from_results(snap.get("results") or {}, out)
     except Exception:
         pass
 
-    # 2) Previous day open/close for OI / Volume
+    # 1b) Multi-snapshot list (often has intraday OI/Vol when single is sparse)
+    try:
+        # Infer side + expiry from OCC ticker if possible (O:AMD250912P00155000)
+        side = None
+        expiry_iso = None
+        m = re.search(r":([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8,9})$", option_ticker)
+        if m:
+            # underlying YY MM DD side strike*1000
+            yy, mm, dd, cp = m.group(2), m.group(3), m.group(4), m.group(5)
+            expiry_iso = f"20{yy}-{mm}-{dd}"
+            side = "call" if cp.upper() == "C" else "put"
+
+        if side and expiry_iso:
+            rlist = await client.get(
+                f"https://api.polygon.io/v3/snapshot/options/{symbol}",
+                params={
+                    "apiKey": POLYGON_API_KEY,
+                    "contract_type": side,
+                    "expiration_date": expiry_iso,
+                    "limit": 1000,
+                },
+                timeout=8.0
+            )
+            if rlist.status_code == 200:
+                js = rlist.json() or {}
+                # Polygon returns {"results":[{...,"details":{"ticker":"O:AMD..."},"open_interest":...,"day":{"volume":...},"last_quote":{...},"greeks":{...}}, ...]}
+                items = js.get("results") or []
+                # Try exact ticker match via "details.ticker" or top-level "ticker"
+                for it in items:
+                    tkr = (it.get("details") or {}).get("ticker") or it.get("ticker")
+                    if tkr == option_ticker:
+                        _apply_from_results(it, out)
+                        break
+                # If not found by exact, try nearest by normalized strike as soft fallback
+                if "oi" not in out and "vol" not in out and items:
+                    # parse normalized strike from each result if present
+                    cands = []
+                    for it in items:
+                        # details.strike may exist; otherwise parse from details.ticker
+                        det = it.get("details") or {}
+                        s_raw = det.get("strike")
+                        s_norm = _normalize_poly_strike(s_raw)
+                        if s_norm is None:
+                            tk = det.get("ticker") or it.get("ticker") or ""
+                            mm2 = re.search(r"[CP](\d{8,9})$", tk)
+                            if mm2:
+                                try:
+                                    s_norm = int(mm2.group(1)) / 1000.0
+                                except Exception:
+                                    s_norm = None
+                        if s_norm is not None:
+                            cands.append((s_norm, it))
+                    # try to infer desired strike from OCC
+                    desired = None
+                    mm3 = re.search(r"[CP](\d{8,9})$", option_ticker)
+                    if mm3:
+                        try:
+                            desired = int(mm3.group(1)) / 1000.0
+                        except Exception:
+                            desired = None
+                    if desired is not None and cands:
+                        cands.sort(key=lambda x: abs(x[0] - desired))
+                        _apply_from_results(cands[0][1], out)
+    except Exception:
+        pass
+
+    # 2) Previous day open/close for OI / Volume (T+1 OI is common)
     try:
         yday = (today_utc - timedelta(days=1)).isoformat()
         r1 = await client.get(
@@ -489,9 +560,9 @@ async def _poly_option_backfill(
             js = r1.json() or {}
             oi = js.get("open_interest")
             vol = js.get("volume")
-            if (out.get("oi") is None) and (oi is not None):
+            if out.get("oi") is None and oi is not None:
                 out["oi"] = oi
-            if (out.get("vol") is None) and (vol is not None):
+            if out.get("vol") is None and vol is not None:
                 out["vol"] = vol
     except Exception:
         pass
