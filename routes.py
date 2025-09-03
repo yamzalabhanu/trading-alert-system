@@ -1,5 +1,4 @@
 # routes.py
-# at top
 import os
 import asyncio
 import socket
@@ -23,7 +22,11 @@ from config import (
     MAX_LLM_PER_DAY,
 )
 from models import Alert, WebhookResponse
-from polygon_client import list_contracts_for_expiry, get_option_snapshot
+from polygon_client import (
+    list_contracts_for_expiry,
+    get_option_snapshot,
+    build_option_contract,   # <-- import builder
+)
 from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from feature_engine import build_features
@@ -286,7 +289,7 @@ async def polygon_get_option_snapshot(
     underlying: str,
     option_ticker: str,
 ) -> Dict[str, Any]:
-    # keep compatibility if your polygon_client exposes get_option_snapshot(symbol, contract)
+    # keep compatibility if polygon_client exposes either (client, symbol, contract) or (symbol, contract)
     return await get_option_snapshot(client, symbol=underlying, contract=option_ticker) \
         if "client" in get_option_snapshot.__code__.co_varnames else await get_option_snapshot(underlying, option_ticker)
 
@@ -324,6 +327,28 @@ async def _worker():
             WORK_Q.task_done()
 
 # =========================
+# Helpers for ±5% contracts
+# =========================
+def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> Dict[str, Any]:
+    """
+    Returns dict with:
+      strike_call (+5%), strike_put (-5%),
+      contract_call, contract_put
+    """
+    call_strike = round_strike_to_common_increment(ul_px * 1.05)
+    put_strike  = round_strike_to_common_increment(ul_px * 0.95)
+
+    contract_call = build_option_contract(symbol, expiry_iso, "CALL", call_strike)
+    contract_put  = build_option_contract(symbol, expiry_iso, "PUT",  put_strike)
+
+    return {
+        "strike_call": call_strike,
+        "strike_put":  put_strike,
+        "contract_call": contract_call,
+        "contract_put":  contract_put,
+    }
+
+# =========================
 # Core processing (moved off-path)
 # =========================
 async def _process_tradingview_job(job: Dict[str, Any]) -> None:
@@ -349,10 +374,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     force_buy = bool(job["flags"].get("force_buy", False))
     qty = int(job["flags"].get("qty", IBKR_DEFAULT_QTY))
 
-    # Recommendation policy
+    # ===== Recommendation policy — compute two-week Friday expiry (never same-week) =====
     ul_px = float(alert["underlying_price_from_alert"])
-    raw_reco_strike = ul_px * (1.05 if alert["side"] == "CALL" else 0.95)
-    desired_strike = round_strike_to_common_increment(raw_reco_strike)
     today_utc = datetime.now(timezone.utc).date()
     target_expiry_date = two_weeks_friday(today_utc)
     swf = same_week_friday(today_utc)
@@ -360,13 +383,21 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         target_expiry_date = swf + timedelta(days=7)
     target_expiry = target_expiry_date.isoformat()
 
-    option_ticker = "OFFLINE-TICKER"
+    # Build ±5% strikes and OCC contracts deterministically
+    pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
+    if alert["side"] == "CALL":
+        desired_strike = pm["strike_call"]
+        option_ticker  = pm["contract_call"]
+    else:
+        desired_strike = pm["strike_put"]
+        option_ticker  = pm["contract_put"]
+
     f: Dict[str, Any] = {}
 
-    # Data prep (Polygon/features)
+    # ===== Data prep (Polygon/features) =====
     try:
-        if (not POLYGON_API_KEY):
-            # OFFLINE MODE
+        if not POLYGON_API_KEY:
+            # OFFLINE MODE (fabricate minimal set)
             f = {
                 "bid": None, "ask": None, "mid": None,
                 "option_spread_pct": None, "quote_age_sec": None,
@@ -382,20 +413,22 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # ONLINE MODE
-            contracts = await polygon_list_contracts_for_expiry(
-                HTTP, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
-            )
-            if not contracts:
-                raise RuntimeError(f"No contracts for {alert['symbol']} {alert['side']} exp {target_expiry}")
-            best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike)) if contracts else None
-            if not best:
-                raise RuntimeError(f"No strikes near {desired_strike} for {alert['symbol']} on {target_expiry}")
-            option_ticker = best.get("ticker") or best.get("symbol") or best.get("contract")
-            if not option_ticker:
-                raise RuntimeError("Polygon returned contract without ticker")
-
+            # ONLINE MODE — first try direct snapshot for our OCC contract
             snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+
+            # Fallback: if snapshot looks empty (illiquid/missing), search the expiry and pick nearest strike
+            if not snap or not snap.get("_raw"):
+                contracts = await polygon_list_contracts_for_expiry(
+                    HTTP, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
+                )
+                if contracts:
+                    # choose nearest strike and use its ticker if present
+                    best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike))
+                    fallback_ticker = best.get("ticker") or best.get("symbol") or best.get("contract")
+                    if fallback_ticker:
+                        option_ticker = fallback_ticker
+                        snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+
             f = await build_features(
                 HTTP,
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
@@ -487,8 +520,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 
                 ib_result_obj = await place_recommended_option_order(
                     symbol=alert["symbol"],
-                    side=alert["side"],                # "CALL" or "PUT" (your ibkr_client should handle this)
-                    strike=float(desired_strike),     # recommended strike
+                    side=alert["side"],                # "CALL" or "PUT"
+                    strike=float(desired_strike),     # ±5% recommended strike
                     expiry_iso=target_expiry,         # two-weeks Friday rule, ISO "YYYY-MM-DD"
                     quantity=int(qty),
                     limit_price=limit_px,             # None => market
@@ -533,6 +566,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
             "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
+        },
+        "pm_contracts": {  # helpful for debugging
+            "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
+            "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
         }
     })
 
@@ -604,10 +641,17 @@ def report_preview():
     chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
     return {"ok": True, "header": rep["header"], "contract_chunks": chunks, "count": rep["count"]}
 
-# --- NEW: non-blocking webhook that immediately ACKs and enqueues work ---
+# --- Non-blocking webhook: ACKs immediately and enqueues work ---
 @router.post("/webhook", response_class=JSONResponse)
 @router.post("/webhook/tradingview", response_class=JSONResponse)
-async def webhook_tradingview(request: Request, offline: int = Query(default=0), ib: int = Query(default=0), qty: int = Query(default=IBKR_DEFAULT_QTY), force: int = Query(default=0), force_buy: int = Query(default=0)):
+async def webhook_tradingview(
+    request: Request,
+    offline: int = Query(default=0),
+    ib: int = Query(default=0),
+    qty: int = Query(default=IBKR_DEFAULT_QTY),
+    force: int = Query(default=0),
+    force_buy: int = Query(default=0),
+):
     payload_text = await _get_alert_text(request)
     if not payload_text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
