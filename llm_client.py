@@ -11,7 +11,7 @@ from typing import Any, Dict, Tuple
 from openai import AsyncOpenAI
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 _client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
