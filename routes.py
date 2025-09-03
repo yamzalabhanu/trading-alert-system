@@ -24,8 +24,8 @@ from config import (
 from models import Alert, WebhookResponse
 from polygon_client import (
     list_contracts_for_expiry,
-    get_option_snapshot,
-    build_option_contract,   # <-- import builder
+    get_option_snapshot,     # may have either (client, symbol, contract) or (symbol, contract)
+    build_option_contract,   # OCC builder (O:<TICKER><YYMMDD><C/P><STRIKE*1000, 8 digits>)
 )
 from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -44,6 +44,7 @@ _COOLDOWN: Dict[Tuple[str, str], datetime] = {}
 # Shared HTTP client + background queue/worker
 HTTP: httpx.AsyncClient | None = None
 WORK_Q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1000)
+WORKER_COUNT = 0  # for stats
 
 # --- IBKR toggles (env defaults; can be overridden via query params) ---
 def _env_truthy(s: str) -> bool:
@@ -274,7 +275,9 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
 
-# Async wrappers for polygon_client (keeping your current call style)
+# =========================
+# Polygon wrappers (robust)
+# =========================
 async def polygon_list_contracts_for_expiry(
     client: httpx.AsyncClient,
     symbol: str,
@@ -289,9 +292,22 @@ async def polygon_get_option_snapshot(
     underlying: str,
     option_ticker: str,
 ) -> Dict[str, Any]:
-    # keep compatibility if polygon_client exposes either (client, symbol, contract) or (symbol, contract)
-    return await get_option_snapshot(client, symbol=underlying, contract=option_ticker) \
-        if "client" in get_option_snapshot.__code__.co_varnames else await get_option_snapshot(underlying, option_ticker)
+    """
+    Robustly call polygon_client.get_option_snapshot regardless of whether it expects:
+      - (client, *, symbol=..., contract=...)  OR
+      - (symbol, contract)
+    """
+    try:
+        return await get_option_snapshot(client, symbol=underlying, contract=option_ticker)
+    except TypeError as e1:
+        try:
+            return await get_option_snapshot(underlying, option_ticker)
+        except TypeError as e2:
+            raise RuntimeError(
+                f"get_option_snapshot signature mismatch: "
+                f"tried (client,symbol,contract): {e1}; "
+                f"tried (symbol,contract): {e2}"
+            )
 
 # =========================
 # Lifespan: startup/shutdown
@@ -299,14 +315,15 @@ async def polygon_get_option_snapshot(
 
 @router.on_event("startup")
 async def _startup():
-    global HTTP
+    global HTTP, WORKER_COUNT
     HTTP = httpx.AsyncClient(
         http2=True,
         timeout=httpx.Timeout(read=6.0, write=6.0, connect=3.0, pool=3.0),
         limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
     )
     # Start N workers
-    for _ in range(int(os.getenv("WORKERS", "3"))):
+    WORKER_COUNT = int(os.getenv("WORKERS", "3"))
+    for _ in range(WORKER_COUNT):
         asyncio.create_task(_worker())
 
 @router.on_event("shutdown")
@@ -567,7 +584,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
         },
-        "pm_contracts": {  # helpful for debugging
+        "pm_contracts": {
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
             "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
         }
@@ -606,6 +623,16 @@ def logs_today(limit: int = 50):
     todays = [x for x in reversed(_DECISIONS_LOG)
               if isinstance(x.get("timestamp_local"), datetime) and x["timestamp_local"].date() == today_local]
     return {"ok": True, "count": len(todays[:limit]), "items": todays[:limit]}
+
+@router.get("/worker/stats")
+def worker_stats():
+    # Non-blocking queue size check
+    return {
+        "ok": True,
+        "queue_size": WORK_Q.qsize(),
+        "queue_maxsize": WORK_Q.maxsize,
+        "workers": WORKER_COUNT,
+    }
 
 @router.post("/run/daily_report")
 async def run_daily_report():
