@@ -4,6 +4,7 @@ import asyncio
 import socket
 import json
 import re
+from urllib.parse import quote
 from fastapi import Query
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -25,7 +26,7 @@ from models import Alert, WebhookResponse
 from polygon_client import (
     list_contracts_for_expiry,
     get_option_snapshot,     # may be (client, symbol, contract) or (symbol, contract)
-    build_option_contract,
+    build_option_contract,   # OCC builder: O:<SYM><YYMMDD><C/P><STRIKE*1000>
 )
 from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -234,6 +235,23 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
         return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
 
 # =========================
+# HTTP helpers (encoding & safe JSON)
+# =========================
+def _encode_ticker_path(t: str) -> str:
+    return quote(t or "", safe="")
+
+async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+    try:
+        r = await client.get(url, params=params, timeout=timeout)
+        if r.status_code in (402, 403, 404, 429):
+            return None
+        r.raise_for_status()
+        js = r.json()
+        return js if isinstance(js, dict) else None
+    except Exception:
+        return None
+
+# =========================
 # Strike helpers
 # =========================
 def _normalize_poly_strike(raw) -> Optional[float]:
@@ -343,7 +361,6 @@ def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
     return round(age, 3)
 
 def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
-    # Use today's session window (00:00 UTC to now) — Polygon minute bars will still be filtered correctly
     start = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=timezone.utc)
     return start.isoformat(), now_utc.isoformat()
 
@@ -362,7 +379,7 @@ async def _poly_option_backfill(
       2) Single-contract snapshot
       3) Previous-day open/close (T+1 OI/Vol)
       4) Last quote
-      5) Minute aggregates (sum volume intraday) if still missing
+      5) Minute aggregates (sum intraday volume)
     """
     out: Dict[str, Any] = {}
     if not POLYGON_API_KEY:
@@ -387,12 +404,7 @@ async def _poly_option_backfill(
             out_dict["ask"] = float(ask_px)
         if out_dict.get("mid") is None and out_dict.get("bid") is not None and out_dict.get("ask") is not None:
             out_dict["mid"] = round((out_dict["bid"] + out_dict["ask"]) / 2.0, 4)
-        ts = (
-            lq.get("sip_timestamp")
-            or lq.get("participant_timestamp")
-            or lq.get("trf_timestamp")
-            or lq.get("t")
-        )
+        ts = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp") or lq.get("t")
         age = _quote_age_from_ts(ts)
         if age is not None:
             out_dict["quote_age_sec"] = age
@@ -405,7 +417,7 @@ async def _poly_option_backfill(
         if iv is not None:
             out_dict["iv"] = iv
 
-    # 1) Multi-snapshot list
+    # 1) Multi-snapshot list (no ticker in path, so no encoding needed)
     try:
         side = None
         expiry_iso = None
@@ -416,22 +428,21 @@ async def _poly_option_backfill(
             side = "call" if cp.upper() == "C" else "put"
 
         if side and expiry_iso:
-            rlist = await client.get(
+            rlist = await _http_json(
+                client,
                 f"https://api.polygon.io/v3/snapshot/options/{symbol}",
-                params={
-                    "apiKey":     POLYGON_API_KEY,
+                {
+                    "apiKey": POLYGON_API_KEY,
                     "contract_type": side,
                     "expiration_date": expiry_iso,
                     "limit": 1000,
-                    # explicitly request greeks if supported
                     "greeks": "true",
                     "include_greeks": "true",
                 },
                 timeout=8.0
             )
-            if rlist.status_code == 200:
-                js = rlist.json() or {}
-                items = js.get("results") or []
+            if rlist:
+                items = rlist.get("results") or []
                 chosen = None
                 for it in items:
                     tkr = (it.get("details") or {}).get("ticker") or it.get("ticker")
@@ -468,11 +479,17 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 2) Single-contract snapshot
+    # 2) Single-contract snapshot (ticker in path → encode)
     if not out:
         try:
-            snap = await polygon_get_option_snapshot(client, underlying=symbol, option_ticker=option_ticker)
-            if isinstance(snap, dict):
+            enc_opt = _encode_ticker_path(option_ticker)
+            snap = await _http_json(
+                client,
+                f"https://api.polygon.io/v3/snapshot/options/{symbol}/{enc_opt}",
+                {"apiKey": POLYGON_API_KEY},
+                timeout=8.0
+            )
+            if snap:
                 _apply_from_results(snap.get("results") or {}, out)
         except Exception:
             pass
@@ -480,15 +497,16 @@ async def _poly_option_backfill(
     # 3) Previous-day open/close (T+1 OI/Vol)
     try:
         yday = (today_utc - timedelta(days=1)).isoformat()
-        r1 = await client.get(
-            f"https://api.polygon.io/v1/open-close/options/{option_ticker}/{yday}",
-            params={"apiKey": POLYGON_API_KEY},
+        enc_opt = _encode_ticker_path(option_ticker)
+        oc = await _http_json(
+            client,
+            f"https://api.polygon.io/v1/open-close/options/{enc_opt}/{yday}",
+            {"apiKey": POLYGON_API_KEY},
             timeout=6.0
         )
-        if r1.status_code == 200:
-            js = r1.json() or {}
-            oi = js.get("open_interest")
-            vol = js.get("volume")
+        if oc:
+            oi = oc.get("open_interest")
+            vol = oc.get("volume")
             if out.get("oi") is None and oi is not None:
                 out["oi"] = oi
             if out.get("vol") is None and vol is not None:
@@ -496,16 +514,17 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 4) Last quote for NBBO/age
+    # 4) Last quote (NBBO/age)
     try:
-        r2 = await client.get(
-            f"https://api.polygon.io/v3/quotes/options/{option_ticker}/last",
-            params={"apiKey": POLYGON_API_KEY},
+        enc_opt = _encode_ticker_path(option_ticker)
+        lastq = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
+            {"apiKey": POLYGON_API_KEY},
             timeout=6.0
         )
-        if r2.status_code == 200:
-            js = r2.json() or {}
-            res = js.get("results") or {}
+        if lastq:
+            res = lastq.get("results") or {}
             last = res.get("last") or res
             bid_px = last.get("bidPrice")
             ask_px = last.get("askPrice")
@@ -525,16 +544,17 @@ async def _poly_option_backfill(
     # 5) Minute aggregates — compute intraday volume sum if still missing
     try:
         if out.get("vol") is None:
+            enc_opt = _encode_ticker_path(option_ticker)
             now_utc_dt = datetime.now(timezone.utc)
             frm_iso, to_iso = _today_utc_range_for_aggs(now_utc_dt)
-            r3 = await client.get(
-                f"https://api.polygon.io/v2/aggs/ticker/{option_ticker}/range/1/min/{frm_iso}/{to_iso}",
-                params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY},
+            aggs = await _http_json(
+                client,
+                f"https://api.polygon.io/v2/aggs/ticker/{enc_opt}/range/1/min/{frm_iso}/{to_iso}",
+                {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY},
                 timeout=8.0
             )
-            if r3.status_code == 200:
-                js = r3.json() or {}
-                results = js.get("results") or []
+            if aggs:
+                results = aggs.get("results") or []
                 if results:
                     vol_sum = 0
                     for bar in results:
@@ -719,7 +739,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception:
             score, rating = None, None
         decision_path = f"llm.{decision_final}"
-        if bool(job["flags"].get("force_buy", False)):
+        if force_buy:
             decision_final = "buy"
             decision_path = "force.buy"
 
@@ -917,3 +937,77 @@ async def webhook_tradingview(
     except asyncio.QueueFull:
         return JSONResponse({"status": "busy", "detail": "queue full"}, status_code=429)
     return JSONResponse({"status": "accepted"}, status_code=202)
+
+# ================
+# Diagnostics
+# ================
+@router.get("/diag/polygon")
+async def diag_polygon(underlying: str, contract: str):
+    if HTTP is None:
+        raise HTTPException(status_code=503, detail="HTTP client not ready")
+    enc = _encode_ticker_path(contract)
+    out = {}
+
+    # multi-snapshot
+    m = re.search(r":([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8,9})$", contract)
+    if m:
+        yy, mm, dd, cp = m.group(2), m.group(3), m.group(4), m.group(5)
+        expiry_iso = f"20{yy}-{mm}-{dd}"
+        side = "call" if cp.upper() == "C" else "put"
+        out["multi"] = await _http_json(
+            HTTP,
+            f"https://api.polygon.io/v3/snapshot/options/{underlying}",
+            {"apiKey": POLYGON_API_KEY, "contract_type": side, "expiration_date": expiry_iso, "limit": 5, "greeks": "true"},
+            timeout=6.0
+        )
+
+    # single
+    out["single"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0
+    )
+
+    # last quote
+    out["last_quote"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0
+    )
+
+    # open/close yday
+    yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    out["open_close"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v1/open-close/options/{enc}/{yday}",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0
+    )
+
+    # minute aggs
+    now_utc_dt = datetime.now(timezone.utc)
+    frm_iso = datetime(now_utc_dt.year, now_utc_dt.month, now_utc_dt.day, 0,0,0,tzinfo=timezone.utc).isoformat()
+    to_iso = now_utc_dt.isoformat()
+    out["aggs"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/1/min/{frm_iso}/{to_iso}",
+        {"adjusted":"true","sort":"asc","limit":2000,"apiKey":POLYGON_API_KEY},
+        timeout=8.0
+    )
+
+    def skim(d):
+        if not isinstance(d, dict): return d
+        return {
+            "keys": list(d.keys())[:10],
+            "sample": (d.get("results") or d) if not isinstance(d.get("results"), list) else (d.get("results")[:2]),
+            "status_hint": d.get("status"),
+        }
+    return {
+        "multi": skim(out.get("multi")),
+        "single": skim(out.get("single")),
+        "last_quote": skim(out.get("last_quote")),
+        "open_close": skim(out.get("open_close")),
+        "aggs": skim(out.get("aggs")),
+    }
