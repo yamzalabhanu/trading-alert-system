@@ -266,7 +266,6 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
             "avg_fill_price": getattr(res, "avg_fill_price", None),
             "error": getattr(res, "error", None),
         }
-        # Preserve a raw representation
         try:
             payload["raw"] = getattr(res, "raw", None) or repr(res)
         except Exception:
@@ -274,6 +273,33 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
         return payload
     except Exception as e:
         return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
+
+# =========================
+# Strike normalization helpers
+# =========================
+def _normalize_poly_strike(raw) -> Optional[float]:
+    """
+    Polygon v3 sometimes reports strike as:
+      - float (e.g., 155.0) OR
+      - int like 155000 (strike * 1000)
+    Normalize to price dollars.
+    """
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except Exception:
+        return None
+    # Heuristic: treat larger numbers as *1000 (covers 2000+ safely)
+    return v / 1000.0 if v >= 2000 else v
+
+def _within_reasonable_strike(diff: float, step: float) -> bool:
+    """
+    Accept a fallback only if it's reasonably close.
+    step = common increment at this underlying (0.5, 1, 5, 10)
+    Rule: within <= 3 increments OR <= 10 dollars, whichever is larger.
+    """
+    return diff <= max(3 * step, 10.0)
 
 # =========================
 # Polygon wrappers (robust)
@@ -321,7 +347,6 @@ async def _startup():
         timeout=httpx.Timeout(read=6.0, write=6.0, connect=3.0, pool=3.0),
         limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
     )
-    # Start N workers
     WORKER_COUNT = int(os.getenv("WORKERS", "3"))
     for _ in range(WORKER_COUNT):
         asyncio.create_task(_worker())
@@ -370,7 +395,7 @@ def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> D
 # =========================
 def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
     """
-    Try to compute age (seconds) from polygon timestamps (ns or us or ms).
+    Try to compute age (seconds) from polygon timestamps (ns/us/ms/s).
     """
     if ts_val is None:
         return None
@@ -378,15 +403,15 @@ def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
         ns = int(ts_val)
     except Exception:
         return None
-    # Heuristic scale: ns (>=1e12), us (>=1e9), ms (>=1e6), else s
+    # Scale guess
     if ns >= 10**14:
-        sec = ns / 1e9
+        sec = ns / 1e9      # ns
     elif ns >= 10**11:
-        sec = ns / 1e6
+        sec = ns / 1e6      # us
     elif ns >= 10**8:
-        sec = ns / 1e3
+        sec = ns / 1e3      # ms
     else:
-        sec = float(ns)
+        sec = float(ns)     # s
     age = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
     return round(age, 3)
 
@@ -435,7 +460,6 @@ async def _poly_option_backfill(
                     out["ask"] = float(ask_px)
                 if out.get("bid") is not None and out.get("ask") is not None:
                     out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
-                # quote age
                 ts = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp")
                 age = _quote_age_from_ts(ts)
                 if age is not None:
@@ -454,7 +478,6 @@ async def _poly_option_backfill(
         pass
 
     # 2) Previous day open/close for OI / Volume
-    # Use market day "yesterday" in UTC terms; you can make this more robust by using a US market calendar.
     try:
         yday = (today_utc - timedelta(days=1)).isoformat()
         r1 = await client.get(
@@ -494,8 +517,8 @@ async def _poly_option_backfill(
                 out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
             ts = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
             age = _quote_age_from_ts(ts)
-            if age is not None:
-                out["quote_age_sec"] = age if out.get("quote_age_sec") is None else out["quote_age_sec"]
+            if age is not None and out.get("quote_age_sec") is None:
+                out["quote_age_sec"] = age
     except Exception:
         pass
 
@@ -508,7 +531,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     """
     job keys:
       - alert_text (str)
-      - flags: dict(ib_enabled, force, force_buy, qty)
+      - flags: dict(ib_enabled, force, force_buy, qty, debug)
     """
     global HTTP
     if HTTP is None:
@@ -526,6 +549,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     force = bool(job["flags"].get("force", False))
     force_buy = bool(job["flags"].get("force_buy", False))
     qty = int(job["flags"].get("qty", IBKR_DEFAULT_QTY))
+    debug_mode = bool(job["flags"].get("debug", False))
 
     # ===== Recommendation policy — compute two-week Friday expiry (never same-week) =====
     ul_px = float(alert["underlying_price_from_alert"])
@@ -546,6 +570,12 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         option_ticker  = pm["contract_put"]
 
     f: Dict[str, Any] = {}
+    selection_debug: Dict[str, Any] = {
+        "desired_strike": desired_strike,
+        "selected_ticker_initial": option_ticker,
+        "fallback_considered": [],
+        "fallback_applied": False,
+    }
 
     # ===== Data prep (Polygon/features) =====
     try:
@@ -569,17 +599,58 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             # ONLINE MODE — first try direct snapshot for our OCC contract
             snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
 
-            # Fallback: if snapshot looks empty (illiquid/missing), search the expiry and pick nearest strike
+            # Fallback: if snapshot looks empty (illiquid/missing), search the expiry and pick nearest strike (normalized)
             if not snap or not snap.get("results"):
                 contracts = await polygon_list_contracts_for_expiry(
                     HTTP, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
                 )
                 if contracts:
-                    best = min(contracts, key=lambda c: abs(float(c.get("strike", 0)) - desired_strike))
-                    fallback_ticker = best.get("ticker") or best.get("symbol") or best.get("contract")
-                    if fallback_ticker:
-                        option_ticker = fallback_ticker
-                        snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+                    candidates = []
+                    for c in contracts:
+                        cs = _normalize_poly_strike(c.get("strike"))
+                        if cs is None:
+                            tk = c.get("ticker") or c.get("symbol") or c.get("contract") or ""
+                            m = re.search(r"[CP](\d{8,9})$", tk or "")
+                            if m:
+                                try:
+                                    cs = int(m.group(1)) / 1000.0
+                                except Exception:
+                                    cs = None
+                        if cs is not None:
+                            diff = abs(cs - desired_strike)
+                            candidates.append((diff, cs, c))
+
+                    # sort by closeness
+                    candidates.sort(key=lambda x: x[0])
+                    if debug_mode:
+                        selection_debug["fallback_considered"] = [
+                            {
+                                "diff": d,
+                                "strike_norm": s,
+                                "ticker": cand.get("ticker") or cand.get("symbol") or cand.get("contract")
+                            }
+                            for d, s, cand in candidates[:5]
+                        ]
+
+                    if candidates:
+                        best_diff, best_strike_norm, best_contract = candidates[0]
+                        # sanity gate: only replace if reasonably close
+                        step = 0.5 if ul_px < 25 else (1 if ul_px < 200 else (5 if ul_px < 1000 else 10))
+                        if _within_reasonable_strike(best_diff, step):
+                            fallback_ticker = (
+                                best_contract.get("ticker")
+                                or best_contract.get("symbol")
+                                or best_contract.get("contract")
+                            )
+                            if fallback_ticker:
+                                option_ticker = fallback_ticker
+                                selection_debug["fallback_applied"] = True
+                                selection_debug["selected_ticker_fallback"] = option_ticker
+                                selection_debug["selected_strike_norm"] = best_strike_norm
+                                # fetch snapshot for the fallback
+                                snap = await polygon_get_option_snapshot(
+                                    HTTP, underlying=alert["symbol"], option_ticker=option_ticker
+                                )
 
             f = await build_features(
                 HTTP,
@@ -587,14 +658,12 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 snapshot=snap
             )
 
-            # ---- Backfill: first parse snapshot to flatten nested fields ----
+            # ---- Backfill: parse snapshot + other endpoints to fill sparse fields ----
             extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
             if extra_from_snap:
-                # Only overlay missing fields
                 for k, v in extra_from_snap.items():
                     if v is not None and (f.get(k) is None):
                         f[k] = v
-                # ensure mid derives if now both bid/ask exist
                 if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
                     f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
 
@@ -691,7 +760,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 
     _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
 
-    _DECISIONS_LOG.append({
+    log_entry = {
         "timestamp_local": market_now(),
         "symbol": alert["symbol"],
         "side": alert["side"],
@@ -723,7 +792,11 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
             "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
         }
-    })
+    }
+    if debug_mode:
+        log_entry["selection_debug"] = selection_debug
+
+    _DECISIONS_LOG.append(log_entry)
 
 # =========================
 # Routes
@@ -812,6 +885,7 @@ async def webhook_tradingview(
     qty: int = Query(default=IBKR_DEFAULT_QTY),
     force: int = Query(default=0),
     force_buy: int = Query(default=0),
+    debug: int = Query(default=0),
 ):
     payload_text = await _get_alert_text(request)
     if not payload_text:
@@ -833,6 +907,7 @@ async def webhook_tradingview(
             "force": bool(force),
             "force_buy": bool(force_buy),
             "qty": int(qty),
+            "debug": bool(debug),
         }
     }
 
