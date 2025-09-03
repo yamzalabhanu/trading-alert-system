@@ -56,6 +56,18 @@ IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()
 IBKR_ORDER_MODE = os.getenv("IBKR_ORDER_MODE", "auto").lower()   # auto | market | limit
 IBKR_USE_MID_AS_LIMIT = os.getenv("IBKR_USE_MID_AS_LIMIT", "1") == "1"
 
+# =========================
+# Trading thresholds (tunable)
+# =========================
+TARGET_DELTA_CALL = float(os.getenv("TARGET_DELTA_CALL", "0.35"))
+TARGET_DELTA_PUT  = float(os.getenv("TARGET_DELTA_PUT", "-0.35"))
+MAX_SPREAD_PCT    = float(os.getenv("MAX_SPREAD_PCT", "6.0"))
+MAX_QUOTE_AGE_S   = float(os.getenv("MAX_QUOTE_AGE_S", "30"))
+MIN_VOL_TODAY     = int(os.getenv("MIN_VOL_TODAY", "100"))
+MIN_OI            = int(os.getenv("MIN_OI", "200"))
+MIN_DTE           = int(os.getenv("MIN_DTE", "3"))
+MAX_DTE           = int(os.getenv("MAX_DTE", "45"))
+
 # ========== Regex ==========
 ALERT_RE_WITH_EXP = re.compile(
     r"^\s*(CALL|PUT)\s*Signal:\s*([A-Z][A-Z0-9\.\-]*)\s*at\s*([0-9]*\.?[0-9]+)\s*"
@@ -296,50 +308,6 @@ async def polygon_get_option_snapshot(
             )
 
 # =========================
-# Lifespan
-# =========================
-@router.on_event("startup")
-async def _startup():
-    global HTTP, WORKER_COUNT
-    HTTP = httpx.AsyncClient(
-        http2=True,
-        timeout=httpx.Timeout(read=6.0, write=6.0, connect=3.0, pool=3.0),
-        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
-    )
-    WORKER_COUNT = int(os.getenv("WORKERS", "3"))
-    for _ in range(WORKER_COUNT):
-        asyncio.create_task(_worker())
-
-@router.on_event("shutdown")
-async def _shutdown():
-    global HTTP
-    if HTTP:
-        await HTTP.aclose()
-
-async def _worker():
-    while True:
-        job = await WORK_Q.get()
-        try:
-            await _process_tradingview_job(job)
-        except Exception as e:
-            print(f"[worker] error: {e!r}")
-        finally:
-            WORK_Q.task_done()
-
-# =========================
-# ±5% helpers
-# =========================
-def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> Dict[str, Any]:
-    call_strike = round_strike_to_common_increment(ul_px * 1.05)
-    put_strike  = round_strike_to_common_increment(ul_px * 0.95)
-    return {
-        "strike_call": call_strike,
-        "strike_put":  put_strike,
-        "contract_call": build_option_contract(symbol, expiry_iso, "CALL", call_strike),
-        "contract_put":  build_option_contract(symbol, expiry_iso, "PUT",  put_strike),
-    }
-
-# =========================
 # Time & age helpers
 # =========================
 def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
@@ -361,8 +329,40 @@ def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
     return round(age, 3)
 
 def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
-    start = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=timezone.utc)
-    return start.isoformat(), now_utc.isoformat()
+    start = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+    return start, now_utc.isoformat()
+
+# =========================
+# Quote sampler
+# =========================
+async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Dict[str, Any]]:
+    best = {}
+    for _ in range(tries):
+        lastq = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
+                                 {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+        if lastq:
+            res = lastq.get("results") or {}
+            last = res.get("last") or res
+            bid = last.get("bidPrice")
+            ask = last.get("askPrice")
+            ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
+            if bid is not None and ask is not None and ask >= bid:
+                mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
+                spread_pct = ((ask - bid) / mid * 100) if (mid and mid > 0) else None
+                age = _quote_age_from_ts(ts)
+                cand = {
+                    "bid": float(bid) if bid is not None else None,
+                    "ask": float(ask) if ask is not None else None,
+                    "mid": float(mid) if mid is not None else None,
+                    "quote_age_sec": age,
+                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
+                }
+                if not best or \
+                   (cand["option_spread_pct"] or 1e9) < (best.get("option_spread_pct") or 1e9) or \
+                   (cand["quote_age_sec"] or 1e9) < (best.get("quote_age_sec") or 1e9):
+                    best = cand
+        await asyncio.sleep(delay)
+    return best or None
 
 # =========================
 # Backfill layers (multi-snapshot FIRST)
@@ -373,15 +373,6 @@ async def _poly_option_backfill(
     option_ticker: str,
     today_utc: date,
 ) -> Dict[str, Any]:
-    """
-    Fill oi/vol/nbbo/greeks/iv/quote_age via:
-      1) Multi-snapshot list (prefer; request greeks)
-      2) Single-contract snapshot
-      3) Previous-day open/close (T+1 OI/Vol)
-      4) Last quote
-      5) Minute aggregates (sum intraday volume)
-      Fallbacks: use last_trade as pseudo-quote for mid/age if NBBO is unavailable.
-    """
     out: Dict[str, Any] = {}
     if not POLYGON_API_KEY:
         return out
@@ -395,13 +386,13 @@ async def _poly_option_backfill(
         if oi is not None:
             out_dict["oi"] = oi
 
-        # Day block (volume, etc.)
+        # Day -> volume
         day_block = res.get("day") or {}
         vol = day_block.get("volume", day_block.get("v"))
         if vol is not None:
             out_dict["vol"] = vol
 
-        # Preferred: last_quote
+        # Prefer last_quote
         lq = res.get("last_quote") or {}
         bid_px = lq.get("bid_price")
         ask_px = lq.get("ask_price")
@@ -412,37 +403,27 @@ async def _poly_option_backfill(
         if out_dict.get("mid") is None and out_dict.get("bid") is not None and out_dict.get("ask") is not None:
             out_dict["mid"] = round((out_dict["bid"] + out_dict["ask"]) / 2.0, 4)
 
-        # If no last_quote, fallback to last_trade (treat price as a pseudo-mid)
-        if out_dict.get("mid") is None:
+        # Age (prefer quote ts)
+        ts = (
+            lq.get("sip_timestamp")
+            or lq.get("participant_timestamp")
+            or lq.get("trf_timestamp")
+            or lq.get("t")
+        )
+        if ts is None:
             lt = res.get("last_trade") or {}
             lt_px = lt.get("price")
-            if isinstance(lt_px, (int, float)):
+            if isinstance(lt_px, (int, float)) and out_dict.get("mid") is None:
                 out_dict["mid"] = float(lt_px)
-            # timestamps for age (prefer quote ts; else trade ts)
             ts = (
-                lq.get("sip_timestamp")
-                or lq.get("participant_timestamp")
-                or lq.get("trf_timestamp")
-                or lq.get("t")
-                or lt.get("sip_timestamp")
+                lt.get("sip_timestamp")
                 or lt.get("participant_timestamp")
                 or lt.get("trf_timestamp")
                 or lt.get("t")
             )
-            age = _quote_age_from_ts(ts)
-            if age is not None:
-                out_dict["quote_age_sec"] = age
-        else:
-            # We did have last_quote; compute age from it
-            ts = (
-                lq.get("sip_timestamp")
-                or lq.get("participant_timestamp")
-                or lq.get("trf_timestamp")
-                or lq.get("t")
-            )
-            age = _quote_age_from_ts(ts)
-            if age is not None:
-                out_dict["quote_age_sec"] = age
+        age = _quote_age_from_ts(ts)
+        if age is not None:
+            out_dict["quote_age_sec"] = age
 
         # Greeks & IV
         greeks = res.get("greeks") or {}
@@ -454,17 +435,13 @@ async def _poly_option_backfill(
         if iv is not None:
             out_dict["iv"] = iv
 
-    # 1) Multi-snapshot list (no ticker in path)
+    # 1) Multi-snapshot (list)
     try:
-        side = None
-        expiry_iso = None
         m = re.search(r":([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8,9})$", option_ticker)
         if m:
             yy, mm, dd, cp = m.group(2), m.group(3), m.group(4), m.group(5)
             expiry_iso = f"20{yy}-{mm}-{dd}"
             side = "call" if cp.upper() == "C" else "put"
-
-        if side and expiry_iso:
             rlist = await _http_json(
                 client,
                 f"https://api.polygon.io/v3/snapshot/options/{symbol}",
@@ -486,7 +463,8 @@ async def _poly_option_backfill(
                     if tkr == option_ticker:
                         chosen = it
                         break
-                if chosen is None and items:
+                if not chosen and items:
+                    # fallback by strike proximity
                     desired = None
                     mm3 = re.search(r"[CP](\d{8,9})$", option_ticker)
                     if mm3:
@@ -516,7 +494,7 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 2) Single-contract snapshot (ticker in path → encode)
+    # 2) Single-contract snapshot
     if not out:
         try:
             enc_opt = _encode_ticker_path(option_ticker)
@@ -551,34 +529,18 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 4) Last quote (NBBO/age) — some plans don’t return this; we already used last_trade fallback above
+    # 4) Sample best quote (tightest/freshest)
     try:
         enc_opt = _encode_ticker_path(option_ticker)
-        lastq = await _http_json(
-            client,
-            f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
-            {"apiKey": POLYGON_API_KEY},
-            timeout=6.0
-        )
-        if lastq:
-            res = lastq.get("results") or {}
-            last = res.get("last") or res
-            bid_px = last.get("bidPrice")
-            ask_px = last.get("askPrice")
-            if bid_px is not None:
-                out.setdefault("bid", float(bid_px))
-            if ask_px is not None:
-                out.setdefault("ask", float(ask_px))
-            if out.get("mid") is None and out.get("bid") is not None and out.get("ask") is not None:
-                out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
-            ts = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-            age = _quote_age_from_ts(ts)
-            if age is not None and out.get("quote_age_sec") is None:
-                out["quote_age_sec"] = age
+        sampled = await _sample_best_quote(client, enc_opt, tries=5, delay=0.6)
+        if sampled:
+            for k, v in sampled.items():
+                if v is not None:
+                    out[k] = v
     except Exception:
         pass
 
-    # 5) Minute aggregates — compute intraday volume sum if still missing (plan-dependent)
+    # 5) Minute aggregates (intraday volume sum if missing)
     try:
         if out.get("vol") is None:
             enc_opt = _encode_ticker_path(option_ticker)
@@ -604,6 +566,199 @@ async def _poly_option_backfill(
         pass
 
     return out
+
+# =========================
+# ±5% helpers
+# =========================
+def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> Dict[str, Any]:
+    call_strike = round_strike_to_common_increment(ul_px * 1.05)
+    put_strike  = round_strike_to_common_increment(ul_px * 0.95)
+    return {
+        "strike_call": call_strike,
+        "strike_put":  put_strike,
+        "contract_call": build_option_contract(symbol, expiry_iso, "CALL", call_strike),
+        "contract_put":  build_option_contract(symbol, expiry_iso, "PUT",  put_strike),
+    }
+
+# =========================
+# Delta-targeted selector (uses multi-snapshot where possible)
+# =========================
+async def _choose_best_contract(
+    client: httpx.AsyncClient,
+    symbol: str,
+    expiry_iso: str,
+    side: str,
+    ul_px: float,
+    desired_strike: float,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns (ticker, debug_info)
+    Ranking:
+      1) |delta - target|  (0.35 for calls, -0.35 for puts)
+      2) lower spread%
+      3) higher intraday volume
+      4) higher OI
+      5) |strike - desired_strike|
+    """
+    debug = {"candidates": []}
+    if not POLYGON_API_KEY:
+        # Fall back to ±5% contract
+        base = _build_plus_minus_contracts(symbol, ul_px, expiry_iso)
+        t = base["contract_call"] if side == "CALL" else base["contract_put"]
+        return t, {"reason": "offline/no key"}
+
+    # Pull the chain list (to know available contracts)
+    chain = await polygon_list_contracts_for_expiry(client, symbol=symbol, expiry=expiry_iso, side=side, limit=1000)
+    if not chain:
+        base = _build_plus_minus_contracts(symbol, ul_px, expiry_iso)
+        t = base["contract_call"] if side == "CALL" else base["contract_put"]
+        return t, {"reason": "no_chain"}
+
+    # Multi snapshot to get greeks & basics
+    try:
+        side_poly = "call" if side.upper() == "CALL" else "put"
+        mlist = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/snapshot/options/{symbol}",
+            {
+                "apiKey": POLYGON_API_KEY,
+                "contract_type": side_poly,
+                "expiration_date": expiry_iso,
+                "limit": 1000,
+                "greeks": "true",
+            },
+            timeout=8.0
+        )
+    except Exception:
+        mlist = None
+
+    index_by_ticker = {}
+    if mlist:
+        for it in (mlist.get("results") or []):
+            tk = (it.get("details") or {}).get("ticker") or it.get("ticker")
+            if tk:
+                index_by_ticker[tk] = it
+
+    # Build scored candidates
+    cands: List[Tuple] = []
+    for c in chain:
+        tk = c.get("ticker") or c.get("symbol") or c.get("contract")
+        if not tk:
+            continue
+        det = index_by_ticker.get(tk) or {}
+        greeks = det.get("greeks") or {}
+        delta = greeks.get("delta")
+        oi = det.get("open_interest")
+        day_block = det.get("day") or {}
+        vol = day_block.get("volume")
+        # quick quote sample (1 try to keep latency bounded)
+        enc = _encode_ticker_path(tk)
+        q = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+                             {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+        spread_pct = None
+        if q:
+            res = q.get("results") or {}
+            last = res.get("last") or res
+            b, a = last.get("bidPrice"), last.get("askPrice")
+            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0 and b >= 0:
+                mid = (a + b)/2.0
+                if mid > 0:
+                    spread_pct = (a - b)/mid*100.0
+
+        # distance to target delta
+        tgt = TARGET_DELTA_CALL if side == "CALL" else TARGET_DELTA_PUT
+        delta_miss = abs((delta if isinstance(delta, (int, float)) else tgt) - tgt)
+
+        # desired strike distance
+        s_norm = _normalize_poly_strike(c.get("strike"))
+        if s_norm is None:
+            m2 = re.search(r"[CP](\d{8,9})$", tk)
+            if m2:
+                try:
+                    s_norm = int(m2.group(1)) / 1000.0
+                except Exception:
+                    s_norm = None
+        strike_miss = abs((s_norm if s_norm is not None else desired_strike) - desired_strike)
+
+        # Score tuple
+        rank_tuple = (
+            delta_miss,
+            (spread_pct if spread_pct is not None else 1e9),
+            -(vol or 0),
+            -(oi or 0),
+            strike_miss,
+        )
+        cands.append((rank_tuple, tk, delta, spread_pct, vol, oi, s_norm))
+
+    if not cands:
+        base = _build_plus_minus_contracts(symbol, ul_px, expiry_iso)
+        t = base["contract_call"] if side == "CALL" else base["contract_put"]
+        return t, {"reason": "no_candidates"}
+
+    cands.sort(key=lambda x: x[0])
+    top = cands[0]
+    debug["candidates"] = [
+        {
+            "ticker": tk,
+            "rank": r[0],
+            "delta": d,
+            "spread_pct": sp,
+            "vol": v,
+            "oi": oi,
+            "strike": s,
+        }
+        for r, tk, d, sp, v, oi, s in cands[:5]
+    ]
+    return top[1], debug
+
+# =========================
+# Preflight gates (hard filters before LLM)
+# =========================
+def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    checks = {}
+    checks["quote_fresh"] = (f.get("quote_age_sec") is not None and f["quote_age_sec"] <= MAX_QUOTE_AGE_S)
+    checks["spread_ok"]   = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= MAX_SPREAD_PCT)
+    checks["vol_ok"]      = (f.get("vol") or 0) >= MIN_VOL_TODAY
+    checks["oi_ok"]       = (f.get("oi") or 0) >= MIN_OI
+    dte_val = f.get("dte")
+    if dte_val is None:
+        # compute defensively
+        checks["dte_ok"] = False
+    else:
+        checks["dte_ok"] = (MIN_DTE <= dte_val <= MAX_DTE)
+    ok = all(checks.values())
+    return ok, checks
+
+# =========================
+# Lifespan
+# =========================
+@router.on_event("startup")
+async def _startup():
+    global HTTP, WORKER_COUNT
+    HTTP = httpx.AsyncClient(
+        http2=True,
+        timeout=httpx.Timeout(read=6.0, write=6.0, connect=3.0, pool=3.0),
+        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+    )
+    WORKER_COUNT = int(os.getenv("WORKERS", "3"))
+    for _ in range(WORKER_COUNT):
+        asyncio.create_task(_worker())
+
+@router.on_event("shutdown")
+async def _shutdown():
+    global HTTP
+    if HTTP:
+        await HTTP.aclose()
+
+async def _worker():
+    while True:
+        job = await WORK_Q.get()
+        try:
+            await _process_tradingview_job(job)
+        except Exception as e:
+            print(f"[worker] error: {e!r}")
+        finally:
+            WORK_Q.task_done()
 
 # =========================
 # Core processing
@@ -634,21 +789,20 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         target_expiry_date = swf + timedelta(days=7)
     target_expiry = target_expiry_date.isoformat()
 
+    # ±5% contracts for reference/logs
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
-    if alert["side"] == "CALL":
-        desired_strike = pm["strike_call"]
-        option_ticker  = pm["contract_call"]
-    else:
-        desired_strike = pm["strike_put"]
-        option_ticker  = pm["contract_put"]
+    desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
+
+    # Delta-targeted selection with liquidity tie-breakers
+    try:
+        option_ticker, sel_dbg = await _choose_best_contract(
+            HTTP, alert["symbol"], target_expiry, alert["side"], ul_px, desired_strike
+        )
+    except Exception:
+        option_ticker, sel_dbg = (pm["contract_call"] if alert["side"] == "CALL" else pm["contract_put"], {"reason": "selector_error"})
 
     f: Dict[str, Any] = {}
-    selection_debug: Dict[str, Any] = {
-        "desired_strike": desired_strike,
-        "selected_ticker_initial": option_ticker,
-        "fallback_considered": [],
-        "fallback_applied": False,
-    }
+    selection_debug: Dict[str, Any] = {"desired_strike": desired_strike, "selected_ticker": option_ticker, **(sel_dbg or {})}
 
     try:
         if not POLYGON_API_KEY:
@@ -667,79 +821,20 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # Enrich FIRST (now maps last_trade fallback)
+            # Enrich FIRST (multi-source)
             extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
-            if debug_mode:
-                print({"_debug_backfill": {k: extra_from_snap.get(k) for k in ["oi","vol","bid","ask","mid","quote_age_sec","delta","gamma","theta","vega","iv"]}})
 
-            # ---------- PRE-SEED features with enrichment ----------
-            f = {}
+            # Seed features with enrichment
             for k, v in (extra_from_snap or {}).items():
                 if v is not None:
                     f[k] = v
-            # ------------------------------------------------------
 
-            # Try to get per-contract snapshot for build_features internal logic
+            # Single contract snapshot (for build_features internals)
             snap = None
-            if not extra_from_snap:
-                try:
-                    snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
-                except Exception:
-                    snap = None
-
-            # As last resort, list contracts to find nearest (guarded)
-            if (not extra_from_snap) and (not snap or not snap.get("results")):
-                contracts = await polygon_list_contracts_for_expiry(
-                    HTTP, symbol=alert["symbol"], expiry=target_expiry, side=alert["side"], limit=250
-                )
-                if contracts:
-                    candidates = []
-                    for c in contracts:
-                        cs = _normalize_poly_strike(c.get("strike"))
-                        if cs is None:
-                            tk = c.get("ticker") or c.get("symbol") or c.get("contract") or ""
-                            m2 = re.search(r"[CP](\d{8,9})$", tk or "")
-                            if m2:
-                                try:
-                                    cs = int(m2.group(1)) / 1000.0
-                                except Exception:
-                                    cs = None
-                        if cs is not None:
-                            diff = abs(cs - desired_strike)
-                            candidates.append((diff, cs, c))
-                    candidates.sort(key=lambda x: x[0])
-                    if debug_mode:
-                        selection_debug["fallback_considered"] = [
-                            {
-                                "diff": d,
-                                "strike_norm": s,
-                                "ticker": cand.get("ticker") or cand.get("symbol") or cand.get("contract")
-                            }
-                            for d, s, cand in candidates[:5]
-                        ]
-                    if candidates:
-                        step = 0.5 if ul_px < 25 else (1 if ul_px < 200 else (5 if ul_px < 1000 else 10))
-                        best_diff, best_strike_norm, best_contract = candidates[0]
-                        if _within_reasonable_strike(best_diff, step):
-                            fallback_ticker = (
-                                best_contract.get("ticker")
-                                or best_contract.get("symbol")
-                                or best_contract.get("contract")
-                            )
-                            if fallback_ticker:
-                                option_ticker = fallback_ticker
-                                selection_debug["fallback_applied"] = True
-                                selection_debug["selected_ticker_fallback"] = option_ticker
-                                selection_debug["selected_strike_norm"] = best_strike_norm
-                                extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
-                                # merge new enrichment into f (prefer non-null)
-                                for k, v in (extra_from_snap or {}).items():
-                                    if v is not None and f.get(k) is None:
-                                        f[k] = v
-                                try:
-                                    snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
-                                except Exception:
-                                    snap = None
+            try:
+                snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
+            except Exception:
+                snap = None
 
             # Build core features (trend, regime, sr, iv_rank, etc.)
             core = await build_features(
@@ -747,23 +842,22 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
                 snapshot=snap
             )
-            # ---------- POST-MERGE core into f without clobbering good values ----------
             for k, v in (core or {}).items():
                 if v is not None or k not in f:
                     f[k] = v
 
-            # Ensure mid if we at least have bid/ask
+            # Ensure mid if we have bid/ask
             if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
                 f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
 
-            # --- NEW: fill DTE if missing ---
+            # Fill DTE if missing
             try:
                 if f.get("dte") is None:
                     f["dte"] = (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days
             except Exception:
                 pass
 
-            # --- NEW: compute spread % if we have a book ---
+            # Compute spread %
             try:
                 bid = f.get("bid")
                 ask = f.get("ask")
@@ -782,14 +876,16 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # ---------- Decisioning / LLM / Telegram / IBKR ----------
+    # ---------- Preflight gates (before LLM) ----------
+    pf_ok, pf_checks = preflight_ok(f)
+
     in_window = allowed_now_cdt() or force
 
     llm_ran = False
     llm_reason = ""
     tg_result = None
     decision_final = "skip"
-    decision_path = "window.skip"
+    decision_path = "preflight.fail"
     score: Optional[float] = None
     rating: Optional[str] = None
     llm: Dict[str, Any] = {"decision": "wait", "confidence": 0.0, "reason": "", "checklist": {}, "ev_estimate": {}}
@@ -797,7 +893,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
 
-    if in_window:
+    if in_window and (pf_ok or force_buy):
+        # Run LLM if liquidity OK (or force_buy overrides)
         try:
             llm = await analyze_with_openai(alert, f)
             consume_llm()
@@ -815,52 +912,56 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         if force_buy:
             decision_final = "buy"
             decision_path = "force.buy"
-
-        try:
-            tg_text = compose_telegram_text(
-                alert={**alert, "strike": desired_strike, "expiry": target_expiry},
-                option_ticker=option_ticker,
-                f=f,
-                llm=llm,
-                llm_ran=True,
-                llm_reason="",
-                score=score,
-                rating=rating
-            )
-            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                tg_result = await send_telegram(tg_text)
-        except Exception as e:
-            print(f"[worker] Telegram error: {e}")
-
-        try:
-            if decision_final == "buy" and ib_enabled:
-                ib_attempted = True
-                mode = IBKR_ORDER_MODE
-                mid = f.get("mid")
-                if mode == "market":
-                    use_market = True
-                elif mode == "limit":
-                    use_market = (mid is None)
-                else:
-                    use_market = not (IBKR_USE_MID_AS_LIMIT and (mid is not None))
-                limit_px = None if use_market else float(mid) if mid is not None else None
-
-                ib_result_obj = await place_recommended_option_order(
-                    symbol=alert["symbol"],
-                    side=alert["side"],
-                    strike=float(desired_strike),
-                    expiry_iso=target_expiry,
-                    quantity=int(qty),
-                    limit_price=limit_px,
-                    action="BUY",
-                    tif=IBKR_TIF,
-                )
-        except Exception as e:
-            ib_result_obj = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     else:
-        llm_reason = "Outside processing windows (Allowed: 08:30–11:30 & 14:00–15:00 CDT). LLM + Telegram skipped."
-        ib_attempted = False
-        ib_result_obj = None
+        if not in_window:
+            llm_reason = "Outside processing windows (Allowed: 08:30–11:30 & 14:00–15:00 CDT). LLM + Telegram skipped."
+            decision_path = "window.skip"
+        elif not pf_ok:
+            llm_reason = f"Preflight failed: {pf_checks}"
+
+    # Telegram
+    try:
+        tg_text = compose_telegram_text(
+            alert={**alert, "strike": desired_strike, "expiry": target_expiry},
+            option_ticker=option_ticker,
+            f=f,
+            llm=llm,
+            llm_ran=(decision_path.startswith("llm.") or decision_path == "force.buy"),
+            llm_reason=llm_reason,
+            score=score,
+            rating=rating
+        )
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            tg_result = await send_telegram(tg_text)
+    except Exception as e:
+        print(f"[worker] Telegram error: {e}")
+
+    # IBKR placement
+    try:
+        if (decision_final == "buy") and ib_enabled:
+            ib_attempted = True
+            mode = IBKR_ORDER_MODE
+            mid = f.get("mid")
+            if mode == "market":
+                use_market = True
+            elif mode == "limit":
+                use_market = (mid is None)
+            else:
+                use_market = not (IBKR_USE_MID_AS_LIMIT and (mid is not None))
+            limit_px = None if use_market else float(mid) if mid is not None else None
+
+            ib_result_obj = await place_recommended_option_order(
+                symbol=alert["symbol"],
+                side=alert["side"],
+                strike=float(desired_strike),
+                expiry_iso=target_expiry,
+                quantity=int(qty),
+                limit_price=limit_px,
+                action="BUY",
+                tif=IBKR_TIF,
+            )
+    except Exception as e:
+        ib_result_obj = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
 
@@ -876,7 +977,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "ran": llm_ran,
             "decision": llm.get("decision"),
             "confidence": llm.get("confidence"),
-            "reason": llm.get("reason")
+            "reason": llm.get("reason") if llm_ran else llm_reason
         },
         "features": {
             "reco_expiry": target_expiry,
@@ -895,10 +996,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         "pm_contracts": {
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
             "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
-        }
+        },
+        "preflight": pf_checks,
+        "selection_debug": selection_debug,
     }
-    if debug_mode:
-        log_entry["selection_debug"] = selection_debug
 
     _DECISIONS_LOG.append(log_entry)
 
@@ -972,6 +1073,7 @@ def report_preview():
     chunks = _chunk_lines_for_telegram(rep["contracts"], prefix=f"🧾 Contracts ({rep['count']}):")
     return {"ok": True, "header": rep["header"], "contract_chunks": chunks, "count": rep["count"]}
 
+# --- Non-blocking webhook: ACK + enqueue ---
 @router.post("/webhook", response_class=JSONResponse)
 @router.post("/webhook/tradingview", response_class=JSONResponse)
 async def webhook_tradingview(
