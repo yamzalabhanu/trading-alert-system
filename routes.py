@@ -380,6 +380,7 @@ async def _poly_option_backfill(
       3) Previous-day open/close (T+1 OI/Vol)
       4) Last quote
       5) Minute aggregates (sum intraday volume)
+      Fallbacks: use last_trade as pseudo-quote for mid/age if NBBO is unavailable.
     """
     out: Dict[str, Any] = {}
     if not POLYGON_API_KEY:
@@ -388,13 +389,19 @@ async def _poly_option_backfill(
     def _apply_from_results(res: Dict[str, Any], out_dict: Dict[str, Any]) -> None:
         if not isinstance(res, dict):
             return
+
+        # OI (top-level)
         oi = res.get("open_interest")
         if oi is not None:
             out_dict["oi"] = oi
+
+        # Day block (volume, etc.)
         day_block = res.get("day") or {}
         vol = day_block.get("volume", day_block.get("v"))
         if vol is not None:
             out_dict["vol"] = vol
+
+        # Preferred: last_quote
         lq = res.get("last_quote") or {}
         bid_px = lq.get("bid_price")
         ask_px = lq.get("ask_price")
@@ -404,10 +411,40 @@ async def _poly_option_backfill(
             out_dict["ask"] = float(ask_px)
         if out_dict.get("mid") is None and out_dict.get("bid") is not None and out_dict.get("ask") is not None:
             out_dict["mid"] = round((out_dict["bid"] + out_dict["ask"]) / 2.0, 4)
-        ts = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp") or lq.get("t")
-        age = _quote_age_from_ts(ts)
-        if age is not None:
-            out_dict["quote_age_sec"] = age
+
+        # If no last_quote, fallback to last_trade (treat price as a pseudo-mid)
+        if out_dict.get("mid") is None:
+            lt = res.get("last_trade") or {}
+            lt_px = lt.get("price")
+            if isinstance(lt_px, (int, float)):
+                out_dict["mid"] = float(lt_px)
+            # timestamps for age (prefer quote ts; else trade ts)
+            ts = (
+                lq.get("sip_timestamp")
+                or lq.get("participant_timestamp")
+                or lq.get("trf_timestamp")
+                or lq.get("t")
+                or lt.get("sip_timestamp")
+                or lt.get("participant_timestamp")
+                or lt.get("trf_timestamp")
+                or lt.get("t")
+            )
+            age = _quote_age_from_ts(ts)
+            if age is not None:
+                out_dict["quote_age_sec"] = age
+        else:
+            # We did have last_quote; compute age from it
+            ts = (
+                lq.get("sip_timestamp")
+                or lq.get("participant_timestamp")
+                or lq.get("trf_timestamp")
+                or lq.get("t")
+            )
+            age = _quote_age_from_ts(ts)
+            if age is not None:
+                out_dict["quote_age_sec"] = age
+
+        # Greeks & IV
         greeks = res.get("greeks") or {}
         for k_src in ("delta", "gamma", "theta", "vega"):
             v = greeks.get(k_src)
@@ -417,7 +454,7 @@ async def _poly_option_backfill(
         if iv is not None:
             out_dict["iv"] = iv
 
-    # 1) Multi-snapshot list (no ticker in path, so no encoding needed)
+    # 1) Multi-snapshot list (no ticker in path)
     try:
         side = None
         expiry_iso = None
@@ -514,7 +551,7 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 4) Last quote (NBBO/age)
+    # 4) Last quote (NBBO/age) — some plans don’t return this; we already used last_trade fallback above
     try:
         enc_opt = _encode_ticker_path(option_ticker)
         lastq = await _http_json(
@@ -528,10 +565,10 @@ async def _poly_option_backfill(
             last = res.get("last") or res
             bid_px = last.get("bidPrice")
             ask_px = last.get("askPrice")
-            if out.get("bid") is None and bid_px is not None:
-                out["bid"] = float(bid_px)
-            if out.get("ask") is None and ask_px is not None:
-                out["ask"] = float(ask_px)
+            if bid_px is not None:
+                out.setdefault("bid", float(bid_px))
+            if ask_px is not None:
+                out.setdefault("ask", float(ask_px))
             if out.get("mid") is None and out.get("bid") is not None and out.get("ask") is not None:
                 out["mid"] = round((out["bid"] + out["ask"]) / 2.0, 4)
             ts = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
@@ -541,7 +578,7 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 5) Minute aggregates — compute intraday volume sum if still missing
+    # 5) Minute aggregates — compute intraday volume sum if still missing (plan-dependent)
     try:
         if out.get("vol") is None:
             enc_opt = _encode_ticker_path(option_ticker)
@@ -630,7 +667,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # Enrich FIRST
+            # Enrich FIRST (now maps last_trade fallback)
             extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
             if debug_mode:
                 print({"_debug_backfill": {k: extra_from_snap.get(k) for k in ["oi","vol","bid","ask","mid","quote_age_sec","delta","gamma","theta","vega","iv"]}})
