@@ -751,9 +751,32 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             for k, v in (core or {}).items():
                 if v is not None or k not in f:
                     f[k] = v
+
             # Ensure mid if we at least have bid/ask
             if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
                 f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
+
+            # --- NEW: fill DTE if missing ---
+            try:
+                if f.get("dte") is None:
+                    f["dte"] = (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days
+            except Exception:
+                pass
+
+            # --- NEW: compute spread % if we have a book ---
+            try:
+                bid = f.get("bid")
+                ask = f.get("ask")
+                mid = f.get("mid")
+                if bid is not None and ask is not None:
+                    if mid is None:
+                        mid = (float(bid) + float(ask)) / 2.0
+                        f["mid"] = round(mid, 4)
+                    spread = float(ask) - float(bid)
+                    if mid and mid > 0:
+                        f["option_spread_pct"] = round((spread / mid) * 100.0, 3)
+            except Exception:
+                pass
 
     except Exception as e:
         print(f"[worker] Polygon/features error: {e}")
