@@ -31,29 +31,27 @@ async def _responses_call(client: httpx.AsyncClient, system: str, user: str) -> 
     url = f"{OPENAI_BASE_URL}/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    # Correct shape for Responses API (2025):
     body = {
         "model": OPENAI_MODEL,
-        "modalities": ["text"],
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         "temperature": LLM_TEMPERATURE,
         "top_p": LLM_TOP_P,
-        "text": {"format": "json"},             # <-- replaces response_format
-        "max_completion_tokens": LLM_MAX_TOK,   # <-- replaces max_tokens
+        "max_completion_tokens": LLM_MAX_TOK,
+        "text.format": "json",   # <-- correct param for JSON output
     }
 
     r = await client.post(url, headers=headers, json=body, timeout=30.0)
 
-    # Some deployments misreport token field; retry without the cap if 400 mentions tokens
     if r.status_code == 400 and ("max_tokens" in r.text or "max_completion_tokens" in r.text):
         body.pop("max_completion_tokens", None)
         r = await client.post(url, headers=headers, json=body, timeout=30.0)
 
     r.raise_for_status()
     return r.json()
+
 
 def _extract_text(js: Dict[str, Any]) -> str:
     # Prefer output_text when present
