@@ -317,38 +317,59 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     return start, now_utc.isoformat()
 
 # =========================
-# Robust NBBO fetcher
+# Robust NBBO fetcher (options only)
 # =========================
 async def _get_nbbo_any(client: httpx.AsyncClient, opt_ticker: str) -> Optional[Dict[str, Any]]:
     """
     Try multiple Polygon endpoints to obtain a fresh NBBO for an option.
-    Returns: {bid, ask, mid, option_spread_pct, quote_age_sec, ts}
+    Returns: {bid, ask, mid, option_spread_pct, quote_age_sec, ts, source}
     """
     if not POLYGON_API_KEY:
         return None
 
-    enc = _encode_ticker_path(opt_ticker)
-    candidates: List[Dict[str, Any]] = []
-
-    async def _push(bid, ask, ts):
+    def _mk(bid, ask, ts, source):
         if bid is None or ask is None:
-            return
+            return None
         try:
             bid = float(bid); ask = float(ask)
             if ask < bid or ask <= 0:
-                return
+                return None
             mid = (bid + ask) / 2.0
             spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else None
             age = _quote_age_from_ts(ts)
-            candidates.append({
+            return {
                 "bid": bid, "ask": ask, "mid": round(mid, 4),
                 "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
-                "quote_age_sec": age, "ts": ts
-            })
+                "quote_age_sec": age, "ts": ts, "source": source,
+            }
         except Exception:
-            return
+            return None
 
-    # (A) Recent quotes (desc)
+    enc = _encode_ticker_path(opt_ticker)
+    candidates: List[Dict[str, Any]] = []
+
+    # A) v3/quotes/options/{ticker}/last
+    try:
+        lastq = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=3.5
+        )
+        if lastq:
+            res = lastq.get("results") or {}
+            last = res.get("last") or res
+            cand = _mk(
+                last.get("bidPrice"),
+                last.get("askPrice"),
+                last.get("sip_timestamp") or last.get("participant_timestamp") or last.get("trf_timestamp") or last.get("t"),
+                "v3.last"
+            )
+            if cand: candidates.append(cand)
+    except Exception:
+        pass
+
+    # B) v3/quotes/options/{ticker}?sort=desc&limit=1
     try:
         qlist = await _http_json(
             client,
@@ -358,63 +379,62 @@ async def _get_nbbo_any(client: httpx.AsyncClient, opt_ticker: str) -> Optional[
         )
         if qlist and isinstance(qlist.get("results"), list) and qlist["results"]:
             q0 = qlist["results"][0]
-            await _push(q0.get("bid_price"), q0.get("ask_price"),
-                        q0.get("sip_timestamp") or q0.get("participant_timestamp") or q0.get("trf_timestamp") or q0.get("t"))
+            cand = _mk(
+                q0.get("bid_price"),
+                q0.get("ask_price"),
+                q0.get("sip_timestamp") or q0.get("participant_timestamp") or q0.get("trf_timestamp") or q0.get("t"),
+                "v3.list.desc1"
+            )
+            if cand: candidates.append(cand)
     except Exception:
         pass
 
-    # (B) “last” quote
+    # C) single-contract snapshot's last_quote (requires underlying)
     try:
-        lastq = await _http_json(
-            client,
-            f"https://api.polygon.io/v3/quotes/options/{enc}/last",
-            {"apiKey": POLYGON_API_KEY},
-            timeout=3.0
-        )
-        if lastq:
-            res = lastq.get("results") or {}
-            last = res.get("last") or res
-            await _push(last.get("bidPrice"), last.get("askPrice"),
-                        last.get("sip_timestamp") or last.get("t") or last.get("timestamp"))
-    except Exception:
-        pass
-
-    # (C) Legacy NBBO
-    try:
-        nbbo = await _http_json(
-            client,
-            f"https://api.polygon.io/v2/last/nbbo/{enc}",
-            {"apiKey": POLYGON_API_KEY},
-            timeout=3.0
-        )
-        if nbbo and nbbo.get("status") == "success":
-            await _push(nbbo.get("bid"), nbbo.get("ask"), nbbo.get("updated") or nbbo.get("sip_timestamp"))
+        m = re.search(r"^O:([A-Z]+)\d{6}[CP]\d{8,9}$", opt_ticker)
+        if m:
+            underlying = m.group(1)
+            snap = await _http_json(
+                client,
+                f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
+                {"apiKey": POLYGON_API_KEY},
+                timeout=4.0
+            )
+            if snap:
+                lq = (snap.get("results") or {}).get("last_quote") or {}
+                cand = _mk(
+                    lq.get("bid_price"),
+                    lq.get("ask_price"),
+                    lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp") or lq.get("t"),
+                    "snapshot.last_quote"
+                )
+                if cand: candidates.append(cand)
     except Exception:
         pass
 
     if not candidates:
         return None
 
+    # Choose: freshest first, then tightest spread
     fresh = [c for c in candidates if c.get("quote_age_sec") is not None]
-    best = min(fresh, key=lambda c: c["quote_age_sec"]) if fresh else candidates[0]
-    return best
+    if fresh:
+        fresh.sort(key=lambda x: (x["quote_age_sec"], (x.get("option_spread_pct") or 1e9)))
+        return fresh[0]
+    candidates.sort(key=lambda x: (x.get("option_spread_pct") or 1e9))
+    return candidates[0]
 
 # =========================
-# Quote sampler (uses NBBO fetcher)
+# Quote sampler (uses robust NBBO)
 # =========================
-async def _sample_best_quote(client, opt_ticker: str, tries=4, delay=0.5) -> Optional[Dict[str, Any]]:
-    """
-    Tries multiple times to obtain NBBO via _get_nbbo_any.
-    Returns the best (tightest spread, then freshest) among attempts.
-    """
+async def _sample_best_quote(client: httpx.AsyncClient, opt_ticker: str, tries=4, delay=0.4) -> Optional[Dict[str, Any]]:
     best = None
     for _ in range(tries):
-        data = await _get_nbbo_any(client, opt_ticker)
-        if data:
+        cand = await _get_nbbo_any(client, opt_ticker)
+        if cand:
             if (best is None) \
-               or ((data.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)) \
-               or ((data.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)):
-                best = data
+               or ((cand.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)) \
+               or ((cand.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)):
+                best = cand
         await asyncio.sleep(delay)
     return best
 
@@ -583,41 +603,13 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 4) Sample best NBBO (prefer freshest/tightest), always attempt
+    # 4) Sample best quote (tightest/freshest)  —— uses robust multi-endpoint NBBO
     try:
-        sampled = await _sample_best_quote(client, option_ticker, tries=4, delay=0.5)
+        sampled = await _sample_best_quote(client, option_ticker, tries=4, delay=0.4)
         if sampled:
             for k, v in sampled.items():
                 if v is not None:
                     out[k] = v
-    except Exception:
-        pass
-
-    # If still no mid, try last_trade as weak proxy
-    try:
-        if out.get("mid") is None:
-            enc_opt = _encode_ticker_path(option_ticker)
-            snap_fallback = await _http_json(
-                client,
-                f"https://api.polygon.io/v3/snapshot/options/{symbol}/{enc_opt}",
-                {"apiKey": POLYGON_API_KEY},
-                timeout=5.0
-            )
-            lt = (snap_fallback or {}).get("results", {}).get("last_trade") or {}
-            if isinstance(lt.get("price"), (int, float)):
-                out["mid"] = round(float(lt["price"]), 4)
-    except Exception:
-        pass
-
-    # Compute spread% if possible
-    try:
-        b, a, m = out.get("bid"), out.get("ask"), out.get("mid")
-        if b is not None and a is not None:
-            if m is None:
-                m = (float(b) + float(a)) / 2.0
-                out["mid"] = round(m, 4)
-            if m > 0:
-                out["option_spread_pct"] = round(((float(a) - float(b)) / m) * 100.0, 3)
     except Exception:
         pass
 
@@ -643,6 +635,27 @@ async def _poly_option_backfill(
                             vol_sum += v
                     if vol_sum > 0:
                         out["vol"] = int(vol_sum)
+    except Exception:
+        pass
+
+    # 6) Optional: synthesize a mid from last_trade if STILL no bid/ask/mid (after-hours guardrail)
+    try:
+        if out.get("bid") is None and out.get("ask") is None and out.get("mid") is None:
+            m = re.search(r"^O:([A-Z]+)\d{6}[CP]\d{8,9}$", option_ticker)
+            if m:
+                underlying = m.group(1)
+                enc_opt = _encode_ticker_path(option_ticker)
+                snap = await _http_json(
+                    client,
+                    f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc_opt}",
+                    {"apiKey": POLYGON_API_KEY},
+                    timeout=4.0
+                )
+                lt = (snap or {}).get("results", {}).get("last_trade") or {}
+                if isinstance(lt.get("price"), (int, float)):
+                    out["mid"] = round(float(lt["price"]), 4)
+                    # be conservative on spread when synthesized
+                    out["option_spread_pct"] = out.get("option_spread_pct") or 12.0
     except Exception:
         pass
 
@@ -729,9 +742,9 @@ async def _choose_best_contract(
         day_block = det.get("day") or {}
         vol = day_block.get("volume")
 
-        # quick NBBO check (1 call) to estimate spread%
-        q = await _get_nbbo_any(client, tk)
-        spread_pct = q.get("option_spread_pct") if q else None
+        # quick one-shot quote spread check via robust NBBO
+        nbbo = await _get_nbbo_any(client, tk)
+        spread_pct = nbbo.get("option_spread_pct") if nbbo else None
 
         tgt = TARGET_DELTA_CALL if side == "CALL" else TARGET_DELTA_PUT
         delta_miss = abs((delta if isinstance(delta, (int, float)) else tgt) - tgt)
@@ -1240,10 +1253,18 @@ async def diag_polygon(underlying: str, contract: str):
 
 @router.get("/diag/nbbo")
 async def diag_nbbo(contract: str):
+    """
+    Quick NBBO probe for an options contract. Shows which endpoint produced the quote.
+    """
     if HTTP is None:
         raise HTTPException(status_code=503, detail="HTTP client not ready")
-    res = await _get_nbbo_any(HTTP, contract)
-    return {"ok": bool(res), "nbbo": res}
+    data = await _get_nbbo_any(HTTP, contract)
+    return {
+        "ok": bool(data),
+        "contract": contract,
+        "nbbo": data,
+        "hint": "source indicates which endpoint produced the quote; if null, your key may lack Options NBBO or it is after-hours."
+    }
 
 @router.post("/diag/telegram")
 async def diag_telegram(payload: dict | None = None):
