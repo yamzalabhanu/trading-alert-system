@@ -317,36 +317,106 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     return start, now_utc.isoformat()
 
 # =========================
-# Quote sampler
+# Robust NBBO fetcher
 # =========================
-async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Dict[str, Any]]:
-    best = {}
-    for _ in range(tries):
-        lastq = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
-                                 {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+async def _get_nbbo_any(client: httpx.AsyncClient, opt_ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Try multiple Polygon endpoints to obtain a fresh NBBO for an option.
+    Returns: {bid, ask, mid, option_spread_pct, quote_age_sec, ts}
+    """
+    if not POLYGON_API_KEY:
+        return None
+
+    enc = _encode_ticker_path(opt_ticker)
+    candidates: List[Dict[str, Any]] = []
+
+    async def _push(bid, ask, ts):
+        if bid is None or ask is None:
+            return
+        try:
+            bid = float(bid); ask = float(ask)
+            if ask < bid or ask <= 0:
+                return
+            mid = (bid + ask) / 2.0
+            spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else None
+            age = _quote_age_from_ts(ts)
+            candidates.append({
+                "bid": bid, "ask": ask, "mid": round(mid, 4),
+                "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
+                "quote_age_sec": age, "ts": ts
+            })
+        except Exception:
+            return
+
+    # (A) Recent quotes (desc)
+    try:
+        qlist = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/quotes/options/{enc}",
+            {"apiKey": POLYGON_API_KEY, "limit": 1, "sort": "desc"},
+            timeout=4.0
+        )
+        if qlist and isinstance(qlist.get("results"), list) and qlist["results"]:
+            q0 = qlist["results"][0]
+            await _push(q0.get("bid_price"), q0.get("ask_price"),
+                        q0.get("sip_timestamp") or q0.get("participant_timestamp") or q0.get("trf_timestamp") or q0.get("t"))
+    except Exception:
+        pass
+
+    # (B) “last” quote
+    try:
+        lastq = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=3.0
+        )
         if lastq:
             res = lastq.get("results") or {}
             last = res.get("last") or res
-            bid = last.get("bidPrice")
-            ask = last.get("askPrice")
-            ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-            if bid is not None and ask is not None and ask >= bid:
-                mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
-                spread_pct = ((ask - bid) / mid * 100) if (mid and mid > 0) else None
-                age = _quote_age_from_ts(ts)
-                cand = {
-                    "bid": float(bid) if bid is not None else None,
-                    "ask": float(ask) if ask is not None else None,
-                    "mid": float(mid) if mid is not None else None,
-                    "quote_age_sec": age,
-                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
-                }
-                if not best or \
-                   (cand["option_spread_pct"] or 1e9) < (best.get("option_spread_pct") or 1e9) or \
-                   (cand["quote_age_sec"] or 1e9) < (best.get("quote_age_sec") or 1e9):
-                    best = cand
+            await _push(last.get("bidPrice"), last.get("askPrice"),
+                        last.get("sip_timestamp") or last.get("t") or last.get("timestamp"))
+    except Exception:
+        pass
+
+    # (C) Legacy NBBO
+    try:
+        nbbo = await _http_json(
+            client,
+            f"https://api.polygon.io/v2/last/nbbo/{enc}",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=3.0
+        )
+        if nbbo and nbbo.get("status") == "success":
+            await _push(nbbo.get("bid"), nbbo.get("ask"), nbbo.get("updated") or nbbo.get("sip_timestamp"))
+    except Exception:
+        pass
+
+    if not candidates:
+        return None
+
+    fresh = [c for c in candidates if c.get("quote_age_sec") is not None]
+    best = min(fresh, key=lambda c: c["quote_age_sec"]) if fresh else candidates[0]
+    return best
+
+# =========================
+# Quote sampler (uses NBBO fetcher)
+# =========================
+async def _sample_best_quote(client, opt_ticker: str, tries=4, delay=0.5) -> Optional[Dict[str, Any]]:
+    """
+    Tries multiple times to obtain NBBO via _get_nbbo_any.
+    Returns the best (tightest spread, then freshest) among attempts.
+    """
+    best = None
+    for _ in range(tries):
+        data = await _get_nbbo_any(client, opt_ticker)
+        if data:
+            if (best is None) \
+               or ((data.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)) \
+               or ((data.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)):
+                best = data
         await asyncio.sleep(delay)
-    return best or None
+    return best
 
 # =========================
 # Backfill layers (multi-snapshot FIRST)
@@ -513,14 +583,41 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 4) Sample best quote (tightest/freshest)
+    # 4) Sample best NBBO (prefer freshest/tightest), always attempt
     try:
-        enc_opt = _encode_ticker_path(option_ticker)
-        sampled = await _sample_best_quote(client, enc_opt, tries=5, delay=0.6)
+        sampled = await _sample_best_quote(client, option_ticker, tries=4, delay=0.5)
         if sampled:
             for k, v in sampled.items():
                 if v is not None:
                     out[k] = v
+    except Exception:
+        pass
+
+    # If still no mid, try last_trade as weak proxy
+    try:
+        if out.get("mid") is None:
+            enc_opt = _encode_ticker_path(option_ticker)
+            snap_fallback = await _http_json(
+                client,
+                f"https://api.polygon.io/v3/snapshot/options/{symbol}/{enc_opt}",
+                {"apiKey": POLYGON_API_KEY},
+                timeout=5.0
+            )
+            lt = (snap_fallback or {}).get("results", {}).get("last_trade") or {}
+            if isinstance(lt.get("price"), (int, float)):
+                out["mid"] = round(float(lt["price"]), 4)
+    except Exception:
+        pass
+
+    # Compute spread% if possible
+    try:
+        b, a, m = out.get("bid"), out.get("ask"), out.get("mid")
+        if b is not None and a is not None:
+            if m is None:
+                m = (float(b) + float(a)) / 2.0
+                out["mid"] = round(m, 4)
+            if m > 0:
+                out["option_spread_pct"] = round(((float(a) - float(b)) / m) * 100.0, 3)
     except Exception:
         pass
 
@@ -631,18 +728,10 @@ async def _choose_best_contract(
         oi = det.get("open_interest")
         day_block = det.get("day") or {}
         vol = day_block.get("volume")
-        enc = _encode_ticker_path(tk)
-        q = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
-                             {"apiKey": POLYGON_API_KEY}, timeout=3.0)
-        spread_pct = None
-        if q:
-            res = q.get("results") or {}
-            last = res.get("last") or res
-            b, a = last.get("bidPrice"), last.get("askPrice")
-            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0 and b >= 0:
-                mid = (a + b)/2.0
-                if mid > 0:
-                    spread_pct = (a - b)/mid*100.0
+
+        # quick NBBO check (1 call) to estimate spread%
+        q = await _get_nbbo_any(client, tk)
+        spread_pct = q.get("option_spread_pct") if q else None
 
         tgt = TARGET_DELTA_CALL if side == "CALL" else TARGET_DELTA_PUT
         delta_miss = abs((delta if isinstance(delta, (int, float)) else tgt) - tgt)
@@ -950,7 +1039,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         "preflight": pf_checks,
         "selection_debug": selection_debug,
 
-        # NEW: visibility for messaging/trading outcomes
+        # visibility for messaging/trading outcomes
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
             "result": tg_result
@@ -1148,6 +1237,13 @@ async def diag_polygon(underlying: str, contract: str):
         "open_close": skim(out.get("open_close")),
         "aggs": skim(out.get("aggs")),
     }
+
+@router.get("/diag/nbbo")
+async def diag_nbbo(contract: str):
+    if HTTP is None:
+        raise HTTPException(status_code=503, detail="HTTP client not ready")
+    res = await _get_nbbo_any(HTTP, contract)
+    return {"ok": bool(res), "nbbo": res}
 
 @router.post("/diag/telegram")
 async def diag_telegram(payload: dict | None = None):
