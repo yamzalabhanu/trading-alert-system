@@ -1,166 +1,156 @@
 # llm_client.py
-# Compatible with openai>=1.0 (Responses API or Chat Completions).
-# Uses AsyncOpenAI so routes.py can `await analyze_with_openai(...)`.
-
-from __future__ import annotations
-
-import json
 import os
-from typing import Any, Dict, Tuple
+import json
+from typing import Dict, Any
+import httpx
 
-from openai import AsyncOpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # any Responses-capable model
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+# Tunables
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
+# Safe cap; Responses API expects max_completion_tokens (NOT max_tokens)
+LLM_MAX_TOK = int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "700"))
 
-_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+SYSTEM_PROMPT = """You are an options-trading assistant. 
+Given an alert (side, symbol, strike policy) and computed features (liquidity, greeks, IV context, preflight),
+decide one of: "buy", "skip", or "wait".
+Return a short reason, confidence in [0,1], and a brief checklist dict of key signals.
+Keep answers concise and structured JSON only.
+"""
 
+def _make_user_payload(alert: Dict[str, Any], features: Dict[str, Any]) -> str:
+    # Send the raw data the model needs, but compactly
+    payload = {
+        "alert": alert,
+        "features": features,
+        "instruction": (
+            "Decide: buy/skip/wait. Consider liquidity (bid/ask/mid/spread%, vol, oi, quote_age), "
+            "greeks (delta/gamma/theta/vega), IV & IV rank, DTE, and any regime/MTF alignment. "
+            "If liquidity is poor or data is stale, prefer wait/skip. Output strictly JSON with keys: "
+            "{decision, confidence, reason, checklist}."
+        ),
+    }
+    return json.dumps(payload, separators=(",", ":"))
 
-def _iv_ctx(iv: float | None, iv_rank: float | None) -> str:
+async def _responses_call(client: httpx.AsyncClient, system: str, user: str) -> Dict[str, Any]:
     """
-    Classify IV context into 'low' / 'medium' / 'high' based on IV rank.
+    Calls the Responses API. Uses max_completion_tokens (correct field).
+    If the server still complains about the field name, we retry without it.
     """
-    if iv_rank is None:
-        return "medium"
-    if iv_rank < 0.33:
-        return "low"
-    if iv_rank > 0.66:
-        return "high"
-    return "medium"
+    url = f"{OPENAI_BASE_URL}/responses"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-
-def build_llm_prompt(alert: Dict[str, Any], f: Dict[str, Any]) -> str:
-    """
-    Build a compact, JSON-friendly instruction for the LLM.
-    The model must choose one of: BUY / SKIP / WAIT.
-    """
-    # derive a few readable flags
-    iv_rank = f.get("iv_rank")
-    iv = f.get("iv")
-    iv_context = _iv_ctx(iv, iv_rank)
-
-    # short, clear facts block
-    facts = {
-        "symbol": alert.get("symbol"),
-        "side": alert.get("side"),
-        "underlying_from_alert": alert.get("underlying_price_from_alert"),
-        "reco_strike": alert.get("strike"),
-        "reco_expiry": alert.get("expiry"),
-        "dte": f.get("dte"),
-        "greeks": {
-            "delta": f.get("delta"),
-            "gamma": f.get("gamma"),
-            "theta": f.get("theta"),
-            "vega": f.get("vega"),
-        },
-        "nbbo": {
-            "bid": f.get("bid"),
-            "ask": f.get("ask"),
-            "mid": f.get("mid"),
-            "spread_pct": f.get("option_spread_pct"),
-            "quote_age_sec": f.get("quote_age_sec"),
-        },
-        "liquidity": {"oi": f.get("oi"), "vol": f.get("vol")},
-        "volatility": {"iv": iv, "iv_rank": iv_rank, "iv_context": iv_context, "rv20": f.get("rv20")},
-        "edges": {
-            "em_vs_be_ok": f.get("em_vs_be_ok"),
-            "mtf_align": f.get("mtf_align"),
-            "sr_headroom_ok": f.get("sr_headroom_ok"),
-            "regime": f.get("regime_flag"),
-        },
-        "levels": {
-            "prev_day_high": f.get("prev_day_high"),
-            "prev_day_low": f.get("prev_day_low"),
-            "premarket_high": f.get("premarket_high"),
-            "premarket_low": f.get("premarket_low"),
-            "above_pdh": f.get("above_pdh"),
-            "below_pdl": f.get("below_pdl"),
-            "above_pmh": f.get("above_pmh"),
-            "below_pml": f.get("below_pml"),
-            "vwap": f.get("vwap"),
-            "vwap_dist": f.get("vwap_dist"),
-        },
+    base = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": LLM_TEMPERATURE,
+        "top_p": LLM_TOP_P,
+        # The correct limit param for Responses API:
+        "max_completion_tokens": LLM_MAX_TOK,
+        "response_format": {"type": "json_object"},
     }
 
-    # instruction: **must** return strict JSON so our parser is reliable
-    instruction = (
-        "You are an options-trading assistant. Decide whether to BUY, SKIP, or WAIT on the suggested contract.\n"
-        "- BUY only if the setup quality is good (liquidity ok, spread reasonable, alignment ok, edge present).\n"
-        "- SKIP if risk is poor or data quality/liquidity is bad.\n"
-        "- WAIT if unclear and more confirmation is needed.\n\n"
-        "Return strict JSON ONLY with keys: decision, confidence, reason, checklist, ev_estimate.\n"
-        "decision ∈ {buy, skip, wait}; confidence ∈ [0,1].\n"
-        "checklist should include booleans like delta_band_ok, dte_band_ok, iv_context, rv_iv_spread, em_vs_breakeven_ok,\n"
-        "mtf_trend_alignment, sr_headroom_ok, no_event_risk.\n"
-        "ev_estimate should include win_prob, avg_win_pct, avg_loss_pct, expected_value_pct.\n"
-    )
+    # First attempt with max_completion_tokens
+    r = await client.post(url, headers=headers, json=base, timeout=30.0)
+    if r.status_code == 400 and "max_tokens" in (r.text or ""):
+        # Some deployments surface a confusing error; drop the cap and retry
+        base.pop("max_completion_tokens", None)
+        r = await client.post(url, headers=headers, json=base, timeout=30.0)
 
-    prompt = {
-        "role": "user",
-        "content": instruction + "\nFacts:\n" + json.dumps(facts, separators=(",", ":"), ensure_ascii=False),
-    }
-    return json.dumps(prompt, ensure_ascii=False)
+    r.raise_for_status()
+    return r.json()
 
-
-async def _call_openai_for_json(prompt_payload: str) -> Dict[str, Any]:
+def _extract_text_from_responses(js: Dict[str, Any]) -> str:
     """
-    Calls OpenAI; returns a parsed JSON dict or raises.
-    Uses Chat Completions for maximum compatibility with openai>=1.0.
+    Responses API returns content under output_text (SDKs) or in output[].content[] blocks (raw REST).
+    Handle both defensively.
     """
-    # Convert back to the messages list Chat Completions expects.
-    user_msg = json.loads(prompt_payload)
-    messages = [user_msg] if isinstance(user_msg, dict) else [{"role": "user", "content": prompt_payload}]
+    # SDK-compatible shape
+    txt = js.get("output_text")
+    if isinstance(txt, str) and txt.strip():
+        return txt
 
-    resp = await _client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=400,
-        response_format={"type": "json_object"},
-    )
-    content = resp.choices[0].message.content or "{}"
-    return json.loads(content)
+    # Raw REST shape
+    out = js.get("output") or js.get("choices") or []
+    if isinstance(out, list) and out:
+        # Try to find a text segment
+        first = out[0]
+        parts = first.get("content") if isinstance(first, dict) else None
+        if isinstance(parts, list) and parts:
+            for p in parts:
+                if p.get("type") in (None, "output_text", "text"):
+                    val = p.get("text") or p.get("value")
+                    if isinstance(val, str) and val.strip():
+                        return val
+    # Fallback: stringify
+    return ""
 
-
-def _fallback_wait(reason: str) -> Dict[str, Any]:
-    return {
-        "decision": "wait",
-        "confidence": 0.0,
-        "reason": reason,
-        "checklist": {},
-        "ev_estimate": {},
-    }
-
+def _safe_parse_json(s: str) -> Dict[str, Any]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
 
 async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Orchestrates prompt build + OpenAI call and returns normalized structure.
+    Returns: dict(decision, confidence, reason, checklist, ev_estimate?)
     """
-    try:
-        prompt_payload = build_llm_prompt(alert, features)
-    except Exception as e:
-        return _fallback_wait(f"Prompt build failed: {e}")
-
-    try:
-        out = await _call_openai_for_json(prompt_payload)
-        # Normalize & guard fields
-        decision = str(out.get("decision", "wait")).lower()
-        if decision not in {"buy", "skip", "wait"}:
-            decision = "wait"
-
-        confidence = out.get("confidence")
-        try:
-            confidence = float(confidence)
-        except Exception:
-            confidence = 0.0
-
+    if not OPENAI_API_KEY:
         return {
-            "decision": decision,
-            "confidence": max(0.0, min(1.0, confidence)),
-            "reason": out.get("reason", ""),
-            "checklist": out.get("checklist", {}),
-            "ev_estimate": out.get("ev_estimate", {}),
+            "decision": "wait",
+            "confidence": 0.0,
+            "reason": "LLM disabled: missing OPENAI_API_KEY",
+            "checklist": {},
+            "ev_estimate": {},
         }
-    except Exception as e:
-        # Keep the app resilient if OpenAI is unreachable or responds with a schema error.
-        return _fallback_wait(f"LLM call failed: {e}")
+
+    user_payload = _make_user_payload(alert, features)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            js = await _responses_call(client, SYSTEM_PROMPT, user_payload)
+        except httpx.HTTPStatusError as e:
+            # Surface server’s message for your logs
+            return {
+                "decision": "wait",
+                "confidence": 0.0,
+                "reason": f"LLM call failed: {e.response.status_code} - {e.response.text}",
+                "checklist": {},
+                "ev_estimate": {},
+            }
+        except Exception as e:
+            return {
+                "decision": "wait",
+                "confidence": 0.0,
+                "reason": f"LLM error: {type(e).__name__}: {e}",
+                "checklist": {},
+                "ev_estimate": {},
+            }
+
+    text = _extract_text_from_responses(js) or "{}"
+    parsed = _safe_parse_json(text)
+
+    decision = str(parsed.get("decision", "wait")).lower()
+    if decision not in ("buy", "skip", "wait"):
+        decision = "wait"
+
+    conf = parsed.get("confidence")
+    try:
+        conf = float(conf)
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+
+    return {
+        "decision": decision,
+        "confidence": conf,
+        "reason": parsed.get("reason", ""),
+        "checklist": parsed.get("checklist", {}) or {},
+        "ev_estimate": parsed.get("ev_estimate", {}) or {},
+    }
