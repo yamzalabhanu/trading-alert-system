@@ -5,10 +5,10 @@ import httpx
 
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL  = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 LLM_TEMPERATURE  = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 LLM_TOP_P        = float(os.getenv("LLM_TOP_P", "1.0"))
-LLM_MAX_TOK      = int(os.getenv("LLM_MAX_TOKENS", "7000"))  # used for Chat fallback
+LLM_MAX_TOK      = int(os.getenv("LLM_MAX_TOKENS", "700"))  # used for Chat fallback
 OPENAI_API_STYLE = os.getenv("OPENAI_API_STYLE", "").lower()  # "responses" | "chat" | ""
 
 SYSTEM_PROMPT = (
