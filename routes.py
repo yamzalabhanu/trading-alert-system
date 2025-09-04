@@ -2,7 +2,6 @@
 import os
 import asyncio
 import socket
-import json
 import re
 from urllib.parse import quote
 from fastapi import Query
@@ -109,18 +108,6 @@ def consume_llm(n: int = 1) -> None:
     _reset_quota_if_new_day()
     _llm_quota["used"] = int(_llm_quota.get("used", 0)) + n
 
-def allowed_now_cdt() -> bool:
-    now = market_now().time()
-    for win in WINDOWS_CDT:
-        if isinstance(win, (tuple, list)) and len(win) == 2 and isinstance(win[0], dt_time) and isinstance(win[1], dt_time):
-            if win[0] <= now <= win[1]:
-                return True
-        elif isinstance(win, (tuple, list)) and len(win) == 4 and all(isinstance(x, int) for x in win):
-            sh, sm, eh, em = win
-            if dt_time(sh, sm, tzinfo=CDT_TZ) <= now <= dt_time(eh, em, tzinfo=CDT_TZ):
-                return True
-    return False
-
 def round_strike_to_common_increment(val: float) -> float:
     if val < 25:
         step = 0.5
@@ -207,8 +194,8 @@ def compose_telegram_text(
         reason = f"Reason: {llm.get('reason','')}"
         scoreline = f"Score: {score}  Rating: {rating}"
     else:
-        decision = "LLM Decision: SKIPPED (outside window)"
-        reason = f"Note: {llm_reason}"
+        decision = "LLM Decision: SKIPPED"
+        reason = f"Note: {llm_reason or 'LLM not executed'}"
         scoreline = ""
     return "\n".join([header, contract, "", snap, decision, reason, scoreline]).strip()
 
@@ -247,7 +234,7 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
         return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
 
 # =========================
-# HTTP helpers (encoding & safe JSON)
+# HTTP helpers
 # =========================
 def _encode_ticker_path(t: str) -> str:
     return quote(t or "", safe="")
@@ -274,9 +261,6 @@ def _normalize_poly_strike(raw) -> Optional[float]:
     except Exception:
         return None
     return v / 1000.0 if v >= 2000 else v
-
-def _within_reasonable_strike(diff: float, step: float) -> bool:
-    return diff <= max(3 * step, 10.0)
 
 # =========================
 # Polygon wrappers
@@ -308,7 +292,7 @@ async def polygon_get_option_snapshot(
             )
 
 # =========================
-# Time & age helpers
+# Time helpers
 # =========================
 def _quote_age_from_ts(ts_val: Any) -> Optional[float]:
     if ts_val is None:
@@ -581,7 +565,7 @@ def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> D
     }
 
 # =========================
-# Delta-targeted selector (uses multi-snapshot where possible)
+# Delta-targeted selector
 # =========================
 async def _choose_best_contract(
     client: httpx.AsyncClient,
@@ -602,19 +586,16 @@ async def _choose_best_contract(
     """
     debug = {"candidates": []}
     if not POLYGON_API_KEY:
-        # Fall back to ±5% contract
         base = _build_plus_minus_contracts(symbol, ul_px, expiry_iso)
         t = base["contract_call"] if side == "CALL" else base["contract_put"]
         return t, {"reason": "offline/no key"}
 
-    # Pull the chain list (to know available contracts)
     chain = await polygon_list_contracts_for_expiry(client, symbol=symbol, expiry=expiry_iso, side=side, limit=1000)
     if not chain:
         base = _build_plus_minus_contracts(symbol, ul_px, expiry_iso)
         t = base["contract_call"] if side == "CALL" else base["contract_put"]
         return t, {"reason": "no_chain"}
 
-    # Multi snapshot to get greeks & basics
     try:
         side_poly = "call" if side.upper() == "CALL" else "put"
         mlist = await _http_json(
@@ -639,7 +620,6 @@ async def _choose_best_contract(
             if tk:
                 index_by_ticker[tk] = it
 
-    # Build scored candidates
     cands: List[Tuple] = []
     for c in chain:
         tk = c.get("ticker") or c.get("symbol") or c.get("contract")
@@ -651,7 +631,6 @@ async def _choose_best_contract(
         oi = det.get("open_interest")
         day_block = det.get("day") or {}
         vol = day_block.get("volume")
-        # quick quote sample (1 try to keep latency bounded)
         enc = _encode_ticker_path(tk)
         q = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
                              {"apiKey": POLYGON_API_KEY}, timeout=3.0)
@@ -665,11 +644,9 @@ async def _choose_best_contract(
                 if mid > 0:
                     spread_pct = (a - b)/mid*100.0
 
-        # distance to target delta
         tgt = TARGET_DELTA_CALL if side == "CALL" else TARGET_DELTA_PUT
         delta_miss = abs((delta if isinstance(delta, (int, float)) else tgt) - tgt)
 
-        # desired strike distance
         s_norm = _normalize_poly_strike(c.get("strike"))
         if s_norm is None:
             m2 = re.search(r"[CP](\d{8,9})$", tk)
@@ -680,7 +657,6 @@ async def _choose_best_contract(
                     s_norm = None
         strike_miss = abs((s_norm if s_norm is not None else desired_strike) - desired_strike)
 
-        # Score tuple
         rank_tuple = (
             delta_miss,
             (spread_pct if spread_pct is not None else 1e9),
@@ -712,7 +688,7 @@ async def _choose_best_contract(
     return top[1], debug
 
 # =========================
-# Preflight gates (hard filters before LLM)
+# Preflight (non-blocking)
 # =========================
 def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     checks = {}
@@ -721,11 +697,7 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     checks["vol_ok"]      = (f.get("vol") or 0) >= MIN_VOL_TODAY
     checks["oi_ok"]       = (f.get("oi") or 0) >= MIN_OI
     dte_val = f.get("dte")
-    if dte_val is None:
-        # compute defensively
-        checks["dte_ok"] = False
-    else:
-        checks["dte_ok"] = (MIN_DTE <= dte_val <= MAX_DTE)
+    checks["dte_ok"]      = (dte_val is not None) and (MIN_DTE <= dte_val <= MAX_DTE)
     ok = all(checks.values())
     return ok, checks
 
@@ -804,6 +776,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     f: Dict[str, Any] = {}
     selection_debug: Dict[str, Any] = {"desired_strike": desired_strike, "selected_ticker": option_ticker, **(sel_dbg or {})}
 
+    # --- Enrich features (Polygon + internal) ---
     try:
         if not POLYGON_API_KEY:
             f = {
@@ -821,22 +794,17 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # Enrich FIRST (multi-source)
             extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
-
-            # Seed features with enrichment
             for k, v in (extra_from_snap or {}).items():
                 if v is not None:
                     f[k] = v
 
-            # Single contract snapshot (for build_features internals)
             snap = None
             try:
                 snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
             except Exception:
                 snap = None
 
-            # Build core features (trend, regime, sr, iv_rank, etc.)
             core = await build_features(
                 HTTP,
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
@@ -846,18 +814,15 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 if v is not None or k not in f:
                     f[k] = v
 
-            # Ensure mid if we have bid/ask
             if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
                 f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
 
-            # Fill DTE if missing
             try:
                 if f.get("dte") is None:
                     f["dte"] = (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days
             except Exception:
                 pass
 
-            # Compute spread %
             try:
                 bid = f.get("bid")
                 ask = f.get("ask")
@@ -876,59 +841,41 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # ---------- Preflight gates (before LLM) ----------
+    # ---------- Preflight (do NOT block LLM) ----------
     pf_ok, pf_checks = preflight_ok(f)
 
-    in_window = True  # disable time window checks
+    # ---------- Always run LLM ----------
+    llm_ran = True
+    try:
+        llm = await analyze_with_openai(alert, f)
+        consume_llm()
+    except Exception as e:
+        llm = {"decision": "wait", "confidence": 0.0, "reason": f"LLM error: {e}", "checklist": {}, "ev_estimate": {}}
 
-
-    llm_ran = False
-    llm_reason = ""
-    tg_result = None
-    decision_final = "skip"
-    decision_path = "preflight.fail"
+    decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
+    decision_path = f"llm.{decision_final}"
     score: Optional[float] = None
     rating: Optional[str] = None
-    llm: Dict[str, Any] = {"decision": "wait", "confidence": 0.0, "reason": "", "checklist": {}, "ev_estimate": {}}
+    try:
+        score = compute_decision_score(f, llm)
+        rating = map_score_to_rating(score, llm.get("decision"))
+    except Exception:
+        score, rating = None, None
 
-    ib_attempted = False
-    ib_result_obj: Optional[Any] = None
+    if force_buy:
+        decision_final = "buy"
+        decision_path = "force.buy"
 
-    if in_window and (pf_ok or force_buy):
-        # Run LLM if liquidity OK (or force_buy overrides)
-        try:
-            llm = await analyze_with_openai(alert, f)
-            consume_llm()
-        except Exception as e:
-            llm = {"decision": "wait", "confidence": 0.0, "reason": f"LLM error: {e}", "checklist": {}, "ev_estimate": {}}
-
-        llm_ran = True
-        decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
-        try:
-            score = compute_decision_score(f, llm)
-            rating = map_score_to_rating(score, llm.get("decision"))
-        except Exception:
-            score, rating = None, None
-        decision_path = f"llm.{decision_final}"
-        if force_buy:
-            decision_final = "buy"
-            decision_path = "force.buy"
-    else:
-        if not in_window:
-            llm_reason = "Outside processing windows (Allowed: 08:30–11:30 & 14:00–15:00 CDT). LLM + Telegram skipped."
-            decision_path = "window.skip"
-        elif not pf_ok:
-            llm_reason = f"Preflight failed: {pf_checks}"
-
-    # Telegram
+    # ---------- Telegram ----------
+    tg_result = None
     try:
         tg_text = compose_telegram_text(
             alert={**alert, "strike": desired_strike, "expiry": target_expiry},
             option_ticker=option_ticker,
             f=f,
             llm=llm,
-            llm_ran=(decision_path.startswith("llm.") or decision_path == "force.buy"),
-            llm_reason=llm_reason,
+            llm_ran=True,
+            llm_reason="",  # no “outside window” messages anymore
             score=score,
             rating=rating
         )
@@ -937,9 +884,11 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[worker] Telegram error: {e}")
 
-    # IBKR placement
+    # ---------- IBKR placement (still gated by pf_ok unless force_buy) ----------
+    ib_attempted = False
+    ib_result_obj: Optional[Any] = None
     try:
-        if (decision_final == "buy") and ib_enabled:
+        if (decision_final == "buy") and ib_enabled and (pf_ok or force_buy):
             ib_attempted = True
             mode = IBKR_ORDER_MODE
             mid = f.get("mid")
@@ -978,7 +927,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "ran": llm_ran,
             "decision": llm.get("decision"),
             "confidence": llm.get("confidence"),
-            "reason": llm.get("reason") if llm_ran else llm_reason
+            "reason": llm.get("reason"),
         },
         "features": {
             "reco_expiry": target_expiry,
@@ -1000,6 +949,17 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         },
         "preflight": pf_checks,
         "selection_debug": selection_debug,
+
+        # NEW: visibility for messaging/trading outcomes
+        "telegram": {
+            "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+            "result": tg_result
+        },
+        "ibkr": {
+            "enabled": ib_enabled,
+            "attempted": ib_attempted,
+            "result": (_ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None),
+        },
     }
 
     _DECISIONS_LOG.append(log_entry)
@@ -1175,9 +1135,10 @@ async def diag_polygon(underlying: str, contract: str):
 
     def skim(d):
         if not isinstance(d, dict): return d
+        res = d.get("results")
         return {
             "keys": list(d.keys())[:10],
-            "sample": (d.get("results") or d) if not isinstance(d.get("results"), list) else (d.get("results")[:2]),
+            "sample": (res[:2] if isinstance(res, list) else (res if isinstance(res, dict) else d)),
             "status_hint": d.get("status"),
         }
     return {
@@ -1187,3 +1148,20 @@ async def diag_polygon(underlying: str, contract: str):
         "open_close": skim(out.get("open_close")),
         "aggs": skim(out.get("aggs")),
     }
+
+@router.post("/diag/telegram")
+async def diag_telegram(payload: dict | None = None):
+    """
+    Send a quick test message to your Telegram chat to verify BOT_TOKEN/CHAT_ID.
+    POST JSON: {"text": "hello"}  (text is optional)
+    """
+    text = ((payload or {}).get("text")) or "🚨 Telegram test from alert server"
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN env var"}
+    if not TELEGRAM_CHAT_ID:
+        return {"ok": False, "error": "Missing TELEGRAM_CHAT_ID env var"}
+    try:
+        res = await send_telegram(text)
+        return {"ok": True, "sent": True, "text": text, "result": res}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
