@@ -879,7 +879,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     # ---------- Preflight gates (before LLM) ----------
     pf_ok, pf_checks = preflight_ok(f)
 
-    in_window = allowed_now_cdt() or force
+    in_window = true
 
     llm_ran = False
     llm_reason = ""
