@@ -510,7 +510,7 @@ async def _poly_option_backfill(
 
     # 3) Previous-day open/close (T+1 OI/Vol)
     try:
-        yday = (today_utc - timedelta(days=1)).isoformat()
+        yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
         enc_opt = _encode_ticker_path(option_ticker)
         oc = await _http_json(
             client,
@@ -776,11 +776,9 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         target_expiry_date = swf + timedelta(days=7)
     target_expiry = target_expiry_date.isoformat()
 
-    # ±5% contracts for reference/logs
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
     desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
 
-    # Delta-targeted selection with liquidity tie-breakers
     try:
         option_ticker, sel_dbg = await _choose_best_contract(
             HTTP, alert["symbol"], target_expiry, alert["side"], ul_px, desired_strike
@@ -791,7 +789,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     f: Dict[str, Any] = {}
     selection_debug: Dict[str, Any] = {"desired_strike": desired_strike, "selected_ticker": option_ticker, **(sel_dbg or {})}
 
-    # --- Enrich features (Polygon + internal) ---
     try:
         if not POLYGON_API_KEY:
             f = {
@@ -856,10 +853,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # ---------- Preflight (do NOT block LLM) ----------
     pf_ok, pf_checks = preflight_ok(f)
 
-    # ---------- Always run LLM ----------
     llm_ran = True
     try:
         llm = await analyze_with_openai(alert, f)
@@ -881,7 +876,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         decision_final = "buy"
         decision_path = "force.buy"
 
-    # ---------- Telegram ----------
     tg_result = None
     try:
         tg_text = compose_telegram_text(
@@ -890,7 +884,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             f=f,
             llm=llm,
             llm_ran=True,
-            llm_reason="",  # no “outside window” messages anymore
+            llm_reason="",
             score=score,
             rating=rating
         )
@@ -899,7 +893,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[worker] Telegram error: {e}")
 
-    # ---------- IBKR placement (still gated by pf_ok unless force_buy) ----------
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
     try:
@@ -964,7 +957,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         },
         "preflight": pf_checks,
         "selection_debug": selection_debug,
-
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
             "result": tg_result
@@ -1181,7 +1173,7 @@ async def diag_telegram(payload: dict | None = None):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 # ======================================================
-# Chain Scanner (weeks 1/2/3) – calls + puts (pagination)
+# Chain Scanner (weeks 1/2/3) – calls + puts (pagination + fallback)
 # ======================================================
 async def _poly_paginated_snapshot_list(
     client: httpx.AsyncClient,
@@ -1214,7 +1206,6 @@ async def _poly_paginated_snapshot_list(
             nxt = None
 
         while nxt:
-            # ensure apiKey is on the next_url
             if "apiKey=" not in nxt and POLYGON_API_KEY:
                 sep = "&" if "?" in nxt else "?"
                 nxt = f"{nxt}{sep}apiKey={POLYGON_API_KEY}"
@@ -1225,6 +1216,56 @@ async def _poly_paginated_snapshot_list(
             nxt = page.get("next_url")
 
     return all_rows
+
+async def _poly_reference_contracts(
+    client: httpx.AsyncClient,
+    underlying: str,
+    expiry_iso: str,
+    max_contracts: int = 1200,
+) -> List[str]:
+    """
+    Fallback: query reference contracts and build list of tickers (both C/P).
+    """
+    if not POLYGON_API_KEY:
+        return []
+    tickers: List[str] = []
+    base = "https://api.polygon.io/v3/reference/options/contracts"
+    params = {
+        "underlying_ticker": underlying,
+        "expiration_date": expiry_iso,
+        "limit": 1000,
+        "apiKey": POLYGON_API_KEY,
+    }
+    first = await _http_json(client, base, params, timeout=10.0)
+    if first and isinstance(first.get("results"), list):
+        for it in first["results"]:
+            t = it.get("ticker")
+            if t:
+                tickers.append(t)
+        nxt = first.get("next_url")
+    else:
+        nxt = None
+
+    while nxt and len(tickers) < max_contracts:
+        if "apiKey=" not in nxt and POLYGON_API_KEY:
+            sep = "&" if "?" in nxt else "?"
+            nxt = f"{nxt}{sep}apiKey={POLYGON_API_KEY}"
+        page = await _http_json_url(client, nxt, timeout=10.0)
+        if not page or not isinstance(page.get("results"), list):
+            break
+        for it in page["results"]:
+            t = it.get("ticker")
+            if t:
+                tickers.append(t)
+        nxt = page.get("next_url")
+
+    return tickers[:max_contracts]
+
+async def _poly_snapshot_for_ticker(client: httpx.AsyncClient, underlying: str, ticker: str) -> Optional[Dict[str, Any]]:
+    enc = _encode_ticker_path(ticker)
+    snap = await _http_json(client, f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
+                            {"apiKey": POLYGON_API_KEY}, timeout=6.0)
+    return snap.get("results") if snap else None
 
 @router.post("/scan/options")
 async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
@@ -1251,9 +1292,9 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
     top_n   = int(payload.get("top", 6))
     sort_by = str(payload.get("sort", "oi")).lower()
 
-    # Next 3 Friday expiries starting >= upcoming Friday
+    # Next 3 Friday expiries starting >= next Friday from today (always future)
     today_utc = datetime.now(timezone.utc).date()
-    wk1 = same_week_friday(today_utc)
+    wk1 = _next_friday(today_utc)
     if wk1 <= today_utc:
         wk1 = wk1 + timedelta(days=7)
     wk2 = wk1 + timedelta(days=7)
@@ -1262,8 +1303,24 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
 
     buckets = []
     for i, exp in enumerate(weeks, start=1):
+        # Primary: snapshot list
         rows = await _poly_paginated_snapshot_list(HTTP, symbol, exp, limit=1000)
         scanned = len(rows)
+
+        # Fallback: reference + per-contract snapshots (concurrent)
+        if scanned == 0:
+            tickers = await _poly_reference_contracts(HTTP, symbol, exp, max_contracts=1200)
+            scanned = len(tickers)
+            sem = asyncio.Semaphore(12)
+            async def fetch_one(tk: str):
+                async with sem:
+                    try:
+                        return await _poly_snapshot_for_ticker(HTTP, symbol, tk)
+                    except Exception:
+                        return None
+            snaps = [fetch_one(t) for t in tickers]
+            gathered = await asyncio.gather(*snaps)
+            rows = [r for r in gathered if isinstance(r, dict)]
 
         items = []
         for r in rows:
@@ -1272,12 +1329,10 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
             if not tk:
                 continue
 
-            # liquidity
             day = r.get("day") or {}
             vol = int(day.get("volume") or day.get("v") or 0)
             oi  = int(r.get("open_interest") or 0)
 
-            # NBBO + spread
             lq = r.get("last_quote") or {}
             b = lq.get("bid_price"); a = lq.get("ask_price")
             mid = None; spread_pct = None
