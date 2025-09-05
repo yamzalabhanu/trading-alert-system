@@ -944,7 +944,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     target_expiry_date = two_weeks_friday(today_utc)
     swf = same_week_friday(today_utc)
     if is_same_week(target_expiry_date, swf):
-        target_expiry_date = swf + timedelta(days=7))
+        target_expiry_date = swf + timedelta(days=7)
     target_expiry = target_expiry_date.isoformat()
 
     # ±5% contracts for reference/logs
