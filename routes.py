@@ -33,9 +33,6 @@ from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
 from reporting import _DECISIONS_LOG, _send_daily_report_now, _summarize_day_for_report, _chunk_lines_for_telegram
 
-# NEW: chain scanner
-from chain_scanner import scan_and_alert_options_chain
-
 router = APIRouter()
 
 # =========================
@@ -237,7 +234,7 @@ def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
         return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
 
 # =========================
-# HTTP helpers
+# HTTP helpers (encoding & safe JSON)
 # =========================
 def _encode_ticker_path(t: str) -> str:
     return quote(t or "", safe="")
@@ -320,34 +317,47 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     return start, now_utc.isoformat()
 
 # =========================
-# Quote sampler
+# Quote sampler (+ extra NBBO fallback)
 # =========================
 async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Dict[str, Any]]:
     best = {}
     for _ in range(tries):
+        # v3 last quote
         lastq = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
                                  {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+        bid = ask = ts = None
         if lastq:
             res = lastq.get("results") or {}
             last = res.get("last") or res
             bid = last.get("bidPrice")
             ask = last.get("askPrice")
             ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-            if bid is not None and ask is not None and ask >= bid:
-                mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
-                spread_pct = ((ask - bid) / mid * 100) if (mid and mid > 0) else None
-                age = _quote_age_from_ts(ts)
-                cand = {
-                    "bid": float(bid) if bid is not None else None,
-                    "ask": float(ask) if ask is not None else None,
-                    "mid": float(mid) if mid is not None else None,
-                    "quote_age_sec": age,
-                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
-                }
-                if not best or \
-                   (cand["option_spread_pct"] or 1e9) < (best.get("option_spread_pct") or 1e9) or \
-                   (cand["quote_age_sec"] or 1e9) < (best.get("quote_age_sec") or 1e9):
-                    best = cand
+
+        # legacy v1 last quote (fallback)
+        if (bid is None or ask is None) and POLYGON_API_KEY:
+            lq = await _http_json(client, f"https://api.polygon.io/v1/last_quote/options/{enc_opt}",
+                                  {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+            if lq:
+                q = lq.get("last") or lq
+                bid = q.get("bid") if bid is None else bid
+                ask = q.get("ask") if ask is None else ask
+                ts  = q.get("t") or ts
+
+        if bid is not None and ask is not None and ask >= bid:
+            mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
+            spread_pct = ((ask - bid) / mid * 100) if (mid and mid > 0) else None
+            age = _quote_age_from_ts(ts)
+            cand = {
+                "bid": float(bid) if bid is not None else None,
+                "ask": float(ask) if ask is not None else None,
+                "mid": float(mid) if mid is not None else None,
+                "quote_age_sec": age,
+                "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
+            }
+            if not best or \
+               (cand["option_spread_pct"] or 1e9) < (best.get("option_spread_pct") or 1e9) or \
+               (cand["quote_age_sec"] or 1e9) < (best.get("quote_age_sec") or 1e9):
+                best = cand
         await asyncio.sleep(delay)
     return best or None
 
@@ -705,6 +715,169 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     return ok, checks
 
 # =========================
+# Chain scan helpers/routes
+# =========================
+def _week_fridays(base_utc: date) -> List[date]:
+    w1 = _next_friday(base_utc)
+    w2 = w1 + timedelta(days=7)
+    w3 = w2 + timedelta(days=7)
+    return [w1, w2, w3]
+
+def _as_iso(d: date) -> str:
+    return d.isoformat()
+
+def _as_int(v) -> int:
+    try:
+        if v is None:
+            return 0
+        if isinstance(v, (int, float)):
+            return int(v)
+        return int(str(v).strip())
+    except Exception:
+        return 0
+
+def _safe_float(v) -> Optional[float]:
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+async def _fetch_week_snapshot(client: httpx.AsyncClient, symbol: str, expiry_iso: str, side: Optional[str]=None) -> List[Dict[str, Any]]:
+    if not POLYGON_API_KEY:
+        return []
+    params = {
+        "apiKey": POLYGON_API_KEY,
+        "expiration_date": expiry_iso,
+        "limit": 1000,
+        "greeks": "true",
+    }
+    base = f"https://api.polygon.io/v3/snapshot/options/{symbol}"
+    out: List[Dict[str, Any]] = []
+
+    async def _pull(_side: str):
+        p = dict(params)
+        p["contract_type"] = _side
+        js = await _http_json(client, base, p, timeout=8.0)
+        return (js or {}).get("results") or []
+
+    if side in ("call", "put"):
+        out = await _pull(side)
+    else:
+        calls, puts = await asyncio.gather(_pull("call"), _pull("put"))
+        out = (calls or []) + (puts or [])
+    return out
+
+def _score_and_filter(items: List[Dict[str, Any]], min_vol: int, min_oi: int, min_iv: Optional[float]=None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    norm: List[Dict[str, Any]] = []
+    for it in items:
+        det = it.get("details") or {}
+        day = it.get("day") or {}
+        greeks = it.get("greeks") or {}
+        lq = it.get("last_quote") or {}
+
+        ticker = det.get("ticker") or it.get("ticker")
+        strike = _normalize_poly_strike(det.get("strike"))
+        vol = _as_int(day.get("volume", day.get("v")))
+        oi = _as_int(it.get("open_interest"))
+        iv = _safe_float(it.get("implied_volatility") or greeks.get("iv"))
+
+        bid = _safe_float(lq.get("bid_price"))
+        ask = _safe_float(lq.get("ask_price"))
+        mid = None
+        spread_pct = None
+        if bid is not None and ask is not None and ask >= bid and ask > 0:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                spread_pct = (ask - bid) / mid * 100.0
+
+        norm.append({
+            "ticker": ticker,
+            "strike": strike,
+            "vol": vol,
+            "oi": oi,
+            "iv": iv,
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread_pct": spread_pct,
+        })
+
+    # filter
+    filt = []
+    for r in norm:
+        if min_iv is not None and (r["iv"] is None or r["iv"] < min_iv):
+            continue
+        if r["vol"] >= min_vol or r["oi"] >= min_oi:
+            filt.append(r)
+
+    diag = {"scanned": len(norm), "kept": len(filt)}
+    return filt, diag
+
+def _sort_contracts(rows: List[Dict[str, Any]], sort: str) -> List[Dict[str, Any]]:
+    sort = (sort or "comb").lower()
+    if sort == "oi":
+        return sorted(rows, key=lambda r: r["oi"], reverse=True)
+    if sort == "vol":
+        return sorted(rows, key=lambda r: r["vol"], reverse=True)
+    if sort == "iv":
+        return sorted(rows, key=lambda r: (r["iv"] or 0.0), reverse=True)
+    return sorted(rows, key=lambda r: (r["oi"], r["vol"], (r["iv"] or 0.0)), reverse=True)
+
+def _format_scan_msg(symbol: str, cfg: Dict[str, Any], weeks: List[Tuple[str, List[Dict[str, Any]], Dict[str,int]]]) -> str:
+    hdr = f"🔎 Chain Scan — {symbol}\n\nFilters: minVol≥{cfg['minVol']} or minOI≥{cfg['minOI']}"
+    if cfg.get("minIV") is not None:
+        hdr += f" · minIV≥{cfg['minIV']:.2f}"
+    hdr += f" · sort={cfg['sort']} · top={cfg['top']}\n"
+    lines = [hdr, ""]
+    for wk_label, rows, diag in weeks:
+        lines.append(f"📅 {wk_label}  (scanned {diag['scanned']}, kept {diag['kept']})")
+        if not rows:
+            lines.append("(no contracts meeting thresholds)\n")
+            continue
+        for r in rows[: cfg["top"]]:
+            sp = f" · spr={r['spread_pct']:.1f}%" if r.get("spread_pct") is not None else ""
+            ivp = f"{r['iv']:.3f}" if r['iv'] is not None else "n/a"
+            lines.append(f"• {r['ticker']}  K={r['strike']}  OI={r['oi']}  Vol={r['vol']}  IV={ivp}{sp}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+@router.get("/diag/chain_scan")
+async def diag_chain_scan(
+    symbol: str,
+    minVol: int = 5000,
+    minOI: int = 5000,
+    minIV: Optional[float] = None,
+    sort: str = "comb",       # comb|oi|vol|iv
+    top: int = 8,
+):
+    if HTTP is None:
+        raise HTTPException(status_code=503, detail="HTTP client not ready")
+    today = datetime.now(timezone.utc).date()
+    w1, w2, w3 = _week_fridays(today)
+    cfg = {"minVol": minVol, "minOI": minOI, "minIV": minIV, "sort": sort, "top": top}
+
+    out_weeks = []
+    for idx, d in enumerate([w1, w2, w3], start=1):
+        expiry_iso = _as_iso(d)
+        raw = await _fetch_week_snapshot(HTTP, symbol, expiry_iso, side=None)
+        kept, diag = _score_and_filter(raw, minVol, minOI, minIV)
+        kept_sorted = _sort_contracts(kept, sort)
+        out_weeks.append((f"Week {idx} — {expiry_iso}", kept_sorted, diag))
+
+    text = _format_scan_msg(symbol.upper(), cfg, out_weeks)
+
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "config": cfg,
+        "weeks": [
+            {"label": lbl, "expiry": lbl.split("—")[-1].strip(), "scanned": diag["scanned"], "kept": diag["kept"], "top": rows[:top]}
+            for (lbl, rows, diag) in out_weeks
+        ],
+        "preview": text
+    }
+
+# =========================
 # Lifespan
 # =========================
 @router.on_event("startup")
@@ -751,17 +924,27 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         return
 
     ib_enabled = bool(job["flags"].get("ib_enabled", IBKR_ENABLED))
-    force = bool(job["flags"].get("force", False))
     force_buy = bool(job["flags"].get("force_buy", False))
     qty = int(job["flags"].get("qty", IBKR_DEFAULT_QTY))
-    debug_mode = bool(job["flags"].get("debug", False))
+
+    # scan flags (optional chain scan after LLM/Telegram)
+    scan_enable = bool(job["flags"].get("scan", False))
+    scan_minVol = int(job["flags"].get("scan_minVol", 5000))
+    scan_minOI  = int(job["flags"].get("scan_minOI", 5000))
+    scan_minIV  = job["flags"].get("scan_minIV", None)
+    try:
+        scan_minIV = float(scan_minIV) if scan_minIV is not None else None
+    except Exception:
+        scan_minIV = None
+    scan_sort   = str(job["flags"].get("scan_sort", "comb"))
+    scan_top    = int(job["flags"].get("scan_top", 8))
 
     ul_px = float(alert["underlying_price_from_alert"])
     today_utc = datetime.now(timezone.utc).date()
     target_expiry_date = two_weeks_friday(today_utc)
     swf = same_week_friday(today_utc)
     if is_same_week(target_expiry_date, swf):
-        target_expiry_date = swf + timedelta(days=7)
+        target_expiry_date = swf + timedelta(days=7))
     target_expiry = target_expiry_date.isoformat()
 
     # ±5% contracts for reference/logs
@@ -840,6 +1023,15 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
+            # If still missing bid/ask, one more sampling attempt
+            if f.get("bid") is None or f.get("ask") is None:
+                enc_opt = _encode_ticker_path(option_ticker)
+                sampled = await _sample_best_quote(HTTP, enc_opt, tries=3, delay=0.4)
+                if sampled:
+                    for k, v in sampled.items():
+                        if v is not None:
+                            f[k] = v
+
     except Exception as e:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
@@ -887,7 +1079,26 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[worker] Telegram error: {e}")
 
-    # ---------- IBKR placement (gated by pf_ok unless force_buy) ----------
+    # ---------- Optional chain scan on alert ----------
+    scan_result = None
+    if scan_enable and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            today = datetime.now(timezone.utc).date()
+            w1, w2, w3 = _week_fridays(today)
+            cfg = {"minVol": scan_minVol, "minOI": scan_minOI, "minIV": scan_minIV, "sort": scan_sort, "top": scan_top}
+            out_weeks = []
+            for idx, d in enumerate([w1, w2, w3], start=1):
+                expiry_iso = _as_iso(d)
+                raw = await _fetch_week_snapshot(HTTP, alert["symbol"], expiry_iso, side=None)
+                kept, diag = _score_and_filter(raw, scan_minVol, scan_minOI, scan_minIV)
+                kept_sorted = _sort_contracts(kept, scan_sort)
+                out_weeks.append((f"Week {idx} — {expiry_iso}", kept_sorted, diag))
+            text = _format_scan_msg(alert["symbol"].upper(), cfg, out_weeks)
+            scan_result = await send_telegram(text)
+        except Exception as e:
+            scan_result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # ---------- IBKR placement (still gated by pf_ok unless force_buy) ----------
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
     try:
@@ -915,15 +1126,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             )
     except Exception as e:
         ib_result_obj = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    # ---------- OPTIONAL: Chain scan alert (Week1/2/3 high VOL/OI) ----------
-    try:
-        if job["flags"].get("scan", True):
-            scan_summary = await scan_and_alert_options_chain(HTTP, alert["symbol"], market_now().date())
-        else:
-            scan_summary = {"ok": False, "sent": False, "skipped": True}
-    except Exception as e:
-        scan_summary = {"ok": False, "sent": False, "error": f"{type(e).__name__}: {e}"}
 
     _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
 
@@ -961,16 +1163,20 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         },
         "preflight": pf_checks,
         "selection_debug": selection_debug,
+
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
             "result": tg_result
+        },
+        "scan": {
+            "enabled": scan_enable,
+            "result": scan_result
         },
         "ibkr": {
             "enabled": ib_enabled,
             "attempted": ib_attempted,
             "result": (_ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None),
         },
-        "chain_scan": scan_summary,  # <— NEW
     }
 
     _DECISIONS_LOG.append(log_entry)
@@ -1056,7 +1262,13 @@ async def webhook_tradingview(
     force: int = Query(default=0),
     force_buy: int = Query(default=0),
     debug: int = Query(default=0),
-    scan: int = Query(default=1),  # <— NEW: run chain scan alert
+    # scan on alert (optional)
+    scan: int = Query(default=0),
+    minVol: Optional[int] = Query(default=None),
+    minOI: Optional[int]  = Query(default=None),
+    minIV: Optional[float] = Query(default=None),
+    sort: str = Query(default="comb"),
+    top: int = Query(default=8),
 ):
     payload_text = await _get_alert_text(request)
     if not payload_text:
@@ -1078,7 +1290,13 @@ async def webhook_tradingview(
             "force_buy": bool(force_buy),
             "qty": int(qty),
             "debug": bool(debug),
-            "scan": bool(scan),   # <— NEW
+            # scan options
+            "scan": bool(scan),
+            "scan_minVol": int(minVol) if minVol is not None else 5000,
+            "scan_minOI": int(minOI) if minOI is not None else 5000,
+            "scan_minIV": float(minIV) if (minIV is not None) else None,
+            "scan_sort": sort,
+            "scan_top": int(top),
         }
     }
     try:
