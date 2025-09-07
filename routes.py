@@ -332,7 +332,7 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     return start, now_utc.isoformat()
 
 # =========================
-# Quote sampler + Fresh NBBO
+# Quote sampler
 # =========================
 async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Dict[str, Any]]:
     best = {}
@@ -362,54 +362,6 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
                     best = cand
         await asyncio.sleep(delay)
     return best or None
-
-# --- Fresh NBBO finder: quotes history + v1 last as fallbacks ---
-async def _fetch_fresh_nbbo(client: httpx.AsyncClient, option_ticker: str, max_age_sec: float = 180.0) -> Optional[Dict[str, Any]]:
-    enc = _encode_ticker_path(option_ticker)
-
-    # 1) v3 quotes history (newest first)
-    qhist = await _http_json(
-        client,
-        f"https://api.polygon.io/v3/quotes/options/{enc}",
-        {"apiKey": POLYGON_API_KEY, "limit": 50, "order": "desc", "sort": "timestamp"},
-        timeout=6.0
-    )
-    if qhist and isinstance(qhist.get("results"), list):
-        for q in qhist["results"]:
-            b = q.get("bid_price"); a = q.get("ask_price")
-            ts = q.get("sip_timestamp") or q.get("participant_timestamp") or q.get("t") or q.get("timestamp")
-            age = _quote_age_from_ts(ts)
-            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and age is not None and age <= max_age_sec:
-                mid = (a + b) / 2.0
-                spread_pct = ((a - b) / mid * 100.0) if mid > 0 else None
-                return {
-                    "bid": float(b), "ask": float(a), "mid": float(mid),
-                    "quote_age_sec": age,
-                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
-                }
-
-    # 2) v1 last (legacy) as a looser fallback (accept even if older)
-    v1 = await _http_json(
-        client,
-        f"https://api.polygon.io/v1/last_quote/options/{enc}",
-        {"apiKey": POLYGON_API_KEY},
-        timeout=6.0
-    )
-    if v1 and isinstance(v1.get("last"), dict):
-        last = v1["last"]
-        b = last.get("bid"); a = last.get("ask")
-        ts = last.get("sip_timestamp") or last.get("timestamp")
-        age = _quote_age_from_ts(ts)
-        if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b:
-            mid = (a + b) / 2.0
-            spread_pct = ((a - b) / mid * 100.0) if mid > 0 else None
-            return {
-                "bid": float(b), "ask": float(a), "mid": float(mid),
-                "quote_age_sec": age,
-                "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
-            }
-
-    return None
 
 # =========================
 # Backfill layers (multi-snapshot FIRST)
@@ -576,7 +528,7 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 4) Sample best quote (tightest/freshest among /last tries)
+    # 4) Sample best quote (tightest/freshest)
     try:
         enc_opt = _encode_ticker_path(option_ticker)
         sampled = await _sample_best_quote(client, enc_opt, tries=5, delay=0.6)
@@ -612,16 +564,6 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 6) Fresh NBBO via quotes history/v1 last (fills when last quote was None/stale)
-    try:
-        if (out.get("bid") is None or out.get("ask") is None or
-            out.get("quote_age_sec") is None or (out.get("quote_age_sec") or 1e9) > 300):
-            nbbo = await _fetch_fresh_nbbo(client, option_ticker, max_age_sec=300.0)
-            if nbbo:
-                out.update({k: v for k, v in nbbo.items() if v is not None})
-    except Exception:
-        pass
-
     return out
 
 # =========================
@@ -647,7 +589,7 @@ async def _choose_best_contract(
     side: str,
     ul_px: float,
     desired_strike: float,
-) -> Tuple[str, Dict[str, Any]]:
+) -> Tuple[str, Dict[str, Any]]]:
     """
     Returns (ticker, debug_info)
     Ranking:
@@ -838,7 +780,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
     desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
 
-    # Delta-targeted selection
+    # Delta-targeted selection with liquidity tie-breakers
     try:
         option_ticker, sel_dbg = await _choose_best_contract(
             HTTP, alert["symbol"], target_expiry, alert["side"], ul_px, desired_strike
@@ -867,17 +809,20 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
+            # Enrich FIRST (multi-source)
             extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
             for k, v in (extra_from_snap or {}).items():
                 if v is not None:
                     f[k] = v
 
+            # Single-contract snapshot (for build_features internals)
             snap = None
             try:
                 snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
             except Exception:
                 snap = None
 
+            # Build core features (trend, regime, sr, iv_rank, etc.)
             core = await build_features(
                 HTTP,
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
@@ -913,28 +858,14 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # Final NBBO rescue (if missing or too old)
-            try:
-                need_rescue = (
-                    f.get("bid") is None or f.get("ask") is None or
-                    f.get("quote_age_sec") is None or (f.get("quote_age_sec") or 1e9) > 300
-                )
-                if need_rescue:
-                    nbbo = await _fetch_fresh_nbbo(HTTP, option_ticker, max_age_sec=300.0)
-                    if nbbo:
-                        for k, v in nbbo.items():
-                            f[k] = v
-            except Exception:
-                pass
-
     except Exception as e:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # Preflight snapshot
+    # ---------- Preflight (do NOT block LLM) ----------
     pf_ok, pf_checks = preflight_ok(f)
 
-    # LLM decision (always run)
+    # ---------- Always run LLM ----------
     llm_ran = True
     try:
         llm = await analyze_with_openai(alert, f)
@@ -956,7 +887,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         decision_final = "buy"
         decision_path = "force.buy"
 
-    # Telegram
+    # ---------- Telegram ----------
     tg_result = None
     try:
         tg_text = compose_telegram_text(
@@ -965,7 +896,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             f=f,
             llm=llm,
             llm_ran=True,
-            llm_reason="",  # no window gating now
+            llm_reason="",  # no “outside window” messages anymore
             score=score,
             rating=rating
         )
@@ -974,7 +905,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[worker] Telegram error: {e}")
 
-    # IBKR placement (gated by preflight unless force_buy)
+    # ---------- IBKR placement (still gated by pf_ok unless force_buy) ----------
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
     try:
@@ -1039,6 +970,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         },
         "preflight": pf_checks,
         "selection_debug": selection_debug,
+
+        # visibility for messaging/trading outcomes
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
             "result": tg_result
@@ -1257,6 +1190,20 @@ async def diag_telegram(payload: dict | None = None):
 # ======================================================
 # Chain Scanner (weeks 1/2/3) – calls + puts (pagination + fallback)
 # ======================================================
+def _rank_score(sort_by: str, vol: int, oi: int) -> tuple:
+    """
+    Return a sortable tuple (higher is better but we negate to sort ascending).
+    """
+    sort_by = (sort_by or "oi").lower()
+    if sort_by == "vol":
+        return (-vol, -oi)
+    elif sort_by == "oi":
+        return (-oi, -vol)
+    elif sort_by == "comb":
+        return (-(vol + oi), -oi, -vol)
+    else:  # "comb/oi" or unknown
+        return (-oi, -(vol + oi), -vol)
+
 async def _poly_paginated_snapshot_list(
     client: httpx.AsyncClient,
     underlying: str,
@@ -1371,10 +1318,10 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
 
     min_vol = int(payload.get("minVol", 2000))
     min_oi  = int(payload.get("minOI",  2000))
-    top_n   = int(payload.get("top", 6))
+    top_n   = max(1, int(payload.get("top", 6)))
     sort_by = str(payload.get("sort", "oi")).lower()
 
-    # Next 3 Friday expiries starting >= next Friday from today (always future)
+    # Next 3 Friday expiries strictly in the future
     today_utc = datetime.now(timezone.utc).date()
     wk1 = _next_friday(today_utc)
     if wk1 <= today_utc:
@@ -1384,29 +1331,30 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
     weeks = [wk1.isoformat(), wk2.isoformat(), wk3.isoformat()]
 
     buckets = []
-    overall_candidates: List[Dict[str, Any]] = []
-
+    overall_candidates = []  # keep _score here; strip later
     for i, exp in enumerate(weeks, start=1):
-        # Primary: snapshot list
+        # Primary snapshot list
         rows = await _poly_paginated_snapshot_list(HTTP, symbol, exp, limit=1000)
         scanned = len(rows)
 
-        # Fallback: reference + per-contract snapshots (concurrent)
+        # Fallback path if needed
         if scanned == 0:
             tickers = await _poly_reference_contracts(HTTP, symbol, exp, max_contracts=1200)
             scanned = len(tickers)
             sem = asyncio.Semaphore(12)
+
             async def fetch_one(tk: str):
                 async with sem:
                     try:
                         return await _poly_snapshot_for_ticker(HTTP, symbol, tk)
                     except Exception:
                         return None
+
             snaps = [fetch_one(t) for t in tickers]
             gathered = await asyncio.gather(*snaps)
             rows = [r for r in gathered if isinstance(r, dict)]
 
-        items = []
+        items_with_score = []
         for r in rows:
             det = r.get("details") or {}
             tk  = det.get("ticker") or r.get("ticker")
@@ -1420,34 +1368,15 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
             lq = r.get("last_quote") or {}
             b = lq.get("bid_price"); a = lq.get("ask_price")
             mid = None; spread_pct = None
-            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0:
-                mid = (a + b) / 2.0
-                if mid > 0:
+            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= 0 and b >= 0 and a >= b:
+                mid = (a + b) / 2.0 if (a is not None and b is not None) else None
+                if mid and mid > 0:
                     spread_pct = (a - b) / mid * 100.0
 
-            # Rescue NBBO if missing/stale
-            if (b is None or a is None):
-                try:
-                    nbbo = await _fetch_fresh_nbbo(HTTP, tk, max_age_sec=600.0)
-                    if nbbo:
-                        b = nbbo.get("bid"); a = nbbo.get("ask")
-                        mid = nbbo.get("mid"); spread_pct = nbbo.get("option_spread_pct")
-                except Exception:
-                    pass
-
-            # Only keep those meeting thresholds
+            # Apply volume/OI thresholds
             if (vol >= min_vol) or (oi >= min_oi):
-                # rank key (same rule as before)
-                if sort_by == "vol":
-                    key = (-vol, -oi)
-                elif sort_by == "oi":
-                    key = (-oi, -vol)
-                elif sort_by == "comb":
-                    key = (-(vol + oi), -oi, -vol)
-                else:  # "comb/oi"
-                    key = (-oi, -(vol + oi), -vol)
-
-                it = {
+                score = _rank_score(sort_by, vol, oi)
+                rec = {
                     "ticker": tk,
                     "expiry": exp,
                     "strike": _normalize_poly_strike(det.get("strike")),
@@ -1456,53 +1385,47 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
                     "oi": oi,
                     "bid": b, "ask": a, "mid": mid,
                     "spread_pct": (round(spread_pct, 3) if spread_pct is not None else None),
-                    "_rank_key": key,
-                    "_week": i,
+                    "_score": score,  # keep for sorting
                 }
-                items.append(it)
+                items_with_score.append(rec)
 
-        # Per-week keep top-N
-        items.sort(key=lambda x: x["_rank_key"])
-        kept = items[:top_n]
-        # Add to overall pool BEFORE popping rank key
-        overall_candidates.extend(kept)
-        # Clean up output objects for API
-        for it in kept:
-            it.pop("_rank_key", None)
-            it.pop("_week", None)
+        # Sort & keep top N for this week
+        items_with_score.sort(key=lambda x: x["_score"])
+        kept_with_score = items_with_score[:top_n]
+
+        # Accumulate for overall top calculation (keep _score here)
+        overall_candidates.extend(kept_with_score)
+
+        # For API/Telegram, don’t expose private fields
+        kept_clean = []
+        for it in kept_with_score:
+            itc = dict(it)
+            itc.pop("_score", None)
+            kept_clean.append(itc)
+
         buckets.append({
             "week": i,
             "expiry": exp,
             "scanned": scanned,
-            "kept": len(kept),
-            "items": kept,
+            "kept": len(kept_clean),
+            "items": kept_clean,
         })
 
-    # ---- Build Top 3 across all weeks ----
-    overall_sorted = sorted(overall_candidates, key=lambda x: x["_rank_key"])
-    top3 = overall_sorted[:3]
-    # Prepare clean copy for API response
-    top_overall_resp = []
-    for it in top3:
-        top_overall_resp.append({
-            "ticker": it["ticker"],
-            "expiry": it["expiry"],
-            "strike": it["strike"],
-            "type": it["type"],
-            "vol": it["vol"],
-            "oi": it["oi"],
-            "bid": it["bid"],
-            "ask": it["ask"],
-            "mid": it["mid"],
-            "spread_pct": it["spread_pct"],
-            "week": it["_week"],
-        })
+    # Compute overall top 3 (by same score), then strip _score
+    overall_sorted = sorted(overall_candidates, key=lambda x: x["_score"])
+    top_overall_raw = overall_sorted[:3]
+    top_overall = []
+    for it in top_overall_raw:
+        c = dict(it)
+        c.pop("_score", None)
+        top_overall.append(c)
 
-    # ---- Telegram messages ----
+    # Telegram summary + auto "top-1 buy" alert
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        # Summary per week + overall top 3
-        lines = [f"🔎 Chain Scan — {symbol}\n",
-                 f"Filters: minVol≥{min_vol} or minOI≥{min_oi} · sort={sort_by} · top={top_n}\n"]
+        lines = [
+            f"🔎 Chain Scan — {symbol}\n",
+            f"Filters: minVol≥{min_vol} or minOI≥{min_oi} · sort={sort_by} · top={top_n}\n",
+        ]
         for b in buckets:
             lines.append(f"📅 Week {b['week']} — {b['expiry']} (scanned {b['scanned']}, kept {b['kept']})")
             if b["kept"] == 0:
@@ -1510,35 +1433,34 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
                 continue
             for it in b["items"]:
                 sp = f" · spr={it['spread_pct']}%" if it.get("spread_pct") is not None else ""
-                lines.append(f"{(it.get('type') or '?')[0].upper()} {it['ticker']}  vol={it['vol']} oi={it['oi']}{sp}")
+                lines.append(f"{(it.get('type') or '?')[0].upper()} {it['ticker']} vol={it['vol']} oi={it['oi']}{sp}")
             lines.append("")
-        if top3:
-            lines.append("🏆 Top across weeks (3):")
-            for idx, it in enumerate(top3, start=1):
-                sp = f" · spr={it['spread_pct']}%" if it.get("spread_pct") is not None else ""
-                lines.append(f"{idx}) W{it['_week']} {it['ticker']}  vol={it['vol']} oi={it['oi']}{sp}")
+
+        if top_overall:
+            lines.append("🏆 Top across weeks (3)")
+            for i, it in enumerate(top_overall, start=1):
+                sp = f" · spr={it.get('spread_pct')}%" if it.get("spread_pct") is not None else ""
+                lines.append(f"{i}) {it['ticker']} vol={it['vol']} oi={it['oi']}{sp}")
+            lines.append("")
+
         try:
             await send_telegram("\n".join(lines).strip())
         except Exception:
             pass
 
-        # Buy alert for the #1 overall candidate (informational — no order)
-        if top3:
-            best = top3[0]
-            b_bid = best.get("bid"); b_ask = best.get("ask"); b_mid = best.get("mid")
-            sp = best.get("spread_pct")
-            sp_s = f"{sp}%" if sp is not None else "n/a"
-            buy_lines = [
-                "⚡ BUY CANDIDATE (Top of scan)",
-                f"{symbol} · Week {best['_week']} · Exp {best['expiry']}",
-                f"Contract: {best['ticker']}",
-                f"Type: {str(best.get('type') or '').upper()}  Strike: {best.get('strike')}",
-                f"Vol: {best['vol']}  OI: {best['oi']}",
-                f"NBBO: bid={b_bid} ask={b_ask} mid={b_mid}  Spread%: {sp_s}",
-            ]
+        # Send separate BUY alert for the #1 overall
+        if top_overall:
+            top1 = top_overall[0]
+            msg = (
+                "⚡ BUY CANDIDATE (Top of scan)\n"
+                f"{top1.get('ticker')}  exp={top1.get('expiry')}  "
+                f"vol={top1.get('vol')}  oi={top1.get('oi')}  "
+                f"bid={top1.get('bid')}  ask={top1.get('ask')}  "
+                f"spr%={top1.get('spread_pct')}"
+            )
             try:
-                await send_telegram("\n".join(buy_lines))
+                await send_telegram(msg)
             except Exception:
                 pass
 
-    return {"ok": True, "symbol": symbol, "weeks": buckets, "top_overall": top_overall_resp}
+    return {"ok": True, "symbol": symbol, "weeks": buckets, "top_overall": top_overall}
