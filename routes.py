@@ -278,136 +278,33 @@ def _within_reasonable_strike(diff: float, step: float) -> bool:
     return diff <= max(3 * step, 10.0)
 
 # =========================
-# NBBO enhanced (multi-source)
+# Polygon wrappers
 # =========================
-async def _parse_nbbo_from_last_obj(obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """Return (bid, ask, mid, age_sec) from a v3 quotes 'last' payload or fail gracefully."""
-    if not obj:
-        return None, None, None, None
-    res = obj.get("results") or {}
-    last = res.get("last") or res
-    b = last.get("bidPrice")
-    a = last.get("askPrice")
-    t = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-    if b is None or a is None or (not isinstance(b, (int, float))) or (not isinstance(a, (int, float))) or a < b:
-        return None, None, None, None
-    mid = (a + b) / 2.0 if (a is not None and b is not None) else None
-    age = _quote_age_from_ts(t)
-    return float(b), float(a), (float(mid) if mid is not None else None), (float(age) if age is not None else None)
+async def polygon_list_contracts_for_expiry(
+    client: httpx.AsyncClient,
+    symbol: str,
+    expiry: str,
+    side: str,
+    limit: int = 250,
+) -> List[Dict[str, Any]]:
+    return await list_contracts_for_expiry(client, symbol=symbol, expiry=expiry, side=side, limit=limit)
 
-async def _parse_nbbo_from_snapshot_obj(obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """Return (bid, ask, mid, age_sec) from a snapshot payload /v3/snapshot/options/{underlying}/{enc}."""
-    if not obj:
-        return None, None, None, None
-    res = obj.get("results") or {}
-    lq = res.get("last_quote") or {}
-    b = lq.get("bid_price")
-    a = lq.get("ask_price")
-    t = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp") or lq.get("t")
-    if b is None or a is None or (not isinstance(b, (int, float))) or (not isinstance(a, (int, float))) or a < b:
-        return None, None, None, None
-    mid = (a + b) / 2.0
-    age = _quote_age_from_ts(t)
-    return float(b), float(a), float(mid), (float(age) if age is not None else None)
-
-async def _parse_nbbo_from_v1_last(obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """Return (bid, ask, mid, age_sec) from v1/last_quote/options/{enc} if available."""
-    if not obj:
-        return None, None, None, None
-    last = obj.get("last") or {}
-    b = last.get("bid")
-    a = last.get("ask")
-    t = last.get("last_updated") or last.get("sip_timestamp") or last.get("t")
-    if b is None or a is None or (not isinstance(b, (int, float))) or (not isinstance(a, (int, float))) or a < b:
-        return None, None, None, None
-    mid = (a + b) / 2.0
-    age = _quote_age_from_ts(t)
-    return float(b), float(a), float(mid), (float(age) if age is not None else None)
-
-def _better_nbbo(curr: Dict[str, Any], cand: Dict[str, Any]) -> bool:
-    """
-    Return True if 'cand' should replace 'curr'. Preference order:
-      - any valid cand over missing curr
-      - fresher age (lower age)
-    """
-    cb, ca = cand.get("bid"), cand.get("ask")
-    if cb is None or ca is None:
-        return False
-    kb, ka = curr.get("bid"), curr.get("ask")
-    if kb is None or ka is None:
-        return True
-    cur_age = curr.get("quote_age_sec")
-    cand_age = cand.get("quote_age_sec")
-    if isinstance(cur_age, (int, float)) and isinstance(cand_age, (int, float)):
-        return cand_age < cur_age
-    return False
-
-async def _get_nbbo_enhanced(client: httpx.AsyncClient, underlying: str, option_ticker: str) -> Dict[str, Any]:
-    """Try multiple Polygon endpoints to get a fresh NBBO for the option."""
-    out: Dict[str, Any] = {}
-    if not POLYGON_API_KEY:
-        return out
-    enc = _encode_ticker_path(option_ticker)
-
-    # 1) v3 last
+async def polygon_get_option_snapshot(
+    client: httpx.AsyncClient,
+    underlying: str,
+    option_ticker: str,
+) -> Dict[str, Any]:
     try:
-        lastq = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
-                                 {"apiKey": POLYGON_API_KEY}, timeout=4.0)
-        b, a, m, age = await _parse_nbbo_from_last_obj(lastq)
-        if b is not None and a is not None:
-            sp = (a - b) / m * 100.0 if (m and m > 0) else None
-            out = {"bid": b, "ask": a, "mid": m, "quote_age_sec": age, "option_spread_pct": (round(sp,3) if sp is not None else None), "nbbo_source": "v3.last"}
-    except Exception:
-        pass
-
-    # 2) v3 quotes list (descending newest-first), pick first valid
-    try:
-        ql = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}",
-                              {"apiKey": POLYGON_API_KEY, "order": "desc", "limit": 5}, timeout=4.5)
-        if ql and isinstance(ql.get("results"), list):
-            for row in ql["results"]:
-                b = row.get("bp") or row.get("bidPrice")
-                a = row.get("ap") or row.get("askPrice")
-                t = row.get("t") or row.get("sip_timestamp") or row.get("timestamp")
-                if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b:
-                    m = (a + b) / 2.0
-                    age = _quote_age_from_ts(t)
-                    sp = (a - b) / m * 100.0 if (m and m > 0) else None
-                    cand = {"bid": float(b), "ask": float(a), "mid": float(m), "quote_age_sec": (float(age) if age is not None else None),
-                            "option_spread_pct": (round(sp,3) if sp is not None else None), "nbbo_source": "v3.quotes.list"}
-                    if _better_nbbo(out, cand):
-                        out = cand
-                    break
-    except Exception:
-        pass
-
-    # 3) snapshot single
-    try:
-        snap = await _http_json(client, f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
-                                {"apiKey": POLYGON_API_KEY}, timeout=5.0)
-        b, a, m, age = await _parse_nbbo_from_snapshot_obj(snap)
-        if b is not None and a is not None:
-            sp = (a - b) / m * 100.0 if (m and m > 0) else None
-            cand = {"bid": b, "ask": a, "mid": m, "quote_age_sec": age, "option_spread_pct": (round(sp,3) if sp is not None else None), "nbbo_source": "v3.snapshot"}
-            if _better_nbbo(out, cand):
-                out = cand
-    except Exception:
-        pass
-
-    # 4) v1 legacy last (sometimes works when v3 is empty)
-    try:
-        v1 = await _http_json(client, f"https://api.polygon.io/v1/last_quote/options/{enc}",
-                              {"apiKey": POLYGON_API_KEY}, timeout=4.0)
-        b, a, m, age = await _parse_nbbo_from_v1_last(v1)
-        if b is not None and a is not None:
-            sp = (a - b) / m * 100.0 if (m and m > 0) else None
-            cand = {"bid": b, "ask": a, "mid": m, "quote_age_sec": age, "option_spread_pct": (round(sp,3) if sp is not None else None), "nbbo_source": "v1.last"}
-            if _better_nbbo(out, cand):
-                out = cand
-    except Exception:
-        pass
-
-    return out
+        return await get_option_snapshot(client, symbol=underlying, contract=option_ticker)
+    except TypeError as e1:
+        try:
+            return await get_option_snapshot(underlying, option_ticker)
+        except TypeError as e2:
+            raise RuntimeError(
+                f"get_option_snapshot signature mismatch: "
+                f"tried (client,symbol,contract): {e1}; "
+                f"tried (symbol,contract): {e2}"
+            )
 
 # =========================
 # Time helpers
@@ -435,7 +332,7 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     return start, now_utc.isoformat()
 
 # =========================
-# Quote sampler (kept as a source; enhanced NBBO may override)
+# Quote sampler + Fresh NBBO
 # =========================
 async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Dict[str, Any]]:
     best = {}
@@ -465,6 +362,54 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
                     best = cand
         await asyncio.sleep(delay)
     return best or None
+
+# --- Fresh NBBO finder: quotes history + v1 last as fallbacks ---
+async def _fetch_fresh_nbbo(client: httpx.AsyncClient, option_ticker: str, max_age_sec: float = 180.0) -> Optional[Dict[str, Any]]:
+    enc = _encode_ticker_path(option_ticker)
+
+    # 1) v3 quotes history (newest first)
+    qhist = await _http_json(
+        client,
+        f"https://api.polygon.io/v3/quotes/options/{enc}",
+        {"apiKey": POLYGON_API_KEY, "limit": 50, "order": "desc", "sort": "timestamp"},
+        timeout=6.0
+    )
+    if qhist and isinstance(qhist.get("results"), list):
+        for q in qhist["results"]:
+            b = q.get("bid_price"); a = q.get("ask_price")
+            ts = q.get("sip_timestamp") or q.get("participant_timestamp") or q.get("t") or q.get("timestamp")
+            age = _quote_age_from_ts(ts)
+            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and age is not None and age <= max_age_sec:
+                mid = (a + b) / 2.0
+                spread_pct = ((a - b) / mid * 100.0) if mid > 0 else None
+                return {
+                    "bid": float(b), "ask": float(a), "mid": float(mid),
+                    "quote_age_sec": age,
+                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
+                }
+
+    # 2) v1 last (legacy) as a looser fallback (accept even if older)
+    v1 = await _http_json(
+        client,
+        f"https://api.polygon.io/v1/last_quote/options/{enc}",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0
+    )
+    if v1 and isinstance(v1.get("last"), dict):
+        last = v1["last"]
+        b = last.get("bid"); a = last.get("ask")
+        ts = last.get("sip_timestamp") or last.get("timestamp")
+        age = _quote_age_from_ts(ts)
+        if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b:
+            mid = (a + b) / 2.0
+            spread_pct = ((a - b) / mid * 100.0) if mid > 0 else None
+            return {
+                "bid": float(b), "ask": float(a), "mid": float(mid),
+                "quote_age_sec": age,
+                "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
+            }
+
+    return None
 
 # =========================
 # Backfill layers (multi-snapshot FIRST)
@@ -642,15 +587,6 @@ async def _poly_option_backfill(
     except Exception:
         pass
 
-    # 4b) NBBO enhanced multi-source (only overwrite if fresher/better)
-    try:
-        nbbo = await _get_nbbo_enhanced(client, symbol, option_ticker)
-        if nbbo:
-            if _better_nbbo(out, nbbo) or (out.get("bid") is None or out.get("ask") is None):
-                out.update(nbbo)
-    except Exception:
-        pass
-
     # 5) Minute aggregates (intraday volume sum if missing)
     try:
         if out.get("vol") is None:
@@ -673,6 +609,16 @@ async def _poly_option_backfill(
                             vol_sum += v
                     if vol_sum > 0:
                         out["vol"] = int(vol_sum)
+    except Exception:
+        pass
+
+    # 6) Fresh NBBO via quotes history/v1 last (fills when last quote was None/stale)
+    try:
+        if (out.get("bid") is None or out.get("ask") is None or
+            out.get("quote_age_sec") is None or (out.get("quote_age_sec") or 1e9) > 300):
+            nbbo = await _fetch_fresh_nbbo(client, option_ticker, max_age_sec=300.0)
+            if nbbo:
+                out.update({k: v for k, v in nbbo.items() if v is not None})
     except Exception:
         pass
 
@@ -758,16 +704,18 @@ async def _choose_best_contract(
         oi = det.get("open_interest")
         day_block = det.get("day") or {}
         vol = day_block.get("volume")
-
-        # Try enhanced NBBO so spread reflects real liquidity
+        enc = _encode_ticker_path(tk)
+        q = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+                             {"apiKey": POLYGON_API_KEY}, timeout=3.0)
         spread_pct = None
-        try:
-            nbbo = await _get_nbbo_enhanced(client, symbol, tk)
-            b = nbbo.get("bid"); a = nbbo.get("ask"); m = nbbo.get("mid")
-            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and isinstance(m, (int, float)) and m > 0 and a >= b:
-                spread_pct = (a - b) / m * 100.0
-        except Exception:
-            pass
+        if q:
+            res = q.get("results") or {}
+            last = res.get("last") or res
+            b, a = last.get("bidPrice"), last.get("askPrice")
+            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0 and b >= 0:
+                mid = (a + b)/2.0
+                if mid > 0:
+                    spread_pct = (a - b)/mid*100.0
 
         tgt = TARGET_DELTA_CALL if side == "CALL" else TARGET_DELTA_PUT
         delta_miss = abs((delta if isinstance(delta, (int, float)) else tgt) - tgt)
@@ -890,7 +838,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
     desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
 
-    # Delta-targeted selection with liquidity tie-breakers
+    # Delta-targeted selection
     try:
         option_ticker, sel_dbg = await _choose_best_contract(
             HTTP, alert["symbol"], target_expiry, alert["side"], ul_px, desired_strike
@@ -919,20 +867,17 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # Enrich FIRST (multi-source)
             extra_from_snap = await _poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
             for k, v in (extra_from_snap or {}).items():
                 if v is not None:
                     f[k] = v
 
-            # Single contract snapshot (for build_features internals)
             snap = None
             try:
                 snap = await polygon_get_option_snapshot(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
             except Exception:
                 snap = None
 
-            # Build core features (trend, regime, sr, iv_rank, etc.)
             core = await build_features(
                 HTTP,
                 alert={**alert, "strike": desired_strike, "expiry": target_expiry},
@@ -968,14 +913,17 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # If still missing bid/ask or stale, try enhanced NBBO one more time
+            # Final NBBO rescue (if missing or too old)
             try:
-                need_nbbo = (f.get("bid") is None or f.get("ask") is None or
-                             (isinstance(f.get("quote_age_sec"), (int, float)) and f["quote_age_sec"] > MAX_QUOTE_AGE_S))
-                if need_nbbo:
-                    nbbo2 = await _get_nbbo_enhanced(HTTP, alert["symbol"], option_ticker)
-                    if nbbo2 and _better_nbbo(f, nbbo2):
-                        f.update(nbbo2)
+                need_rescue = (
+                    f.get("bid") is None or f.get("ask") is None or
+                    f.get("quote_age_sec") is None or (f.get("quote_age_sec") or 1e9) > 300
+                )
+                if need_rescue:
+                    nbbo = await _fetch_fresh_nbbo(HTTP, option_ticker, max_age_sec=300.0)
+                    if nbbo:
+                        for k, v in nbbo.items():
+                            f[k] = v
             except Exception:
                 pass
 
@@ -983,10 +931,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # ---------- Preflight (do NOT block LLM) ----------
+    # Preflight snapshot
     pf_ok, pf_checks = preflight_ok(f)
 
-    # ---------- Always run LLM ----------
+    # LLM decision (always run)
     llm_ran = True
     try:
         llm = await analyze_with_openai(alert, f)
@@ -1008,7 +956,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         decision_final = "buy"
         decision_path = "force.buy"
 
-    # ---------- Telegram ----------
+    # Telegram
     tg_result = None
     try:
         tg_text = compose_telegram_text(
@@ -1017,7 +965,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             f=f,
             llm=llm,
             llm_ran=True,
-            llm_reason="",  # no window message
+            llm_reason="",  # no window gating now
             score=score,
             rating=rating
         )
@@ -1026,7 +974,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[worker] Telegram error: {e}")
 
-    # ---------- IBKR placement (still gated by pf_ok unless force_buy) ----------
+    # IBKR placement (gated by preflight unless force_buy)
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
     try:
@@ -1091,7 +1039,6 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         },
         "preflight": pf_checks,
         "selection_debug": selection_debug,
-
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
             "result": tg_result
@@ -1388,7 +1335,7 @@ async def _poly_reference_contracts(
         page = await _http_json_url(client, nxt, timeout=10.0)
         if not page or not isinstance(page.get("results"), list):
             break
-        for it in page.get("results", []):
+        for it in page["results"]:
             t = it.get("ticker")
             if t:
                 tickers.append(t)
@@ -1468,26 +1415,25 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
             vol = int(day.get("volume") or day.get("v") or 0)
             oi  = int(r.get("open_interest") or 0)
 
-            # Only compute NBBO if it passes thresholds (to save calls)
+            lq = r.get("last_quote") or {}
+            b = lq.get("bid_price"); a = lq.get("ask_price")
+            mid = None; spread_pct = None
+            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0:
+                mid = (a + b) / 2.0
+                if mid > 0:
+                    spread_pct = (a - b) / mid * 100.0
+
+            # Rescue NBBO if missing/stale
+            if (b is None or a is None):
+                try:
+                    nbbo = await _fetch_fresh_nbbo(HTTP, tk, max_age_sec=600.0)
+                    if nbbo:
+                        b = nbbo.get("bid"); a = nbbo.get("ask")
+                        mid = nbbo.get("mid"); spread_pct = nbbo.get("option_spread_pct")
+                except Exception:
+                    pass
+
             if (vol >= min_vol) or (oi >= min_oi):
-                lq = r.get("last_quote") or {}
-                b = lq.get("bid_price"); a = lq.get("ask_price")
-                mid = None; spread_pct = None
-
-                if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0:
-                    mid = (a + b) / 2.0
-                    if mid > 0:
-                        spread_pct = (a - b) / mid * 100.0
-                else:
-                    # Enhanced NBBO for those that qualified
-                    try:
-                        nbbo = await _get_nbbo_enhanced(HTTP, symbol, tk)
-                        b = nbbo.get("bid"); a = nbbo.get("ask"); mid = nbbo.get("mid")
-                        if isinstance(b, (int, float)) and isinstance(a, (int, float)) and isinstance(mid, (int, float)) and mid > 0 and a >= b:
-                            spread_pct = (a - b) / mid * 100.0
-                    except Exception:
-                        pass
-
                 if sort_by == "vol":
                     key = (-vol, -oi)
                 elif sort_by == "oi":
