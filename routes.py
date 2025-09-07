@@ -589,7 +589,7 @@ async def _choose_best_contract(
     side: str,
     ul_px: float,
     desired_strike: float,
-) -> Tuple[str, Dict[str, Any]]]:
+) -> Tuple[str, Dict[str, Any]]:
     """
     Returns (ticker, debug_info)
     Ranking:
