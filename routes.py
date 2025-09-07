@@ -36,7 +36,7 @@ from reporting import _DECISIONS_LOG, _send_daily_report_now, _summarize_day_for
 router = APIRouter()
 
 # =========================
-# Global state / resources
+# Global state / resourcess
 # =========================
 _llm_quota: Dict[str, Any] = {"date": None, "used": 0}
 _COOLDOWN: Dict[Tuple[str, str], datetime] = {}
