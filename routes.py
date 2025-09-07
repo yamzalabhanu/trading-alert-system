@@ -1384,6 +1384,8 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
     weeks = [wk1.isoformat(), wk2.isoformat(), wk3.isoformat()]
 
     buckets = []
+    overall_candidates: List[Dict[str, Any]] = []
+
     for i, exp in enumerate(weeks, start=1):
         # Primary: snapshot list
         rows = await _poly_paginated_snapshot_list(HTTP, symbol, exp, limit=1000)
@@ -1433,7 +1435,9 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
                 except Exception:
                     pass
 
+            # Only keep those meeting thresholds
             if (vol >= min_vol) or (oi >= min_oi):
+                # rank key (same rule as before)
                 if sort_by == "vol":
                     key = (-vol, -oi)
                 elif sort_by == "oi":
@@ -1443,7 +1447,7 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
                 else:  # "comb/oi"
                     key = (-oi, -(vol + oi), -vol)
 
-                items.append({
+                it = {
                     "ticker": tk,
                     "expiry": exp,
                     "strike": _normalize_poly_strike(det.get("strike")),
@@ -1452,13 +1456,20 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
                     "oi": oi,
                     "bid": b, "ask": a, "mid": mid,
                     "spread_pct": (round(spread_pct, 3) if spread_pct is not None else None),
-                    "_rank_key": key
-                })
+                    "_rank_key": key,
+                    "_week": i,
+                }
+                items.append(it)
 
+        # Per-week keep top-N
         items.sort(key=lambda x: x["_rank_key"])
-        for it in items:
-            it.pop("_rank_key", None)
         kept = items[:top_n]
+        # Add to overall pool BEFORE popping rank key
+        overall_candidates.extend(kept)
+        # Clean up output objects for API
+        for it in kept:
+            it.pop("_rank_key", None)
+            it.pop("_week", None)
         buckets.append({
             "week": i,
             "expiry": exp,
@@ -1467,8 +1478,29 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
             "items": kept,
         })
 
-    # Telegram summary (optional)
+    # ---- Build Top 3 across all weeks ----
+    overall_sorted = sorted(overall_candidates, key=lambda x: x["_rank_key"])
+    top3 = overall_sorted[:3]
+    # Prepare clean copy for API response
+    top_overall_resp = []
+    for it in top3:
+        top_overall_resp.append({
+            "ticker": it["ticker"],
+            "expiry": it["expiry"],
+            "strike": it["strike"],
+            "type": it["type"],
+            "vol": it["vol"],
+            "oi": it["oi"],
+            "bid": it["bid"],
+            "ask": it["ask"],
+            "mid": it["mid"],
+            "spread_pct": it["spread_pct"],
+            "week": it["_week"],
+        })
+
+    # ---- Telegram messages ----
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        # Summary per week + overall top 3
         lines = [f"🔎 Chain Scan — {symbol}\n",
                  f"Filters: minVol≥{min_vol} or minOI≥{min_oi} · sort={sort_by} · top={top_n}\n"]
         for b in buckets:
@@ -1480,9 +1512,33 @@ async def scan_and_alert_top_liquidity(payload: Dict[str, Any]):
                 sp = f" · spr={it['spread_pct']}%" if it.get("spread_pct") is not None else ""
                 lines.append(f"{(it.get('type') or '?')[0].upper()} {it['ticker']}  vol={it['vol']} oi={it['oi']}{sp}")
             lines.append("")
+        if top3:
+            lines.append("🏆 Top across weeks (3):")
+            for idx, it in enumerate(top3, start=1):
+                sp = f" · spr={it['spread_pct']}%" if it.get("spread_pct") is not None else ""
+                lines.append(f"{idx}) W{it['_week']} {it['ticker']}  vol={it['vol']} oi={it['oi']}{sp}")
         try:
             await send_telegram("\n".join(lines).strip())
         except Exception:
             pass
 
-    return {"ok": True, "symbol": symbol, "weeks": buckets}
+        # Buy alert for the #1 overall candidate (informational — no order)
+        if top3:
+            best = top3[0]
+            b_bid = best.get("bid"); b_ask = best.get("ask"); b_mid = best.get("mid")
+            sp = best.get("spread_pct")
+            sp_s = f"{sp}%" if sp is not None else "n/a"
+            buy_lines = [
+                "⚡ BUY CANDIDATE (Top of scan)",
+                f"{symbol} · Week {best['_week']} · Exp {best['expiry']}",
+                f"Contract: {best['ticker']}",
+                f"Type: {str(best.get('type') or '').upper()}  Strike: {best.get('strike')}",
+                f"Vol: {best['vol']}  OI: {best['oi']}",
+                f"NBBO: bid={b_bid} ask={b_ask} mid={b_mid}  Spread%: {sp_s}",
+            ]
+            try:
+                await send_telegram("\n".join(buy_lines))
+            except Exception:
+                pass
+
+    return {"ok": True, "symbol": symbol, "weeks": buckets, "top_overall": top_overall_resp}
