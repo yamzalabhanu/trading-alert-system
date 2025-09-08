@@ -50,6 +50,9 @@ IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()
 IBKR_ORDER_MODE = os.getenv("IBKR_ORDER_MODE", "auto").lower()   # auto | market | limit
 IBKR_USE_MID_AS_LIMIT = os.getenv("IBKR_USE_MID_AS_LIMIT", "1") == "1"
 
+# Prefer contract picked by chain scan when available
+PREFER_CHAIN_SCAN = _env_truthy(os.getenv("PREFER_CHAIN_SCAN", "1"))
+
 # =========================
 # Trading thresholds (tunable)
 # =========================
@@ -272,7 +275,7 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
                 cand = {
                     "bid": float(bid) if bid is not None else None,
                     "ask": float(ask) if ask is not None else None,
-                    "mid": float(mid) if mid is not None else None,
+                    "mid": float(mid) if mid is not None else None,   # mark
                     "quote_age_sec": age,
                     "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
                 }
@@ -289,6 +292,13 @@ async def _poly_option_backfill(
     option_ticker: str,
     today_utc: date,
 ) -> Dict[str, Any]:
+    """
+    Collects:
+      - bid/ask/mid(mark), last, spread%, quote_age_sec
+      - OI, Vol (day), IV, greeks
+      - prev_close (prior day), quote_change_pct vs prev_close
+      - fallback intraday volume via 1m aggs
+    """
     out: Dict[str, Any] = {}
     if not POLYGON_API_KEY:
         return out
@@ -303,6 +313,8 @@ async def _poly_option_backfill(
         vol = day_block.get("volume", day_block.get("v"))
         if vol is not None:
             out_dict["vol"] = vol
+
+        # quote + last + derived mark/spread/age
         lq = res.get("last_quote") or {}
         bid_px = lq.get("bid_price")
         ask_px = lq.get("ask_price")
@@ -310,28 +322,30 @@ async def _poly_option_backfill(
             out_dict["bid"] = float(bid_px)
         if ask_px is not None:
             out_dict["ask"] = float(ask_px)
+
+        lt = res.get("last_trade") or {}
+        lt_px = lt.get("price")
+        if isinstance(lt_px, (int, float)):
+            out_dict["last"] = float(lt_px)
+
         if out_dict.get("mid") is None and out_dict.get("bid") is not None and out_dict.get("ask") is not None:
             out_dict["mid"] = round((out_dict["bid"] + out_dict["ask"]) / 2.0, 4)
+
         ts = (
             lq.get("sip_timestamp")
             or lq.get("participant_timestamp")
             or lq.get("trf_timestamp")
             or lq.get("t")
+            or lt.get("sip_timestamp")
+            or lt.get("participant_timestamp")
+            or lt.get("trf_timestamp")
+            or lt.get("t")
         )
-        if ts is None:
-            lt = res.get("last_trade") or {}
-            lt_px = lt.get("price")
-            if isinstance(lt_px, (int, float)) and out_dict.get("mid") is None:
-                out_dict["mid"] = float(lt_px)
-            ts = (
-                lt.get("sip_timestamp")
-                or lt.get("participant_timestamp")
-                or lt.get("trf_timestamp")
-                or lt.get("t")
-            )
         age = _quote_age_from_ts(ts)
         if age is not None:
             out_dict["quote_age_sec"] = age
+
+        # greeks & IV
         greeks = res.get("greeks") or {}
         for k_src in ("delta", "gamma", "theta", "vega"):
             v = greeks.get(k_src)
@@ -341,7 +355,7 @@ async def _poly_option_backfill(
         if iv is not None:
             out_dict["iv"] = iv
 
-    # 1) multi-snapshot list
+    # 1) multi-snapshot list -> exact match if present
     try:
         m = re.search(r":([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8,9})$", option_ticker)
         if m:
@@ -389,7 +403,8 @@ async def _poly_option_backfill(
         except Exception:
             pass
 
-    # 3) previous-day open/close
+    # 3) previous-day open/close (for prev_close and later change%)
+    prev_close = None
     try:
         yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
         enc_opt = _encode_ticker_path(option_ticker)
@@ -406,10 +421,14 @@ async def _poly_option_backfill(
                 out["oi"] = oi
             if out.get("vol") is None and vol is not None:
                 out["vol"] = vol
+            pc = oc.get("close")
+            if isinstance(pc, (int, float)):
+                prev_close = float(pc)
+                out["prev_close"] = prev_close
     except Exception:
         pass
 
-    # 4) sample best quote
+    # 4) sample best quote (robust NBBO + mark + spread + age)
     try:
         enc_opt = _encode_ticker_path(option_ticker)
         sampled = await _sample_best_quote(client, enc_opt, tries=5, delay=0.6)
@@ -442,6 +461,17 @@ async def _poly_option_backfill(
                             vol_sum += v
                     if vol_sum > 0:
                         out["vol"] = int(vol_sum)
+    except Exception:
+        pass
+
+    # 6) derive quote_change_pct if possible (mark vs prev_close)
+    try:
+        mark = out.get("mid")
+        if mark is None:
+            # fall back to last if present
+            mark = out.get("last")
+        if isinstance(mark, (int, float)) and isinstance(prev_close, (int, float)) and prev_close > 0:
+            out["quote_change_pct"] = round((float(mark) - float(prev_close)) / float(prev_close) * 100.0, 3)
     except Exception:
         pass
 
@@ -796,14 +826,18 @@ def compose_telegram_text(
     score: Optional[float],
     rating: Optional[str],
 ) -> str:
-    header = f"📣 Options Alert\n{alert['side']} {alert['symbol']} | Strike {alert.get('strike')} | Exp {alert.get('expiry')}\nUnderlying (alert): {alert.get('underlying_price_from_alert')}"
+    header = (
+        f"📣 Options Alert\n"
+        f"{alert['side']} {alert['symbol']} | Strike {alert.get('strike')} | Exp {alert.get('expiry')}\n"
+        f"Underlying (alert): {alert.get('underlying_price_from_alert')}"
+    )
     contract = f"Contract: {option_ticker}"
     snap = (
-        f"Snapshot:\n"
-        f"  IV: {f.get('iv')}  (IV rank: {f.get('iv_rank')})\n"
-        f"  OI: {f.get('oi')}  Vol: {f.get('vol')}\n"
-        f"  NBBO: bid={f.get('bid')} ask={f.get('ask')} mid={f.get('mid')}\n"
+        "Snapshot:\n"
+        f"  NBBO: bid={f.get('bid')} ask={f.get('ask')}  Mark={f.get('mid')}  Last={f.get('last')}\n"
         f"  Spread%: {f.get('option_spread_pct')}  QuoteAge(s): {f.get('quote_age_sec')}\n"
+        f"  PrevClose: {f.get('prev_close')}  Chg% vs PrevClose: {f.get('quote_change_pct')}\n"
+        f"  OI: {f.get('oi')}  Vol: {f.get('vol')}  IV: {f.get('iv')}  (IV rank: {f.get('iv_rank')})\n"
         f"  Greeks: Δ={f.get('delta')} Γ={f.get('gamma')} Θ={f.get('theta')} ν={f.get('vega')}\n"
         f"  EM_vs_BE_ok: {f.get('em_vs_be_ok')}  MTF align: {f.get('mtf_align')}\n"
         f"  S/R ok: {f.get('sr_headroom_ok')}  Regime: {f.get('regime_flag')}  DTE: {f.get('dte')}\n"
@@ -922,7 +956,9 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
     desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
 
-    best_from_scan = None
+    # --- Chain scan selection (triggers alerts using chain scan) ---
+    selection_debug: Dict[str, Any] = {}
+    option_ticker = None
     try:
         best_from_scan = await scan_for_best_contract_for_alert(
             HTTP,
@@ -935,7 +971,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         best_from_scan = None
 
-    if best_from_scan:
+    if PREFER_CHAIN_SCAN and best_from_scan:
         option_ticker = best_from_scan["ticker"]
         if isinstance(best_from_scan.get("strike"), (int, float)):
             desired_strike = float(best_from_scan["strike"])
@@ -950,15 +986,16 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             option_ticker = pm["contract_call"] if alert["side"] == "CALL" else pm["contract_put"]
             selection_debug = {"selected_by": "fallback_pm", "reason": "selector_error"}
 
+    # --- Build feature bundle, backfill missing quote/iv/greeks and compute change% ---
     f: Dict[str, Any] = {}
     try:
         if not POLYGON_API_KEY:
             f = {
-                "bid": None, "ask": None, "mid": None,
+                "bid": None, "ask": None, "mid": None, "last": None,
                 "option_spread_pct": None, "quote_age_sec": None,
                 "oi": None, "vol": None,
                 "delta": None, "gamma": None, "theta": None, "vega": None,
-                "iv": None, "iv_rank": None, "rv20": None,
+                "iv": None, "iv_rank": None, "rv20": None, "prev_close": None, "quote_change_pct": None,
                 "dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days,
                 "em_vs_be_ok": None,
                 "mtf_align": None, "sr_headroom_ok": None, "regime_flag": "trending",
@@ -988,15 +1025,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 if v is not None or k not in f:
                     f[k] = v
 
-            if f.get("mid") is None and f.get("bid") is not None and f.get("ask") is not None:
-                f["mid"] = round((float(f["bid"]) + float(f["ask"])) / 2.0, 4)
-
-            try:
-                if f.get("dte") is None:
-                    f["dte"] = (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days
-            except Exception:
-                pass
-
+            # derive mark & spread if still missing
             try:
                 bid = f.get("bid")
                 ask = f.get("ask")
@@ -1011,12 +1040,30 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
+            # ensure DTE present
+            try:
+                if f.get("dte") is None:
+                    f["dte"] = (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days
+            except Exception:
+                pass
+
+            # compute change% vs prev close if not set already
+            try:
+                if f.get("quote_change_pct") is None:
+                    prev_close = f.get("prev_close")
+                    mark = f.get("mid") if f.get("mid") is not None else f.get("last")
+                    if isinstance(mark, (int, float)) and isinstance(prev_close, (int, float)) and prev_close > 0:
+                        f["quote_change_pct"] = round((float(mark) - float(prev_close)) / float(prev_close) * 100.0, 3)
+            except Exception:
+                pass
+
     except Exception as e:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
     pf_ok, pf_checks = preflight_ok(f)
 
+    # --- LLM decision ---
     try:
         llm = await analyze_with_openai(alert, f)
         consume_llm()
@@ -1035,6 +1082,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     if job["flags"].get("force_buy", False):
         decision_final = "buy"
 
+    # --- Telegram alert (explicitly notes chain-scan) ---
     tg_result = None
     try:
         tg_text = compose_telegram_text(
@@ -1048,13 +1096,13 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             rating=rating
         )
         if selection_debug and selection_debug.get("selected_by") == "chain_scan":
-            tg_text += "\nNote: contract selected via chain-scan (liquidity + strike/expiry fit)."
-
+            tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             tg_result = await send_telegram(tg_text)
     except Exception as e:
         print(f"[worker] Telegram error: {e}")
 
+    # --- IBKR order (optional) ---
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
     try:
@@ -1085,7 +1133,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 
     _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
 
-    log_entry = {
+    # --- Decision log with new fields ---
+    _DECISIONS_LOG.append({
         "timestamp_local": market_now(),
         "symbol": alert["symbol"],
         "side": alert["side"],
@@ -1102,7 +1151,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         "features": {
             "reco_expiry": target_expiry,
             "oi": f.get("oi"), "vol": f.get("vol"),
+            "bid": f.get("bid"), "ask": f.get("ask"),
+            "mark": f.get("mid"), "last": f.get("last"),
             "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
+            "prev_close": f.get("prev_close"), "quote_change_pct": f.get("quote_change_pct"),
             "delta": f.get("delta"), "gamma": f.get("gamma"), "theta": f.get("theta"), "vega": f.get("vega"),
             "dte": f.get("dte"), "em_vs_be_ok": f.get("em_vs_be_ok"),
             "mtf_align": f.get("mtf_align"), "sr_ok": f.get("sr_headroom_ok"), "iv": f.get("iv"),
@@ -1128,8 +1180,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "attempted": ib_attempted,
             "result": (_ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None),
         },
-    }
-    _DECISIONS_LOG.append(log_entry)
+    })
 
 # =========================
 # Diagnostics helpers (routes will call)
@@ -1176,7 +1227,7 @@ async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
     to_iso = now_utc_dt.isoformat()
     out["aggs"] = await _http_json(
         HTTP,
-        f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/1/min/{frm_iso}/{to_iso}",
+        f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/1/min/{frm_iso}/{to_iso}?",
         {"adjusted":"true","sort":"asc","limit":2000,"apiKey":POLYGON_API_KEY},
         timeout=8.0
     )
