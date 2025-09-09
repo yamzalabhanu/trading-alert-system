@@ -1,6 +1,5 @@
 # routes.py
 import os
-import logging
 from urllib.parse import quote
 
 import httpx
@@ -11,14 +10,6 @@ from fastapi.responses import JSONResponse
 import trading_engine as engine
 
 router = APIRouter()
-
-# ----- Logger -----
-logger = logging.getLogger("trading_engine.routes")
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
-    logger.addHandler(_h)
-logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 # ----- App lifecycle wiring -----
 def bind_lifecycle(app: FastAPI):
@@ -65,7 +56,6 @@ async def webhook(
       CALL Signal: <TICKER> at <UL_PRICE> Strike: <STRIKE>
     (And same for PUT.)
     """
-    logger.info("webhook received; ib=%s force=%s qty=%s", ib, force, qty)
     text = await engine.get_alert_text_from_request(request)
     if not text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
@@ -86,16 +76,6 @@ async def webhook(
         "queue_stats": engine.get_worker_stats(),
         "llm_quota": engine.llm_quota_snapshot(),
     })
-
-# Alias endpoint for TradingView (same behavior as /webhook)
-@router.post("/webhook/tradingview")
-async def webhook_tradingview(
-    request: Request,
-    ib: bool = False,
-    force: bool = False,
-    qty: int = 1,
-):
-    return await webhook(request=request, ib=ib, force=force, qty=qty)
 
 # ----- Diagnostics -----
 @router.get("/net/debug")
@@ -159,3 +139,31 @@ async def diag_polygon(underlying: str, contract: str):
         "last_quote": skim(out.get("last_quote")),
         "open_close": skim(out.get("open_close")),
     }
+
+# NBBO entitlement/rate-limit debugging
+@router.get("/diag/nbbo")
+async def diag_nbbo(ticker: str):
+    """
+    Example:
+      /diag/nbbo?ticker=O:AAPL250912C00245000
+    Shows raw HTTP status/body snippet from Polygon last-quote for quick debugging.
+    """
+    if not POLYGON_API_KEY:
+        raise HTTPException(400, "POLYGON_API_KEY not configured")
+    enc = quote(ticker, safe="")
+    url = f"https://api.polygon.io/v3/quotes/options/{enc}/last"
+    async with httpx.AsyncClient(timeout=6.0) as HTTP:
+        try:
+            r = await HTTP.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=6.0)
+            ct = r.headers.get("content-type", "")
+            try:
+                body = r.json() if "application/json" in ct else r.text
+            except Exception:
+                body = r.text
+            if isinstance(body, dict):
+                body_sample = {k: body[k] for k in list(body.keys())[:8]}
+            else:
+                body_sample = str(body)[:1000]
+            return {"status": r.status_code, "body_sample": body_sample}
+        except Exception as e:
+            return {"status": None, "error": f"{type(e).__name__}: {e}"}
