@@ -149,3 +149,4 @@ async def diag_polygon(underlying: str, contract: str):
         "last_quote": skim(out.get("last_quote")),
         "open_close": skim(out.get("open_close")),
     }
+    
