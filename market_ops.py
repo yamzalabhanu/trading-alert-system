@@ -9,7 +9,6 @@ from datetime import datetime, timezone, timedelta, date
 from urllib.parse import quote
 
 import httpx
-from fastapi import HTTPException
 
 from polygon_client import (
     list_contracts_for_expiry,
@@ -81,7 +80,7 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     return start, now_utc.isoformat()
 
 # -------------------------
-# Public wrappers (same names you used)
+# Public wrappers
 # -------------------------
 async def polygon_list_contracts_for_expiry_export(
     client: httpx.AsyncClient,
@@ -128,21 +127,17 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
             bid = last.get("bidPrice")
             ask = last.get("askPrice")
             ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-
             if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
                 mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
                 spread_pct = ((ask - bid) / mid * 100.0) if (mid and mid > 0) else None
                 age = _quote_age_from_ts(ts)
-
                 cand = {
                     "bid": float(bid) if bid is not None else None,
                     "ask": float(ask) if ask is not None else None,
-                    "mid": float(mid) if mid is not None else None,   # mark
+                    "mid": float(mid) if mid is not None else None,
                     "quote_age_sec": age,
                     "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
                 }
-
-                # choose the tighter spread; tie-breaker: fresher quote
                 if (
                     not best
                     or (cand.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)
@@ -158,10 +153,6 @@ async def ensure_nbbo(
     tries: int = 6,
     delay: float = 0.6,
 ) -> Dict[str, Any]:
-    """
-    Repeatedly sample last quote for the option and return best bid/ask/mid,
-    spread%, and quote_age_sec if found. Returns {} if still nothing.
-    """
     enc_opt = _encode_ticker_path(option_ticker)
     best: Dict[str, Any] = {}
     for _ in range(max(1, tries)):
@@ -206,13 +197,6 @@ async def poly_option_backfill(
     option_ticker: str,
     today_utc: date,
 ) -> Dict[str, Any]:
-    """
-    Collects:
-      - bid/ask/mid(mark), last, spread%, quote_age_sec
-      - OI, Vol (day), IV, greeks
-      - prev_close (prior day), quote_change_pct vs prev_close
-      - fallback intraday volume via 1m aggs
-    """
     out: Dict[str, Any] = {}
     if not POLYGON_API_KEY:
         return out
@@ -228,7 +212,6 @@ async def poly_option_backfill(
         if vol is not None:
             out_dict["vol"] = vol
 
-        # quote + last + derived mark/spread/age
         lq = res.get("last_quote") or {}
         bid_px = lq.get("bid_price")
         ask_px = lq.get("ask_price")
@@ -259,7 +242,6 @@ async def poly_option_backfill(
         if age is not None:
             out_dict["quote_age_sec"] = age
 
-        # greeks & IV
         greeks = res.get("greeks") or {}
         for k_src in ("delta", "gamma", "theta", "vega"):
             v = greeks.get(k_src)
@@ -317,7 +299,7 @@ async def poly_option_backfill(
         except Exception:
             pass
 
-    # 3) previous-day open/close (for prev_close and later change%)
+    # 3) previous-day open/close
     prev_close = None
     try:
         yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
@@ -342,7 +324,7 @@ async def poly_option_backfill(
     except Exception:
         pass
 
-    # 4) sample best quote (robust NBBO + mark + spread + age)
+    # 4) sample best quote (NBBO)
     try:
         enc_opt = _encode_ticker_path(option_ticker)
         sampled = await _sample_best_quote(client, enc_opt, tries=5, delay=0.6)
@@ -402,7 +384,7 @@ async def poly_option_backfill(
     except Exception:
         pass
 
-    # 6) derive quote_change_pct if possible (mark vs prev_close)
+    # 6) derive change% if possible (mark vs prev_close)
     try:
         mark = out.get("mid") if out.get("mid") is not None else out.get("last")
         if isinstance(mark, (int, float)) and isinstance(prev_close, (int, float)) and prev_close > 0:
@@ -423,7 +405,6 @@ async def choose_best_contract(
     ul_px: float,
     desired_strike: float,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Former _choose_best_contract (now public)."""
     if not POLYGON_API_KEY:
         return "", {"reason": "offline/no key"}
 
@@ -603,7 +584,7 @@ async def _poly_reference_contracts(
         page = await _http_json_url(client, nxt, timeout=10.0)
         if not page or not isinstance(page.get("results"), list):
             break
-        for it in page["results"]:
+        for it in page.get("results", []):
             t = it.get("ticker")
             if t:
                 tickers.append(t)
