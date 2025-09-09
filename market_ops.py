@@ -353,6 +353,30 @@ async def poly_option_backfill(
     except Exception:
         pass
 
+    # 4b) If still no NBBO, fetch latest trade price as a fallback "last"
+    try:
+        if out.get("bid") is None and out.get("ask") is None:
+            enc_opt = _encode_ticker_path(option_ticker)
+            t = await _http_json(
+                client,
+                f"https://api.polygon.io/v3/trades/options/{enc_opt}/last",
+                {"apiKey": POLYGON_API_KEY},
+                timeout=4.0,
+            )
+            if t:
+                res = t.get("results") or {}
+                last_px = res.get("price")
+                ts = res.get("sip_timestamp") or res.get("participant_timestamp") or res.get("t")
+                if isinstance(last_px, (int, float)):
+                    out["last"] = float(last_px)
+                age = _quote_age_from_ts(ts)
+                if age is not None and out.get("quote_age_sec") is None:
+                    out["quote_age_sec"] = age
+                if out.get("mid") is None and isinstance(last_px, (int, float)):
+                    out["mid"] = float(last_px)
+    except Exception:
+        pass
+
     # 5) minute aggregates as fallback volume
     try:
         if out.get("vol") is None:
