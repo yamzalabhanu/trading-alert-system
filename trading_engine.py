@@ -28,13 +28,14 @@ from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
 from reporting import _DECISIONS_LOG
 
-# === New: pull Polygon helpers from market_ops ===
+# === Polygon/market helpers moved out ===
 from market_ops import (
     polygon_list_contracts_for_expiry_export,
     polygon_get_option_snapshot_export,
-    poly_option_backfill,                # renamed (public) backfill
-    choose_best_contract,                # renamed (public) selector
-    scan_for_best_contract_for_alert,    # chain scan
+    poly_option_backfill,
+    choose_best_contract,
+    scan_for_best_contract_for_alert,
+    ensure_nbbo,  # NEW
 )
 
 # =========================
@@ -191,16 +192,22 @@ def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> D
     }
 
 # =========================
-# Preflight (kept here due to thresholds)
+# Preflight (more forgiving option)
 # =========================
 def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    checks = {}
+    checks: Dict[str, bool] = {}
+    # Allow quote-only pass if we have a fresh NBBO and reasonable spread
     checks["quote_fresh"] = (f.get("quote_age_sec") is not None and f["quote_age_sec"] <= MAX_QUOTE_AGE_S)
     checks["spread_ok"]   = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= MAX_SPREAD_PCT)
-    checks["vol_ok"]      = (f.get("vol") or 0) >= MIN_VOL_TODAY
-    checks["oi_ok"]       = (f.get("oi") or 0) >= MIN_OI
+
+    # Make vol/oi optional via env
+    require_liquidity = os.getenv("REQUIRE_LIQUIDITY_FIELDS", "0") == "1"
+    checks["vol_ok"] = (f.get("vol") or 0) >= MIN_VOL_TODAY if require_liquidity else True
+    checks["oi_ok"]  = (f.get("oi") or 0)  >= MIN_OI        if require_liquidity else True
+
     dte_val = f.get("dte")
-    checks["dte_ok"]      = (dte_val is not None) and (MIN_DTE <= dte_val <= MAX_DTE)
+    checks["dte_ok"] = (dte_val is not None) and (MIN_DTE <= dte_val <= MAX_DTE)
+
     ok = all(checks.values())
     return ok, checks
 
@@ -347,7 +354,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
     desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
 
-    # --- Chain scan selection (triggers alerts using chain scan) ---
+    # --- Chain scan selection ---
     selection_debug: Dict[str, Any] = {}
     option_ticker = None
     try:
@@ -372,12 +379,16 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             option_ticker, sel_dbg = await choose_best_contract(
                 HTTP, alert["symbol"], target_expiry, alert["side"], ul_px, desired_strike
             )
-            selection_debug = {"selected_by": "delta_selector", **(sel_dbg or {})}
+            if not option_ticker:
+                option_ticker = pm["contract_call"] if alert["side"] == "CALL" else pm["contract_put"]
+                selection_debug = {"selected_by": "fallback_pm", "reason": "selector_empty"}
+            else:
+                selection_debug = {"selected_by": "delta_selector", **(sel_dbg or {})}
         except Exception:
             option_ticker = pm["contract_call"] if alert["side"] == "CALL" else pm["contract_put"]
             selection_debug = {"selected_by": "fallback_pm", "reason": "selector_error"}
 
-    # --- Build feature bundle, backfill missing quote/iv/greeks and compute change% ---
+    # --- Build feature bundle and backfill ---
     f: Dict[str, Any] = {}
     try:
         if not POLYGON_API_KEY:
@@ -452,6 +463,37 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         print(f"[worker] Polygon/features error: {e}")
         f = f or {"dte": (datetime.fromisoformat(target_expiry).date() - datetime.now(timezone.utc).date()).days}
 
+    # --- Ensure NBBO present; try a reselect if necessary ---
+    try:
+        if f.get("bid") is None or f.get("ask") is None:
+            nbbo = await ensure_nbbo(HTTP, option_ticker, tries=6, delay=0.5)
+            for k, v in (nbbo or {}).items():
+                if v is not None:
+                    f[k] = v
+    except Exception:
+        pass
+
+    try:
+        need_reselect = (f.get("bid") is None or f.get("ask") is None)
+        if need_reselect and PREFER_CHAIN_SCAN:
+            alt_ticker, _alt_dbg = await choose_best_contract(
+                HTTP, alert["symbol"], target_expiry, alert["side"], ul_px, desired_strike
+            )
+            if alt_ticker and alt_ticker != option_ticker:
+                option_ticker = alt_ticker
+                f2 = await poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc) or {}
+                for k, v in f2.items():
+                    if v is not None:
+                        f[k] = v
+                nbbo2 = await ensure_nbbo(HTTP, option_ticker, tries=6, delay=0.5)
+                for k, v in (nbbo2 or {}).items():
+                    if v is not None:
+                        f[k] = v
+                selection_debug["reselected"] = option_ticker
+    except Exception:
+        pass
+
+    # --- Preflight ---
     pf_ok, pf_checks = preflight_ok(f)
 
     # --- LLM decision ---
@@ -473,7 +515,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     if job["flags"].get("force_buy", False):
         decision_final = "buy"
 
-    # --- Telegram alert (explicitly notes chain-scan) ---
+    # --- Telegram alert ---
     tg_result = None
     try:
         tg_text = compose_telegram_text(
@@ -524,7 +566,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 
     _COOLDOWN[(alert["symbol"], alert["side"])] = datetime.now(timezone.utc)
 
-    # --- Decision log with new fields ---
+    # --- Decision log ---
     _DECISIONS_LOG.append({
         "timestamp_local": market_now(),
         "symbol": alert["symbol"],
@@ -574,8 +616,71 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     })
 
 # =========================
-# Diagnostics helpers (routes will call)
+# Diagnostics helpers
 # =========================
+async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
+    if HTTP is None:
+        raise HTTPException(status_code=503, detail="HTTP client not ready")
+    enc = _encode_ticker_path(contract)
+    out = {}
+
+    m = re.search(r":([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8,9})$", contract)
+    if m:
+        yy, mm, dd, cp = m.group(2), m.group(3), m.group(4), m.group(5)
+        expiry_iso = f"20{yy}-{mm}-{dd}"
+        side = "call" if cp.upper() == "C" else "put"
+        out["multi"] = await _http_json(
+            HTTP,
+            f"https://api.polygon.io/v3/snapshot/options/{underlying}",
+            {"apiKey": POLYGON_API_KEY, "contract_type": side, "expiration_date": expiry_iso, "limit": 5, "greeks": "true"},
+            timeout=6.0
+        )
+
+    out["single"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0
+    )
+    out["last_quote"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0
+    )
+    yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    out["open_close"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v1/open-close/options/{enc}/{yday}",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0
+    )
+    now_utc_dt = datetime.now(timezone.utc)
+    frm_iso = datetime(now_utc_dt.year, now_utc_dt.month, now_utc_dt.day, 0,0,0,tzinfo=timezone.utc).isoformat()
+    to_iso = now_utc_dt.isoformat()
+    out["aggs"] = await _http_json(
+        HTTP,
+        f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/1/min/{frm_iso}/{to_iso}?",
+        {"adjusted":"true","sort":"asc","limit":2000,"apiKey":POLYGON_API_KEY},
+        timeout=8.0
+    )
+
+    def skim(d):
+        if not isinstance(d, dict): return d
+        res = d.get("results")
+        return {
+            "keys": list(d.keys())[:10],
+            "sample": (res[:2] if isinstance(res, list) else (res if isinstance(res, dict) else d)),
+            "status_hint": d.get("status"),
+        }
+    return {
+        "multi": skim(out.get("multi")),
+        "single": skim(out.get("single")),
+        "last_quote": skim(out.get("last_quote")),
+        "open_close": skim(out.get("open_close")),
+        "aggs": skim(out.get("aggs")),
+    }
+
 async def net_debug_info() -> Dict[str, Any]:
     host = os.getenv("IBKR_HOST", "127.0.0.1")
     port = int(os.getenv("IBKR_PORT", "7497"))
