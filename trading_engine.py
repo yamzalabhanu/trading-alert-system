@@ -31,7 +31,7 @@ from reporting import _DECISIONS_LOG
 from market_ops import (
     polygon_get_option_snapshot_export,
     poly_option_backfill,
-    choose_best_contract,
+    choose_best_contract,  # kept for compatibility
     scan_for_best_contract_for_alert,
     scan_top_candidates_for_alert,
     ensure_nbbo,
@@ -498,6 +498,95 @@ async def _probe_nbbo_verbose(option_ticker: str) -> Dict[str, Any]:
     return out
 
 # =========================
+# Listing check + replacement helpers (NEW)
+# =========================
+async def _poly_reference_contracts_exists(underlying: str, expiry_iso: str, ticker: str) -> Dict[str, Any]:
+    """Check if OCC ticker is in Polygon reference contracts for the given expiry, and if snapshot exists."""
+    if HTTP is None or not POLYGON_API_KEY:
+        return {"listed": None, "snapshot_ok": None, "reason": "no HTTP or API key"}
+    try:
+        # A) reference list
+        base = "https://api.polygon.io/v3/reference/options/contracts"
+        params = {
+            "underlying_ticker": underlying,
+            "expiration_date": expiry_iso,
+            "limit": 1000,
+            "apiKey": POLYGON_API_KEY,
+        }
+        r = await HTTP.get(base, params=params, timeout=8.0)
+        listed = False
+        if r.status_code == 200:
+            js = r.json()
+            for it in js.get("results", []):
+                if it.get("ticker") == ticker:
+                    listed = True
+                    break
+        elif r.status_code in (402, 403, 429):
+            return {"listed": None, "snapshot_ok": None, "reason": f"ref-contracts {r.status_code}"}
+
+        # B) single snapshot check (sometimes ref list lags)
+        enc = _encode_ticker_path(ticker)
+        s = await HTTP.get(
+            f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
+            params={"apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        snapshot_ok = (s.status_code == 200 and isinstance((s.json() or {}).get("results"), dict))
+        return {"listed": listed, "snapshot_ok": snapshot_ok, "reason": None}
+    except Exception as e:
+        return {"listed": None, "snapshot_ok": None, "reason": f"error: {type(e).__name__}: {e}"}
+
+async def _rescan_best_replacement(
+    symbol: str,
+    side: str,
+    desired_strike: float,
+    expiry_iso: str,
+    min_vol: int,
+    min_oi: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    If the chosen contract 404s on last-quote, pick a nearby *listed* contract.
+    Tries to stay in the same expiry.
+    """
+    try:
+        # Prefer same expiry; if your market_ops supports restrict_expiries, use it:
+        try:
+            top_same = await scan_top_candidates_for_alert(
+                HTTP,
+                symbol,
+                {"side": side, "symbol": symbol, "strike": desired_strike, "expiry": expiry_iso},
+                min_vol=min_vol,
+                min_oi=min_oi,
+                top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
+                top_overall=10,
+                restrict_expiries=[expiry_iso],   # type: ignore
+            )
+            pool = top_same or []
+        except TypeError:
+            # fallback: get broader set then filter back to same expiry
+            top_any = await scan_top_candidates_for_alert(
+                HTTP,
+                symbol,
+                {"side": side, "symbol": symbol, "strike": desired_strike, "expiry": expiry_iso},
+                min_vol=min_vol,
+                min_oi=min_oi,
+                top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
+                top_overall=15,
+            )
+            pool = [it for it in (top_any or []) if it.get("expiry") == expiry_iso]
+    except Exception:
+        pool = []
+
+    def _rank(it: Dict[str, Any]):
+        sd = abs(float(it.get("strike") or desired_strike) - desired_strike)
+        sp = float(it.get("spread_pct") or 1e9)
+        nbbo_missing = 0 if (it.get("bid") is not None and it.get("ask") is not None) else 1
+        return (sd, nbbo_missing, sp, -(it.get("oi") or 0), -(it.get("vol") or 0))
+
+    pool.sort(key=_rank)
+    return pool[0] if pool else None
+
+# =========================
 # Core processing
 # =========================
 async def _process_tradingview_job(job: Dict[str, Any]) -> None:
@@ -544,8 +633,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         best_from_scan = await scan_for_best_contract_for_alert(
             HTTP,
             alert["symbol"],
-            {"side": alert["side"], "symbol": alert["symbol"],
-             "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+            {"side": alert["side"], "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
             min_vol=scan_min_vol,
             min_oi=scan_min_oi,
             top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
@@ -566,13 +654,12 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         }
         logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
-        # Broaden: pick the single best across the next 3 weeks as a backstop
+        # Broaden: pick the best across the next 3 weeks as a backstop
         try:
             one_best = await scan_top_candidates_for_alert(
                 HTTP,
                 alert["symbol"],
-                {"side": alert["side"], "symbol": alert["symbol"],
-                 "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+                {"side": alert["side"], "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
                 min_vol=scan_min_vol,
                 min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
@@ -717,6 +804,52 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
+    # === NEW: If last-quote returned 404, verify existence and auto-swap to a listed contract ===
+    if f.get("nbbo_http_status") == 404 and POLYGON_API_KEY:
+        exist = await _poly_reference_contracts_exists(alert["symbol"], chosen_expiry, option_ticker)
+        logger.info("NBBO 404 verification: listed=%s snapshot_ok=%s reason=%s",
+                    exist.get("listed"), exist.get("snapshot_ok"), exist.get("reason"))
+
+        if exist.get("listed") is False and not exist.get("snapshot_ok"):
+            # the contract truly isn't listed; rescan for a replacement in same expiry
+            repl = await _rescan_best_replacement(
+                symbol=alert["symbol"],
+                side=alert["side"],
+                desired_strike=desired_strike,
+                expiry_iso=chosen_expiry,
+                min_vol=scan_min_vol,
+                min_oi=scan_min_oi,
+            )
+            if repl:
+                old_tk = option_ticker
+                option_ticker = repl["ticker"]
+                desired_strike = float(repl.get("strike") or desired_strike)
+                try:
+                    # refresh features / NBBO for the replacement
+                    extra_from_snap2 = await poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
+                    for k, v in (extra_from_snap2 or {}).items():
+                        if v is not None:
+                            f[k] = v
+                    probe2 = await _pull_nbbo_direct(option_ticker)
+                    for k, v in (probe2 or {}).items():
+                        if v is not None:
+                            f[k] = v
+                    if f.get("bid") is None or f.get("ask") is None:
+                        nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker)
+                        for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
+                            if nbbo_dbg2.get(k) is not None:
+                                f[k] = nbbo_dbg2[k]
+                        f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
+                        f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
+                    selection_debug["replaced_due_to_404"] = {
+                        "old": old_tk,
+                        "new": option_ticker,
+                        "why": "contract not listed in Polygon reference/snapshot"
+                    }
+                    logger.info("Replaced contract due to 404: %s → %s", old_tk, option_ticker)
+                except Exception as e:
+                    logger.warning("Replacement contract fetch failed: %r", e)
+
     # 5) PRE-LLM CHAIN-SCAN ALERT (send only if scan picked the contract)
     if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by", "").startswith("chain_scan"):
         try:
@@ -746,8 +879,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             top3 = await scan_top_candidates_for_alert(
                 HTTP,
                 alert["symbol"],
-                {"side": alert["side"], "symbol": alert["symbol"],
-                 "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+                {"side": alert["side"], "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
                 min_vol=scan_min_vol,
                 min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
@@ -821,6 +953,9 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         )
         if selection_debug.get("selected_by", "").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
+        if selection_debug.get("replaced_due_to_404"):
+            rep = selection_debug["replaced_due_to_404"]
+            tg_text += f"\n⚠️ Original contract {rep['old']} not listed; switched to {rep['new']}."
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             logger.info("Telegram final alert: sending…")
             tg_result = await send_telegram(tg_text)
