@@ -392,7 +392,15 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
     desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
 
-    # 3) CHAIN SCAN — primary contract selection
+    # 3) CHAIN SCAN — thresholds (relax after-hours)
+    rth = _is_rth_now()
+    scan_min_vol = int(os.getenv("SCAN_MIN_VOL", "500"))
+    scan_min_oi  = int(os.getenv("SCAN_MIN_OI",  "500"))
+    if not rth:
+        scan_min_vol = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
+        scan_min_oi  = int(os.getenv("SCAN_MIN_OI_AH",  "100"))
+
+    # 3a) primary contract selection
     selection_debug: Dict[str, Any] = {}
     option_ticker = None
 
@@ -402,8 +410,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             alert["symbol"],
             {"side": alert["side"], "symbol": alert["symbol"],
              "strike": alert.get("strike"), "expiry": alert.get("expiry")},
-            min_vol=int(os.getenv("SCAN_MIN_VOL", "500")),
-            min_oi=int(os.getenv("SCAN_MIN_OI", "500")),
+            min_vol=scan_min_vol,
+            min_oi=scan_min_oi,
             top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
         )
     except Exception:
@@ -429,17 +437,28 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             )
             selection_debug = {"selected_by": "delta_selector", **(sel_dbg or {})}
             if not option_ticker:
-                option_ticker = pm["contract_call"] if alert["side"] == "CALL" else pm["contract_put"]
-                selection_debug = {"selected_by": "fallback_pm", "reason": "selector_empty"}
+                # Fallback respects the alert's expiry if provided
+                fallback_exp = str(alert.get("expiry") or target_expiry)
+                pm_fallback = _build_plus_minus_contracts(alert["symbol"], ul_px, fallback_exp)
+                option_ticker = pm_fallback["contract_call"] if alert["side"] == "CALL" else pm_fallback["contract_put"]
+                desired_strike = pm_fallback["strike_call"] if alert["side"] == "CALL" else pm_fallback["strike_put"]
+                selection_debug = {"selected_by": "fallback_pm", "reason": "selector_empty", "chosen_expiry": fallback_exp}
         except Exception:
-            option_ticker = pm["contract_call"] if alert["side"] == "CALL" else pm["contract_put"]
-            selection_debug = {"selected_by": "fallback_pm", "reason": "selector_error"}
+            # Fallback respects the alert's expiry if provided
+            fallback_exp = str(alert.get("expiry") or target_expiry)
+            pm_fallback = _build_plus_minus_contracts(alert["symbol"], ul_px, fallback_exp)
+            option_ticker = pm_fallback["contract_call"] if alert["side"] == "CALL" else pm_fallback["contract_put"]
+            desired_strike = pm_fallback["strike_call"] if alert["side"] == "CALL" else pm_fallback["strike_put"]
+            selection_debug = {"selected_by": "fallback_pm", "reason": "selector_error", "chosen_expiry": fallback_exp}
         logger.info("delta/fallback selected: %s (strike=%s exp=%s) via %s",
-                    option_ticker, desired_strike, chosen_expiry, selection_debug.get("selected_by"))
+                    option_ticker, desired_strike, selection_debug.get("chosen_expiry", chosen_expiry),
+                    selection_debug.get("selected_by"))
+
+    # Use the chosen expiry everywhere downstream
+    chosen_expiry = selection_debug.get("chosen_expiry", str(alert.get("expiry") or target_expiry))
 
     # 4) Build feature bundle + backfills
     f: Dict[str, Any] = {}
-    chosen_expiry = selection_debug.get("chosen_expiry", str(alert.get("expiry") or target_expiry))
     try:
         if not POLYGON_API_KEY:
             f = {
@@ -520,7 +539,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-    # 5) PRE-LLM CHAIN-SCAN ALERT
+    # 5) PRE-LLM CHAIN-SCAN ALERT (only if selection was chain_scan)
     if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by") == "chain_scan":
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -541,7 +560,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception as e:
             logger.exception("[worker] Telegram pre-LLM chainscan error: %s", e)
 
-    # 5b) SECOND ALERT — Top 3 across next 3 weeks
+    # 5b) SECOND ALERT — Top 3 across next 3 weeks (always send a message if Telegram configured)
     if SEND_CHAIN_SCAN_TOPN_ALERTS:
         try:
             logger.info("computing chain top3 across next 3 weeks…")
@@ -550,27 +569,36 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 alert["symbol"],
                 {"side": alert["side"], "symbol": alert["symbol"],
                  "strike": alert.get("strike"), "expiry": alert.get("expiry")},
-                min_vol=int(os.getenv("SCAN_MIN_VOL", "500")),
-                min_oi=int(os.getenv("SCAN_MIN_OI", "500")),
+                min_vol=scan_min_vol,
+                min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
                 top_overall=3,
             )
-            if top3 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                lines = [
-                    f"📊 Chain Top 3 (next 3 weeks) for {alert['symbol']} {alert['side']}",
-                    "(ranked by strike fit + spread + liquidity)"
-                ]
-                for i, it in enumerate(top3, 1):
-                    lines.append(
-                        f"{i}. {it['expiry']} | {it['ticker']} | strike {it.get('strike')} | "
-                        f"OI {it.get('oi')} Vol {it.get('vol')} | "
-                        f"NBBO {it.get('bid')}/{it.get('ask')} mid={it.get('mid')} | spread%={it.get('spread_pct')}"
-                    )
-                logger.info("Telegram top3 chainscan: sending (%d items)…", len(top3))
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                if top3:
+                    lines = [
+                        f"📊 Chain Top 3 (next 3 weeks) for {alert['symbol']} {alert['side']}",
+                        "(ranked by strike fit + spread + liquidity)"
+                    ]
+                    for i, it in enumerate(top3, 1):
+                        lines.append(
+                            f"{i}. {it['expiry']} | {it['ticker']} | strike {it.get('strike')} | "
+                            f"OI {it.get('oi')} Vol {it.get('vol')} | "
+                            f"NBBO {it.get('bid')}/{it.get('ask')} mid={it.get('mid')} | spread%={it.get('spread_pct')}"
+                        )
+                else:
+                    lines = [
+                        f"📊 Chain Top 3 (next 3 weeks) for {alert['symbol']} {alert['side']}",
+                        "No candidates found. Likely reasons:",
+                        f"• After-hours={not rth} (day vol=0 until RTH)",
+                        f"• Thresholds too strict (min_vol={scan_min_vol}, min_oi={scan_min_oi})",
+                        "• Illiquid expiry/strike for now"
+                    ]
+                logger.info("Telegram top3 chainscan: sending (%d items)…", len(top3 or []))
                 await send_telegram("\n".join(lines))
                 logger.info("Telegram top3 chainscan: sent")
             else:
-                logger.info("Telegram top3 chainscan: skipped (no results or no bot/chat env)")
+                logger.info("Telegram top3 chainscan: skipped (no bot/chat env)")
         except Exception as e:
             logger.exception("[worker] Telegram top3 chainscan error: %s", e)
 
