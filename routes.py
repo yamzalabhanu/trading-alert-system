@@ -1,60 +1,48 @@
 # routes.py
 import os
-from fastapi import APIRouter, HTTPException, Request, FastAPI
+from urllib.parse import quote
 
-# Runtime surface from the new package
-from trading_engine import (
-    startup, shutdown, enqueue_webhook_job,
-    diag_polygon_bundle, net_debug_info,
-    get_worker_stats, llm_quota_snapshot,
-)
+import httpx
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
-# Request/alert parsing helper from utils
-from trading_engine.engine_utils import get_alert_text_from_request
+# Use the orchestrator module directly
+import trading_engine as engine
 
 router = APIRouter()
 
-# Optional: if you prefer a single function to mount lifecycle onto your FastAPI app
-def mount(app: FastAPI):
+# ----- App lifecycle wiring -----
+def bind_lifecycle(app: FastAPI):
     @app.on_event("startup")
-    async def _on_startup():
-        await startup()
+    async def _startup():
+        await engine.startup()
 
     @app.on_event("shutdown")
-    async def _on_shutdown():
-        await shutdown()
+    async def _shutdown():
+        await engine.shutdown()
 
-# --- Health / status ---
+# Optional alternative if you prefer this name
+def mount(app: FastAPI):
+    return bind_lifecycle(app)
 
+# ----- Health / status -----
 @router.get("/healthz")
 async def healthz():
-    # very cheap liveness; add more if you like
-    return {"ok": True, "workers": get_worker_stats(), "llm_quota": llm_quota_snapshot()}
+    return {
+        "ok": True,
+        "workers": engine.get_worker_stats(),
+        "llm_quota": engine.llm_quota_snapshot(),
+    }
 
 @router.get("/engine/stats")
 async def engine_stats():
-    return {"workers": get_worker_stats()}
+    return {"workers": engine.get_worker_stats()}
 
 @router.get("/engine/quota")
 async def engine_quota():
-    return llm_quota_snapshot()
+    return engine.llm_quota_snapshot()
 
-# --- Diagnostics (unchanged behavior, new imports) ---
-
-@router.get("/net/debug")
-async def net_debug():
-    return await net_debug_info()
-
-@router.get("/poly/diag")
-async def poly_diag(sym: str, contract: str):
-    """
-    Example:
-      /poly/diag?sym=RKLB&contract=O:RKLB250919C00050000
-    """
-    return await diag_polygon_bundle(sym, contract)
-
-# --- Webhook (TradingView) ---
-
+# ----- Webhook (TradingView) -----
 @router.post("/webhook")
 async def webhook(
     request: Request,
@@ -66,29 +54,88 @@ async def webhook(
     Accepts JSON {"message": "..."} or raw text body containing one of:
       CALL Signal: <TICKER> at <UL_PRICE> Strike: <STRIKE> Expiry: YYYY-MM-DD
       CALL Signal: <TICKER> at <UL_PRICE> Strike: <STRIKE>
-    And same for PUT.
-
-    Example curl:
-      curl -X POST 'http://localhost:8000/webhook?ib=false&force=false&qty=1' \
-        -H 'content-type: application/json' \
-        -d '{"message":"CALL Signal: RKLB at 47.66 Strike: 50 Expiry: 2025-09-19"}'
+    (And same for PUT.)
     """
-    alert_text = await get_alert_text_from_request(request)
-    if not alert_text:
-        raise HTTPException(400, "Empty alert payload")
+    text = await engine.get_alert_text_from_request(request)
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty alert payload")
 
-    flags = {
-        "ib_enabled": bool(ib),
-        "force_buy": bool(force),
-        "qty": int(qty),
-    }
-
-    ok = enqueue_webhook_job(alert_text, flags)
+    ok = engine.enqueue_webhook_job(
+        alert_text=text,
+        flags={
+            "ib_enabled": bool(ib),
+            "qty": int(qty),
+            "force_buy": bool(force),
+        },
+    )
     if not ok:
-        raise HTTPException(503, "Worker queue is full")
+        raise HTTPException(status_code=503, detail="Queue is full")
+
+    return JSONResponse({
+        "queued": True,
+        "queue_stats": engine.get_worker_stats(),
+        "llm_quota": engine.llm_quota_snapshot(),
+    })
+
+# ----- Diagnostics -----
+@router.get("/net/debug")
+async def net_debug():
+    return await engine.net_debug_info()
+
+# Lightweight Polygon diagnostics (single, last_quote, open_close[yesterday])
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+
+async def _http_json(client: httpx.AsyncClient, url: str, params=None, timeout: float = 8.0):
+    try:
+        r = await client.get(url, params=params or {}, timeout=timeout)
+        if r.status_code in (402, 403, 404, 429):
+            return None
+        r.raise_for_status()
+        js = r.json()
+        return js if isinstance(js, dict) else None
+    except Exception:
+        return None
+
+@router.get("/diag/polygon")
+async def diag_polygon(underlying: str, contract: str):
+    if not POLYGON_API_KEY:
+        raise HTTPException(400, "POLYGON_API_KEY not configured")
+    enc = quote(contract, safe="")
+    out = {}
+    async with httpx.AsyncClient(timeout=6.0) as HTTP:
+        out["single"] = await _http_json(
+            HTTP,
+            f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
+            {"apiKey": POLYGON_API_KEY},
+            6.0,
+        )
+        out["last_quote"] = await _http_json(
+            HTTP,
+            f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+            {"apiKey": POLYGON_API_KEY},
+            6.0,
+        )
+        from datetime import datetime, timezone, timedelta
+        yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+        out["open_close"] = await _http_json(
+            HTTP,
+            f"https://api.polygon.io/v1/open-close/options/{enc}/{yday}",
+            {"apiKey": POLYGON_API_KEY},
+            6.0,
+        )
+
+    def skim(d):
+        if not isinstance(d, dict):
+            return d
+        res = d.get("results")
+        return {
+            "keys": list(d.keys())[:10],
+            "sample": (res[:2] if isinstance(res, list) else (res if isinstance(res, dict) else d)),
+            "status_hint": d.get("status"),
+        }
 
     return {
-        "queued": True,
-        "workers": get_worker_stats(),
-        "llm_quota": llm_quota_snapshot(),
+        "single": skim(out.get("single")),
+        "last_quote": skim(out.get("last_quote")),
+        "open_close": skim(out.get("open_close")),
     }
