@@ -335,7 +335,7 @@ async def poly_option_backfill(
     except Exception:
         pass
 
-    # 4b) If still no NBBO, fetch latest trade price as a fallback "last"
+    # 4b) Last-trade fallback if NBBO missing
     try:
         if out.get("bid") is None and out.get("ask") is None:
             enc_opt = _encode_ticker_path(option_ticker)
@@ -387,6 +387,7 @@ async def poly_option_backfill(
     # 6) derive change% if possible (mark vs prev_close)
     try:
         mark = out.get("mid") if out.get("mid") is not None else out.get("last")
+        prev_close = out.get("prev_close")
         if isinstance(mark, (int, float)) and isinstance(prev_close, (int, float)) and prev_close > 0:
             out["quote_change_pct"] = round((float(mark) - float(prev_close)) / float(prev_close) * 100.0, 3)
     except Exception:
@@ -626,6 +627,7 @@ async def scan_for_best_contract_for_alert(
     min_oi: int  = 500,
     top_n_each_week: int = 12,
 ) -> Optional[Dict[str, Any]]:
+    # (same as before, returns best single dict)
     today_utc = datetime.now(timezone.utc).date()
     def _next_friday(d: date) -> date:
         return d + timedelta(days=(4 - d.weekday()) % 7)
@@ -701,3 +703,86 @@ async def scan_for_best_contract_for_alert(
     scored = [( _score_chain_item_for_alert(alert, it), it ) for it in candidates]
     scored.sort(key=lambda z: z[0])
     return scored[0][1] if scored else None
+
+# NEW: top-N (e.g., 3) across next 3 weeks
+async def scan_top_candidates_for_alert(
+    client: httpx.AsyncClient,
+    symbol: str,
+    alert: Dict[str, Any],
+    min_vol: int = 500,
+    min_oi: int  = 500,
+    top_n_each_week: int = 12,
+    top_overall: int = 3,
+) -> List[Dict[str, Any]]:
+    today_utc = datetime.now(timezone.utc).date()
+    def _next_friday(d: date) -> date:
+        return d + timedelta(days=(4 - d.weekday()) % 7)
+    wk1 = _next_friday(today_utc)
+    if wk1 <= today_utc:
+        wk1 = wk1 + timedelta(days=7)
+    wk2 = wk1 + timedelta(days=7)
+    wk3 = wk2 + timedelta(days=7)
+    default_weeks = [wk1.isoformat(), wk2.isoformat(), wk3.isoformat()]
+
+    expiry_alert = str(alert.get("expiry") or "")
+    weeks = []
+    if expiry_alert:
+        seen = set()
+        for e in [expiry_alert] + default_weeks:
+            if e and e not in seen:
+                weeks.append(e); seen.add(e)
+    else:
+        weeks = default_weeks
+
+    candidates: List[Dict[str, Any]] = []
+    for exp in weeks:
+        rows = await _poly_paginated_snapshot_list(client, symbol, exp, limit=1000)
+        if not rows:
+            tickers = await _poly_reference_contracts(client, symbol, exp, max_contracts=1200)
+            sem = asyncio.Semaphore(12)
+            async def fetch_one(tk: str):
+                async with sem:
+                    try:
+                        return await _poly_snapshot_for_ticker(client, symbol, tk)
+                    except Exception:
+                        return None
+            snaps = await asyncio.gather(*[fetch_one(t) for t in tickers])
+            rows = [r for r in snaps if isinstance(r, dict)]
+
+        for r in rows:
+            det = r.get("details") or {}
+            tk  = det.get("ticker") or r.get("ticker")
+            if not tk:
+                continue
+            day = r.get("day") or {}
+            vol = int(day.get("volume") or day.get("v") or 0)
+            oi  = int(r.get("open_interest") or 0)
+            if vol < min_vol and oi < min_oi:
+                continue
+
+            lq = r.get("last_quote") or {}
+            b = lq.get("bid_price"); a = lq.get("ask_price")
+            mid = None; spread_pct = None
+            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0:
+                mid = (a + b) / 2.0
+                if mid and mid > 0:
+                    spread_pct = (a - b) / mid * 100.0
+
+            it = {
+                "ticker": tk,
+                "expiry": exp,
+                "strike": _normalize_poly_strike(det.get("strike")),
+                "type": det.get("contract_type"),
+                "vol": vol,
+                "oi": oi,
+                "bid": b, "ask": a, "mid": mid,
+                "spread_pct": round(spread_pct, 3) if isinstance(spread_pct, (int, float)) else None,
+            }
+            candidates.append(it)
+
+    if not candidates:
+        return []
+
+    scored = [( _score_chain_item_for_alert(alert, it), it ) for it in candidates]
+    scored.sort(key=lambda z: z[0])
+    return [it for _, it in scored[:max(1, top_overall)]]
