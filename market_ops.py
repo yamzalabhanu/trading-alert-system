@@ -113,34 +113,49 @@ async def polygon_get_option_snapshot_export(
 # -------------------------
 # Quote sampler
 # -------------------------
+# --- replace your _sample_best_quote with this version ---
 async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Dict[str, Any]]:
-    best = {}
+    best: Dict[str, Any] = {}
     for _ in range(tries):
-        lastq = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
-                                 {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+        lastq = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=3.0,
+        )
         if lastq:
             res = lastq.get("results") or {}
             last = res.get("last") or res
             bid = last.get("bidPrice")
             ask = last.get("askPrice")
             ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-            if bid is not None and ask is not None and ask >= bid:
-                mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
-                spread_pct = ((ask - bid) / mid * 100) if (mid and mid > 0) else None
+
+            if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
+                mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
+                spread_pct = ((ask - bid) / mid * 100.0) if (mid and mid > 0) else None
                 age = _quote_age_from_ts(ts)
+
                 cand = {
                     "bid": float(bid) if bid is not None else None,
                     "ask": float(ask) if ask is not None else None,
                     "mid": float(mid) if mid is not None else None,   # mark
                     "quote_age_sec": age,
-                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None
+                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
                 }
-                if not best or \
-                   (cand["option_spread_pct"] or 1e9) < (best.get("option_spread_pct") or 1e9) or \
-                   (cand "quote_age_sec" in cand and (cand["quote_age_sec"] or 1e9) < (best.get("quote_age_sec") or 1e9)):
+
+                # choose the tighter spread; tie-breaker: fresher quote
+                if (
+                    not best
+                    or (cand.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)
+                    or (
+                        ("quote_age_sec" in cand)
+                        and (cand.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)
+                    )
+                ):
                     best = cand
         await asyncio.sleep(delay)
     return best or None
+
 
 # -------------------------
 # Backfill bundle
