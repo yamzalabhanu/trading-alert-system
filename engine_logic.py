@@ -22,10 +22,10 @@ from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
 from reporting import _DECISIONS_LOG
 
-# pull shared HTTP client from runtime (avoids circular resources)
+# Pull shared HTTP client from runtime (avoids circular resources)
 from engine_runtime import get_http_client
 
-# market_ops remains external, as before
+# Market helpers
 from market_ops import (
     polygon_get_option_snapshot_export,
     poly_option_backfill,
@@ -66,7 +66,7 @@ SCAN_MIN_OI_RTH  = int(os.getenv("SCAN_MIN_OI_RTH",  os.getenv("SCAN_MIN_OI",  "
 SCAN_MIN_VOL_AH  = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
 SCAN_MIN_OI_AH   = int(os.getenv("SCAN_MIN_OI_AH",  "100"))
 
-SEND_CHAIN_SCAN_ALERTS   = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "1"))
+SEND_CHAIN_SCAN_ALERTS      = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "1"))
 SEND_CHAIN_SCAN_TOPN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "1"))
 
 # =========================
@@ -470,6 +470,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] HTTP client not ready")
         return
 
+    # Ensure locals are always defined for later use
+    selection_debug: Dict[str, Any] = {}
+    replacement_note: Optional[Dict[str, Any]] = None
+    option_ticker: Optional[str] = None
+
     # 1) Parse
     try:
         alert = parse_alert_text(job["alert_text"])
@@ -501,9 +506,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     scan_min_oi  = SCAN_MIN_OI_RTH  if rth else SCAN_MIN_OI_AH
 
     # 3a) Selection via scan
-    selection_debug: Dict[str, Any] = {}
-    option_ticker = None
-
     try:
         best_from_scan = await scan_for_best_contract_for_alert(
             client,
@@ -645,7 +647,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # 404 replacement flow
+    # 404 replacement flow (define/keep replacement_note safe)
     if f.get("nbbo_http_status") == 404 and POLYGON_API_KEY:
         exist = await _poly_reference_contracts_exists(alert["symbol"], chosen_expiry, option_ticker)
         logger.info("NBBO 404 verification: listed=%s snapshot_ok=%s reason=%s",
@@ -675,20 +677,18 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                                 f[k] = nbbo_dbg2[k]
                         f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
                         f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
-                    # stash marker in selection_debug at the end when we have it
-                    replacement_note = {"old": old_tk, "new": option_ticker,
-                                        "why": "contract not listed in Polygon reference/snapshot"}
+                    replacement_note = {
+                        "old": old_tk,
+                        "new": option_ticker,
+                        "why": "contract not listed in Polygon reference/snapshot",
+                    }
+                    logger.info("Replaced contract due to 404: %s → %s", old_tk, option_ticker)
                 except Exception as e:
                     logger.warning("Replacement contract fetch failed: %r", e)
                     replacement_note = None
-            else:
-                replacement_note = None
-    else:
-        replacement_note = None
 
     # 5) Optional Telegram pre-LLM (only if scan picked)
-    if SEND_CHAIN_SCAN_ALERTS and "selected_by" in (locals().get("selection_debug") or {}) and \
-       (selection_debug.get("selected_by") or "").startswith("chain_scan"):
+    if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by", "").startswith("chain_scan"):
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 pre_text = (
@@ -721,7 +721,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         score, rating = None, None
 
-    if bool(job["flags"].get("force_buy", False)):
+    if force_buy:
         decision_final = "buy"
 
     # 7) Telegram final
@@ -730,10 +730,13 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             alert={**alert, "strike": desired_strike, "expiry": chosen_expiry},
             option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating
         )
-        if "selection_debug" in locals() and (selection_debug.get("selected_by","").startswith("chain_scan")):
+        if selection_debug.get("selected_by","").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
-        if replacement_note:
-            tg_text += f"\n⚠️ Original contract {replacement_note['old']} not listed; switched to {replacement_note['new']}."
+        if replacement_note is not None:
+            tg_text += (
+                f"\n⚠️ Original contract {replacement_note['old']} not listed; "
+                f"switched to {replacement_note['new']}."
+            )
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             await send_telegram(tg_text)
     except Exception as e:
@@ -743,7 +746,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
     try:
-        if (decision_final == "buy") and ib_enabled and (pf_ok or bool(job["flags"].get("force_buy", False))):
+        if (decision_final == "buy") and ib_enabled and (pf_ok or force_buy):
             ib_attempted = True
             mode = IBKR_ORDER_MODE
             mid = f.get("mid")
@@ -758,7 +761,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             ib_result_obj = await place_recommended_option_order(
                 symbol=alert["symbol"], side=alert["side"],
                 strike=float(desired_strike), expiry_iso=chosen_expiry,
-                quantity=int(job["flags"].get("qty", IBKR_DEFAULT_QTY)),
+                quantity=int(qty),
                 limit_price=limit_px, action="BUY", tif=IBKR_TIF,
             )
     except Exception as e:
@@ -797,8 +800,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
             "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
         },
-        # ib result for auditing (if any)
-        "ibkr": {"enabled": ib_enabled, "attempted": ib_attempted, "result": ib_result_obj},
+        "ibkr": {"enabled": ib_enabled, "attempted": ib_attempted, "result": _ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None},
     })
 
 # =========================
