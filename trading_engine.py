@@ -697,7 +697,7 @@ async def _http_json_url(client: httpx.AsyncClient, url: str, timeout: float = 8
     except Exception:
         return None
 
-async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]]:
+async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
     if HTTP is None:
         raise HTTPException(status_code=503, detail="HTTP client not ready")
     enc = _encode_ticker_path(contract)
