@@ -50,7 +50,10 @@ logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 # =========================
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # optional, for checks
 
-# Pre-LLM chain-scan alert + Top 3 alert
+# Force chain scan at all times (overrides PREFER_CHAIN_SCAN)
+ALWAYS_CHAIN_SCAN = os.getenv("ALWAYS_CHAIN_SCAN", "1") == "1"
+
+# Telegram toggles
 SEND_CHAIN_SCAN_ALERTS = os.getenv("SEND_CHAIN_SCAN_ALERTS", "1") == "1"
 SEND_CHAIN_SCAN_TOPN_ALERTS = os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "1") == "1"
 
@@ -71,8 +74,8 @@ IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()
 IBKR_ORDER_MODE = os.getenv("IBKR_ORDER_MODE", "auto").lower()   # auto | market | limit
 IBKR_USE_MID_AS_LIMIT = os.getenv("IBKR_USE_MID_AS_LIMIT", "1") == "1"
 
-# Prefer contract picked by chain scan when available
-PREFER_CHAIN_SCAN = _env_truthy(os.getenv("PREFER_CHAIN_SCAN", "1"))
+# NOTE: kept for compatibility, but ALWAYS_CHAIN_SCAN supersedes this
+PREFER_CHAIN_SCAN = True
 
 # =========================
 # Trading thresholds (tunable)
@@ -85,6 +88,12 @@ MIN_VOL_TODAY     = int(os.getenv("MIN_VOL_TODAY", "100"))
 MIN_OI            = int(os.getenv("MIN_OI", "200"))
 MIN_DTE           = int(os.getenv("MIN_DTE", "3"))
 MAX_DTE           = int(os.getenv("MAX_DTE", "45"))
+
+# Optional scan knobs (RTH vs AH)
+SCAN_MIN_VOL_RTH = int(os.getenv("SCAN_MIN_VOL_RTH", os.getenv("SCAN_MIN_VOL", "500")))
+SCAN_MIN_OI_RTH  = int(os.getenv("SCAN_MIN_OI_RTH",  os.getenv("SCAN_MIN_OI",  "500")))
+SCAN_MIN_VOL_AH  = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
+SCAN_MIN_OI_AH   = int(os.getenv("SCAN_MIN_OI_AH",  "100"))
 
 # ========== Regex ==========
 ALERT_RE_WITH_EXP = re.compile(
@@ -225,12 +234,18 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         checks["quote_fresh"] = (quote_age is not None and quote_age <= MAX_QUOTE_AGE_S and has_nbbo)
         checks["spread_ok"]   = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= MAX_SPREAD_PCT)
     else:
+        # After hours: accept if we have any tradable price proxy (last or synthetic mid)
         checks["quote_fresh"] = bool(has_last)
         checks["spread_ok"]   = True
 
+    # After-hours: ignore day vol/oi gates (can be zero)
     require_liquidity = os.getenv("REQUIRE_LIQUIDITY_FIELDS", "0") == "1"
-    checks["vol_ok"] = (f.get("vol") or 0) >= MIN_VOL_TODAY if require_liquidity else True
-    checks["oi_ok"]  = (f.get("oi") or 0)  >= MIN_OI        if require_liquidity else True
+    if rth and require_liquidity:
+        checks["vol_ok"] = (f.get("vol") or 0) >= MIN_VOL_TODAY
+        checks["oi_ok"]  = (f.get("oi") or 0)  >= MIN_OI
+    else:
+        checks["vol_ok"] = True
+        checks["oi_ok"]  = True
 
     dte_val = f.get("dte")
     checks["dte_ok"] = (dte_val is not None) and (MIN_DTE <= dte_val <= MAX_DTE)
@@ -359,6 +374,69 @@ def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
         return False
 
 # =========================
+# Internal helpers for NBBO pull
+# =========================
+async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+    try:
+        r = await client.get(url, params=params, timeout=timeout)
+        if r.status_code in (402, 403, 404, 429):
+            return None
+        r.raise_for_status()
+        js = r.json()
+        return js if isinstance(js, dict) else None
+    except Exception:
+        return None
+
+async def _pull_nbbo_direct(option_ticker: str) -> Dict[str, Any]:
+    """
+    Direct Polygon last-quote probe to derive bid/ask/mid/spread/age.
+    """
+    out: Dict[str, Any] = {}
+    if not POLYGON_API_KEY or HTTP is None:
+        return out
+    try:
+        enc = _encode_ticker_path(option_ticker)
+        lastq = await _http_json(
+            HTTP,
+            f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=4.0
+        )
+        if not lastq:
+            return out
+        res = lastq.get("results") or {}
+        last = res.get("last") or res
+        bid = last.get("bidPrice")
+        ask = last.get("askPrice")
+        ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
+        # compute mid/spread/age if possible
+        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
+            mid = (bid + ask) / 2.0
+            out["bid"] = float(bid)
+            out["ask"] = float(ask)
+            out["mid"] = round(float(mid), 4)
+            if mid > 0:
+                out["option_spread_pct"] = round((ask - bid) / mid * 100.0, 3)
+        # quote age
+        if ts is not None:
+            try:
+                ns = int(ts)
+                if ns >= 10**14:
+                    sec = ns / 1e9
+                elif ns >= 10**11:
+                    sec = ns / 1e6
+                elif ns >= 10**8:
+                    sec = ns / 1e3
+                else:
+                    sec = float(ns)
+                out["quote_age_sec"] = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+# =========================
 # Core processing
 # =========================
 async def _process_tradingview_job(job: Dict[str, Any]) -> None:
@@ -394,13 +472,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
 
     # 3) CHAIN SCAN — thresholds (relax after-hours)
     rth = _is_rth_now()
-    scan_min_vol = int(os.getenv("SCAN_MIN_VOL", "500"))
-    scan_min_oi  = int(os.getenv("SCAN_MIN_OI",  "500"))
-    if not rth:
-        scan_min_vol = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
-        scan_min_oi  = int(os.getenv("SCAN_MIN_OI_AH",  "100"))
+    scan_min_vol = SCAN_MIN_VOL_RTH if rth else SCAN_MIN_VOL_AH
+    scan_min_oi  = SCAN_MIN_OI_RTH  if rth else SCAN_MIN_OI_AH
 
-    # 3a) primary contract selection
+    # 3a) primary contract selection (ALWAYS chain scan; broaden if needed)
     selection_debug: Dict[str, Any] = {}
     option_ticker = None
 
@@ -417,7 +492,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         best_from_scan = None
 
-    if PREFER_CHAIN_SCAN and best_from_scan:
+    if best_from_scan:
         option_ticker = best_from_scan["ticker"]
         if isinstance(best_from_scan.get("strike"), (int, float)):
             desired_strike = float(best_from_scan["strike"])
@@ -430,34 +505,47 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         }
         logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
-        chosen_expiry = str(alert.get("expiry") or target_expiry)
+        # Broaden: pick the single best across the next 3 weeks as a backstop
         try:
-            option_ticker, sel_dbg = await choose_best_contract(
-                HTTP, alert["symbol"], chosen_expiry, alert["side"], ul_px, desired_strike
+            one_best = await scan_top_candidates_for_alert(
+                HTTP,
+                alert["symbol"],
+                {"side": alert["side"], "symbol": alert["symbol"],
+                 "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+                min_vol=scan_min_vol,
+                min_oi=scan_min_oi,
+                top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
+                top_overall=1,
             )
-            selection_debug = {"selected_by": "delta_selector", **(sel_dbg or {})}
-            if not option_ticker:
-                # Fallback respects the alert's expiry if provided
-                fallback_exp = str(alert.get("expiry") or target_expiry)
-                pm_fallback = _build_plus_minus_contracts(alert["symbol"], ul_px, fallback_exp)
-                option_ticker = pm_fallback["contract_call"] if alert["side"] == "CALL" else pm_fallback["contract_put"]
-                desired_strike = pm_fallback["strike_call"] if alert["side"] == "CALL" else pm_fallback["strike_put"]
-                selection_debug = {"selected_by": "fallback_pm", "reason": "selector_empty", "chosen_expiry": fallback_exp}
         except Exception:
-            # Fallback respects the alert's expiry if provided
+            one_best = None
+
+        if one_best:
+            it = one_best[0]
+            option_ticker = it["ticker"]
+            desired_strike = float(it.get("strike") or desired_strike)
+            chosen_expiry = str(it.get("expiry") or alert.get("expiry") or target_expiry)
+            selection_debug = {
+                "selected_by": "chain_scan_broadened",
+                "selected_ticker": option_ticker,
+                "best_item": it,
+                "chosen_expiry": chosen_expiry,
+            }
+            logger.info("chain_scan (broadened) selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
+        else:
+            # Last resort: fallback but respect the alert expiry if provided
             fallback_exp = str(alert.get("expiry") or target_expiry)
             pm_fallback = _build_plus_minus_contracts(alert["symbol"], ul_px, fallback_exp)
             option_ticker = pm_fallback["contract_call"] if alert["side"] == "CALL" else pm_fallback["contract_put"]
             desired_strike = pm_fallback["strike_call"] if alert["side"] == "CALL" else pm_fallback["strike_put"]
-            selection_debug = {"selected_by": "fallback_pm", "reason": "selector_error", "chosen_expiry": fallback_exp}
-        logger.info("delta/fallback selected: %s (strike=%s exp=%s) via %s",
-                    option_ticker, desired_strike, selection_debug.get("chosen_expiry", chosen_expiry),
-                    selection_debug.get("selected_by"))
+            chosen_expiry = fallback_exp
+            selection_debug = {"selected_by": "fallback_pm", "reason": "scan_empty", "chosen_expiry": fallback_exp}
+            logger.info("fallback selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
 
     # Use the chosen expiry everywhere downstream
     chosen_expiry = selection_debug.get("chosen_expiry", str(alert.get("expiry") or target_expiry))
 
-    # 4) Build feature bundle + backfills
+    # 4) Build feature bundle + aggressive NBBO backfills
     f: Dict[str, Any] = {}
     try:
         if not POLYGON_API_KEY:
@@ -475,11 +563,13 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
+            # A) rich backfill (OI/Vol/Greeks/IV + last + sometimes NBBO)
             extra_from_snap = await poly_option_backfill(HTTP, alert["symbol"], option_ticker, today_utc)
             for k, v in (extra_from_snap or {}).items():
                 if v is not None:
                     f[k] = v
 
+            # B) snapshot-consistent features (VWAP, regime, headroom, etc.)
             snap = None
             try:
                 snap = await polygon_get_option_snapshot_export(HTTP, underlying=alert["symbol"], option_ticker=option_ticker)
@@ -495,7 +585,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 if v is not None or k not in f:
                     f[k] = v
 
-            # derive mid/spread if missing
+            # C) derive mid/spread if we already have NBBO
             try:
                 bid = f.get("bid"); ask = f.get("ask"); mid = f.get("mid")
                 if bid is not None and ask is not None:
@@ -508,14 +598,31 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # ensure DTE
+            # D) aggressively ensure NBBO if missing
+            try:
+                if f.get("bid") is None or f.get("ask") is None:
+                    nbbo = await ensure_nbbo(HTTP, option_ticker, tries=12, delay=0.35)
+                    for k, v in (nbbo or {}).items():
+                        if v is not None:
+                            f[k] = v
+            except Exception:
+                pass
+
+            # E) direct last-quote probe to fill NBBO/age/spread
+            if f.get("bid") is None or f.get("ask") is None:
+                probe = await _pull_nbbo_direct(option_ticker)
+                for k, v in (probe or {}).items():
+                    if v is not None:
+                        f[k] = v
+
+            # F) ensure DTE
             try:
                 if f.get("dte") is None:
                     f["dte"] = (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days
             except Exception:
                 pass
 
-            # compute change% vs prev close
+            # G) compute change% vs prev close (use mid, fallback last)
             try:
                 if f.get("quote_change_pct") is None:
                     prev_close = f.get("prev_close")
@@ -525,22 +632,16 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
+            # H) if still no NBBO but we have last, synthesize a mark (AH convenience)
+            if (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("last"), (int, float)):
+                f.setdefault("mid", float(f["last"]))
+
     except Exception as e:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # NBBO probe if missing
-    try:
-        if f.get("bid") is None or f.get("ask") is None:
-            nbbo = await ensure_nbbo(HTTP, option_ticker, tries=6, delay=0.5)
-            for k, v in (nbbo or {}).items():
-                if v is not None:
-                    f[k] = v
-    except Exception:
-        pass
-
-    # 5) PRE-LLM CHAIN-SCAN ALERT (only if selection was chain_scan)
-    if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by") == "chain_scan":
+    # 5) PRE-LLM CHAIN-SCAN ALERT (we always chain-scan, but only send if we actually selected from scan)
+    if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by", "").startswith("chain_scan"):
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 pre_text = (
@@ -560,7 +661,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception as e:
             logger.exception("[worker] Telegram pre-LLM chainscan error: %s", e)
 
-    # 5b) SECOND ALERT — Top 3 across next 3 weeks (always send a message if Telegram configured)
+    # 5b) SECOND ALERT — Top 3 across next 3 weeks (always message if Telegram configured)
     if SEND_CHAIN_SCAN_TOPN_ALERTS:
         try:
             logger.info("computing chain top3 across next 3 weeks…")
@@ -591,7 +692,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                         f"📊 Chain Top 3 (next 3 weeks) for {alert['symbol']} {alert['side']}",
                         "No candidates found. Likely reasons:",
                         f"• After-hours={not rth} (day vol=0 until RTH)",
-                        f"• Thresholds too strict (min_vol={scan_min_vol}, min_oi={scan_min_oi})",
+                        f"• Thresholds in effect (min_vol={scan_min_vol}, min_oi={scan_min_oi})",
                         "• Illiquid expiry/strike for now"
                     ]
                 logger.info("Telegram top3 chainscan: sending (%d items)…", len(top3 or []))
@@ -640,7 +741,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             score=score,
             rating=rating
         )
-        if selection_debug and selection_debug.get("selected_by") == "chain_scan":
+        if selection_debug.get("selected_by", "").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             logger.info("Telegram final alert: sending…")
@@ -736,19 +837,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     })
 
 # =========================
-# Diagnostics helpers (routes will call)
+# Diagnostics helpers (used by routes)
 # =========================
-async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
-    try:
-        r = await client.get(url, params=params, timeout=timeout)
-        if r.status_code in (402, 403, 404, 429):
-            return None
-        r.raise_for_status()
-        js = r.json()
-        return js if isinstance(js, dict) else None
-    except Exception:
-        return None
-
 async def _http_json_url(client: httpx.AsyncClient, url: str, timeout: float = 8.0) -> Optional[Dict[str, Any]]:
     try:
         r = await client.get(url, timeout=timeout)
