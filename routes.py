@@ -1,5 +1,6 @@
 # routes.py
 import os
+import logging
 from urllib.parse import quote
 
 import httpx
@@ -10,6 +11,14 @@ from fastapi.responses import JSONResponse
 import trading_engine as engine
 
 router = APIRouter()
+
+# ----- Logger -----
+logger = logging.getLogger("trading_engine.routes")
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 # ----- App lifecycle wiring -----
 def bind_lifecycle(app: FastAPI):
@@ -56,6 +65,7 @@ async def webhook(
       CALL Signal: <TICKER> at <UL_PRICE> Strike: <STRIKE>
     (And same for PUT.)
     """
+    logger.info("webhook received; ib=%s force=%s qty=%s", ib, force, qty)
     text = await engine.get_alert_text_from_request(request)
     if not text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
