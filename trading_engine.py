@@ -50,7 +50,7 @@ logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 # =========================
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # optional, for checks
 
-# Force chain scan at all times (overrides PREFER_CHAIN_SCAN)
+# Force chain scan at all times
 ALWAYS_CHAIN_SCAN = os.getenv("ALWAYS_CHAIN_SCAN", "1") == "1"
 
 # Telegram toggles
@@ -281,6 +281,7 @@ def compose_telegram_text(
         f"  Greeks: Δ={f.get('delta')} Γ={f.get('gamma')} Θ={f.get('theta')} ν={f.get('vega')}\n"
         f"  EM_vs_BE_ok: {f.get('em_vs_be_ok')}  MTF align: {f.get('mtf_align')}\n"
         f"  S/R ok: {f.get('sr_headroom_ok')}  Regime: {f.get('regime_flag')}  DTE: {f.get('dte')}\n"
+        f"  NBBO debug: status={f.get('nbbo_http_status')} reason={f.get('nbbo_reason')}\n"
     )
     if llm_ran:
         decision = f"LLM Decision: {llm.get('decision','WAIT').upper()}  (conf: {llm.get('confidence')})"
@@ -374,7 +375,7 @@ def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
         return False
 
 # =========================
-# Internal helpers for NBBO pull
+# HTTP helpers (verbose)
 # =========================
 async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
     try:
@@ -386,6 +387,21 @@ async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]
         return js if isinstance(js, dict) else None
     except Exception:
         return None
+
+# Return status + json/text; do NOT swallow 402/403/429 so we can see entitlement/rate-limits.
+async def _http_get_any(url: str, params: dict | None = None, timeout: float = 6.0) -> Dict[str, Any]:
+    if HTTP is None:
+        return {"status": None, "error": "HTTP client not ready"}
+    try:
+        r = await HTTP.get(url, params=params or {}, timeout=timeout)
+        ct = r.headers.get("content-type", "")
+        try:
+            payload = r.json() if "application/json" in ct else r.text
+        except Exception:
+            payload = r.text
+        return {"status": r.status_code, "body": payload}
+    except Exception as e:
+        return {"status": None, "error": f"{type(e).__name__}: {e}"}
 
 async def _pull_nbbo_direct(option_ticker: str) -> Dict[str, Any]:
     """
@@ -409,7 +425,6 @@ async def _pull_nbbo_direct(option_ticker: str) -> Dict[str, Any]:
         bid = last.get("bidPrice")
         ask = last.get("askPrice")
         ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
-        # compute mid/spread/age if possible
         if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
             mid = (bid + ask) / 2.0
             out["bid"] = float(bid)
@@ -417,23 +432,69 @@ async def _pull_nbbo_direct(option_ticker: str) -> Dict[str, Any]:
             out["mid"] = round(float(mid), 4)
             if mid > 0:
                 out["option_spread_pct"] = round((ask - bid) / mid * 100.0, 3)
-        # quote age
         if ts is not None:
             try:
                 ns = int(ts)
-                if ns >= 10**14:
-                    sec = ns / 1e9
-                elif ns >= 10**11:
-                    sec = ns / 1e6
-                elif ns >= 10**8:
-                    sec = ns / 1e3
-                else:
-                    sec = float(ns)
+                if ns >= 10**14: sec = ns / 1e9
+                elif ns >= 10**11: sec = ns / 1e6
+                elif ns >= 10**8: sec = ns / 1e3
+                else: sec = float(ns)
                 out["quote_age_sec"] = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
             except Exception:
                 pass
     except Exception:
         pass
+    return out
+
+async def _probe_nbbo_verbose(option_ticker: str) -> Dict[str, Any]:
+    """
+    Hit Polygon v3 last-quote endpoint and report status + minimal derived fields.
+    Surfaces 402/403/429 so you know if it’s entitlement/rate-limit.
+    """
+    out: Dict[str, Any] = {}
+    if not POLYGON_API_KEY:
+        return {"nbbo_reason": "no POLYGON_API_KEY in env"}
+
+    enc = _encode_ticker_path(option_ticker)
+    url = f"https://api.polygon.io/v3/quotes/options/{enc}/last"
+    res = await _http_get_any(url, params={"apiKey": POLYGON_API_KEY}, timeout=6.0)
+
+    out["nbbo_http_status"] = res.get("status")
+    if res.get("status") != 200:
+        body = res.get("body")
+        if isinstance(body, dict):
+            out["nbbo_reason"] = body.get("error") or body.get("message") or "non-200 from Polygon"
+        else:
+            out["nbbo_reason"] = "non-200 from Polygon"
+        out["nbbo_body_sample"] = (body if isinstance(body, dict) else str(body))[:400]
+        return out
+
+    body = res.get("body") or {}
+    last = (body.get("results") or {}).get("last") or body.get("results") or {}
+    bid = last.get("bidPrice"); ask = last.get("askPrice")
+    ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
+
+    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
+        mid = (bid + ask) / 2.0
+        out.update({
+            "bid": float(bid), "ask": float(ask),
+            "mid": round(mid, 4),
+            "option_spread_pct": round(((ask - bid)/mid*100.0), 3) if mid > 0 else None,
+        })
+    else:
+        out["nbbo_reason"] = "no bid/ask in response (thin or AH?)"
+
+    try:
+        if ts is not None:
+            ns = int(ts)
+            if ns >= 10**14: sec = ns / 1e9
+            elif ns >= 10**11: sec = ns / 1e6
+            elif ns >= 10**8: sec = ns / 1e3
+            else: sec = float(ns)
+            out["quote_age_sec"] = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
+    except Exception:
+        pass
+
     return out
 
 # =========================
@@ -545,7 +606,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     # Use the chosen expiry everywhere downstream
     chosen_expiry = selection_debug.get("chosen_expiry", str(alert.get("expiry") or target_expiry))
 
-    # 4) Build feature bundle + aggressive NBBO backfills
+    # 4) Build feature bundle + aggressive NBBO backfills + verbose reasons
     f: Dict[str, Any] = {}
     try:
         if not POLYGON_API_KEY:
@@ -636,11 +697,27 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             if (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("last"), (int, float)):
                 f.setdefault("mid", float(f["last"]))
 
+            # I) final verbose NBBO probe to attach reason/status when still missing
+            if f.get("bid") is None or f.get("ask") is None:
+                nbbo_dbg = await _probe_nbbo_verbose(option_ticker)
+                for k in ("bid", "ask", "mid", "option_spread_pct", "quote_age_sec"):
+                    if nbbo_dbg.get(k) is not None:
+                        f[k] = nbbo_dbg[k]
+                f["nbbo_http_status"] = nbbo_dbg.get("nbbo_http_status")
+                f["nbbo_reason"] = nbbo_dbg.get("nbbo_reason")
+                f["nbbo_body_sample"] = nbbo_dbg.get("nbbo_body_sample")
+                logger.info("NBBO verbose: status=%s reason=%s",
+                            f.get("nbbo_http_status"), f.get("nbbo_reason"))
+
+            # J) optional: synthesize a soft spread for analytics when we only have mark/last
+            if (f.get("option_spread_pct") is None) and (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("mid"), (int, float)):
+                f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
+
     except Exception as e:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # 5) PRE-LLM CHAIN-SCAN ALERT (we always chain-scan, but only send if we actually selected from scan)
+    # 5) PRE-LLM CHAIN-SCAN ALERT (send only if scan picked the contract)
     if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by", "").startswith("chain_scan"):
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -652,6 +729,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                     f"Spread%={f.get('option_spread_pct')}  QuoteAge(s)={f.get('quote_age_sec')}\n"
                     f"OI={f.get('oi')}  Vol={f.get('vol')}  IV={f.get('iv')}  Δ={f.get('delta')} Γ={f.get('gamma')}\n"
                     f"DTE={f.get('dte')}  Regime={f.get('regime_flag')}  (pre-LLM)\n"
+                    f"NBBO dbg: status={f.get('nbbo_http_status')} reason={f.get('nbbo_reason')}\n"
                 )
                 logger.info("Telegram pre-LLM chainscan: sending…")
                 await send_telegram(pre_text)
@@ -818,6 +896,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
             "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
+            "nbbo_http_status": f.get("nbbo_http_status"),
+            "nbbo_reason": f.get("nbbo_reason"),
         },
         "pm_contracts": {
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
@@ -837,19 +917,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     })
 
 # =========================
-# Diagnostics helpers (used by routes)
+# Diagnostics helpers (routes will call)
 # =========================
-async def _http_json_url(client: httpx.AsyncClient, url: str, timeout: float = 8.0) -> Optional[Dict[str, Any]]:
-    try:
-        r = await client.get(url, timeout=timeout)
-        if r.status_code in (402, 403, 404, 429):
-            return None
-        r.raise_for_status()
-        js = r.json()
-        return js if isinstance(js, dict) else None
-    except Exception:
-        return None
-
 async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
     if HTTP is None:
         raise HTTPException(status_code=503, detail="HTTP client not ready")
