@@ -32,6 +32,7 @@ from market_ops import (
     poly_option_backfill,
     choose_best_contract,
     scan_for_best_contract_for_alert,
+    scan_top_candidates_for_alert,   # NEW
     ensure_nbbo,
 )
 
@@ -42,6 +43,8 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # optional, for checks
 
 # NEW: send a pre-LLM chain-scan alert once we have a selection
 SEND_CHAIN_SCAN_ALERTS = os.getenv("SEND_CHAIN_SCAN_ALERTS", "1") == "1"
+# NEW: send a second alert with top-3 candidates across next 3 weeks
+SEND_CHAIN_SCAN_TOPN_ALERTS = os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "1") == "1"
 
 _llm_quota: Dict[str, Any] = {"date": None, "used": 0}
 _COOLDOWN: Dict[Tuple[str, str], datetime] = {}
@@ -518,6 +521,35 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception as e:
             print(f"[worker] Telegram pre-LLM chainscan error: {e}")
 
+    # 5b) SECOND ALERT — Top 3 candidates across next 3 weeks
+    if SEND_CHAIN_SCAN_TOPN_ALERTS:
+        try:
+            top3 = await scan_top_candidates_for_alert(
+                HTTP,
+                alert["symbol"],
+                {"side": alert["side"], "symbol": alert["symbol"],
+                 "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+                min_vol=int(os.getenv("SCAN_MIN_VOL", "500")),
+                min_oi=int(os.getenv("SCAN_MIN_OI", "500")),
+                top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
+                top_overall=3,
+            )
+            if top3 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                lines = [
+                    f"📊 Chain Top 3 (next 3 weeks) for {alert['symbol']} {alert['side']}",
+                    "(ranked by strike fit + spread + liquidity)",
+                ]
+                for i, it in enumerate(top3, 1):
+                    lines.append(
+                        f"{i}. {it['expiry']} | {it['ticker']} | strike {it.get('strike')} | "
+                        f"OI {it.get('oi')} Vol {it.get('vol')} | "
+                        f"NBBO {it.get('bid')}/{it.get('ask')} mid={it.get('mid')} | "
+                        f"spread%={it.get('spread_pct')}"
+                    )
+                await send_telegram("\n".join(lines))
+        except Exception as e:
+            print(f"[worker] Telegram top3 chainscan error: {e}")
+
     # 6) Preflight + LLM
     pf_ok, pf_checks = preflight_ok(f)
 
@@ -620,7 +652,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "prev_day_high": f.get("prev_day_high"), "prev_day_low": f.get("prev_day_low"),
             "premarket_high": f.get("premarket_high"), "premarket_low": f.get("premarket_low"),
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
-            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
+            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pml"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
         },
         "pm_contracts": {
@@ -665,7 +697,7 @@ async def _http_json_url(client: httpx.AsyncClient, url: str, timeout: float = 8
     except Exception:
         return None
 
-async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
+async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]]:
     if HTTP is None:
         raise HTTPException(status_code=503, detail="HTTP client not ready")
     enc = _encode_ticker_path(contract)
