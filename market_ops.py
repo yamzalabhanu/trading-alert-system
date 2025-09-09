@@ -21,9 +21,9 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 # -------------------------
 # Generic HTTP helpers
 # -------------------------
-async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any] | None, timeout: float = 8.0) -> Optional[Dict[str, Any]]:
     try:
-        r = await client.get(url, params=params, timeout=timeout)
+        r = await client.get(url, params=params or {}, timeout=timeout)
         if r.status_code in (402, 403, 404, 429):
             return None
         r.raise_for_status()
@@ -111,9 +111,8 @@ async def polygon_get_option_snapshot_export(
             )
 
 # -------------------------
-# Quote sampler
+# Quote samplers / probes
 # -------------------------
-# --- replace your _sample_best_quote with this version ---
 async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Dict[str, Any]]:
     best: Dict[str, Any] = {}
     for _ in range(tries):
@@ -147,15 +146,56 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
                 if (
                     not best
                     or (cand.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)
-                    or (
-                        ("quote_age_sec" in cand)
-                        and (cand.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)
-                    )
+                    or (cand.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)
                 ):
                     best = cand
         await asyncio.sleep(delay)
     return best or None
 
+async def ensure_nbbo(
+    client: httpx.AsyncClient,
+    option_ticker: str,
+    tries: int = 6,
+    delay: float = 0.6,
+) -> Dict[str, Any]:
+    """
+    Repeatedly sample last quote for the option and return best bid/ask/mid,
+    spread%, and quote_age_sec if found. Returns {} if still nothing.
+    """
+    enc_opt = _encode_ticker_path(option_ticker)
+    best: Dict[str, Any] = {}
+    for _ in range(max(1, tries)):
+        lastq = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=3.0,
+        )
+        if lastq:
+            res = lastq.get("results") or {}
+            last = res.get("last") or res
+            bid = last.get("bidPrice")
+            ask = last.get("askPrice")
+            ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
+            if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
+                mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
+                spread_pct = ((ask - bid) / mid * 100.0) if (mid and mid > 0) else None
+                age = _quote_age_from_ts(ts)
+                cand = {
+                    "bid": float(bid) if bid is not None else None,
+                    "ask": float(ask) if ask is not None else None,
+                    "mid": float(mid) if mid is not None else None,
+                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
+                    "quote_age_sec": age,
+                }
+                if (
+                    not best
+                    or (cand.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)
+                    or (cand.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)
+                ):
+                    best = cand
+        await asyncio.sleep(delay)
+    return best
 
 # -------------------------
 # Backfill bundle
@@ -361,7 +401,6 @@ async def choose_best_contract(
 ) -> Tuple[str, Dict[str, Any]]:
     """Former _choose_best_contract (now public)."""
     if not POLYGON_API_KEY:
-        # minimal fallback: +/- 5% builder lives in trading_engine; caller will handle fallback
         return "", {"reason": "offline/no key"}
 
     chain = await polygon_list_contracts_for_expiry_export(client, symbol=symbol, expiry=expiry_iso, side=side, limit=1000)
