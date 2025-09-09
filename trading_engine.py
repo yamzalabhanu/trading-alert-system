@@ -35,7 +35,7 @@ from market_ops import (
     poly_option_backfill,
     choose_best_contract,
     scan_for_best_contract_for_alert,
-    ensure_nbbo,  # NEW
+    ensure_nbbo,  # NBBO probe
 )
 
 # =========================
@@ -178,6 +178,15 @@ def is_same_week(a: date, b: date) -> bool:
 def _encode_ticker_path(t: str) -> str:
     return quote(t or "", safe="")
 
+# Regular Trading Hours check (Mon–Fri, 08:30–15:00 CT)
+def _is_rth_now() -> bool:
+    now = datetime.now(CDT_TZ)
+    if now.weekday() > 4:
+        return False
+    start = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    end   = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    return start <= now <= end
+
 # =========================
 # Strike helpers (local)
 # =========================
@@ -192,15 +201,25 @@ def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> D
     }
 
 # =========================
-# Preflight (more forgiving option)
+# Preflight (after-hours tolerant)
 # =========================
 def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     checks: Dict[str, bool] = {}
-    # Allow quote-only pass if we have a fresh NBBO and reasonable spread
-    checks["quote_fresh"] = (f.get("quote_age_sec") is not None and f["quote_age_sec"] <= MAX_QUOTE_AGE_S)
-    checks["spread_ok"]   = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= MAX_SPREAD_PCT)
+    rth = _is_rth_now()
 
-    # Make vol/oi optional via env
+    quote_age = f.get("quote_age_sec")
+    has_nbbo  = f.get("bid") is not None and f.get("ask") is not None
+    has_last  = isinstance(f.get("last"), (int, float)) or isinstance(f.get("mid"), (int, float))
+
+    if rth:
+        # Require fresh NBBO during market hours
+        checks["quote_fresh"] = (quote_age is not None and quote_age <= MAX_QUOTE_AGE_S and has_nbbo)
+        checks["spread_ok"]   = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= MAX_SPREAD_PCT)
+    else:
+        # After-hours: tolerate lack of NBBO if we at least have a recent trade/mark
+        checks["quote_fresh"] = bool(has_last)
+        checks["spread_ok"]   = True
+
     require_liquidity = os.getenv("REQUIRE_LIQUIDITY_FIELDS", "0") == "1"
     checks["vol_ok"] = (f.get("vol") or 0) >= MIN_VOL_TODAY if require_liquidity else True
     checks["oi_ok"]  = (f.get("oi") or 0)  >= MIN_OI        if require_liquidity else True
