@@ -3,6 +3,7 @@ import os
 import re
 import asyncio
 import socket
+import logging
 from urllib.parse import quote
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone, timedelta, date
@@ -26,24 +27,31 @@ from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
 from reporting import _DECISIONS_LOG
 
-# === Polygon/market helpers split out ===
+# === Polygon/market helpers (split module) ===
 from market_ops import (
     polygon_get_option_snapshot_export,
     poly_option_backfill,
     choose_best_contract,
     scan_for_best_contract_for_alert,
-    scan_top_candidates_for_alert,   # NEW
+    scan_top_candidates_for_alert,
     ensure_nbbo,
 )
+
+# ------------- Logger -------------
+logger = logging.getLogger("trading_engine")
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 # =========================
 # Global state / resources
 # =========================
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # optional, for checks
 
-# NEW: send a pre-LLM chain-scan alert once we have a selection
+# Pre-LLM chain-scan alert + Top 3 alert
 SEND_CHAIN_SCAN_ALERTS = os.getenv("SEND_CHAIN_SCAN_ALERTS", "1") == "1"
-# NEW: send a second alert with top-3 candidates across next 3 weeks
 SEND_CHAIN_SCAN_TOPN_ALERTS = os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "1") == "1"
 
 _llm_quota: Dict[str, Any] = {"date": None, "used": 0}
@@ -181,7 +189,6 @@ def is_same_week(a: date, b: date) -> bool:
 def _encode_ticker_path(t: str) -> str:
     return quote(t or "", safe="")
 
-# Regular Trading Hours check (Mon–Fri, 08:30–15:00 CT)
 def _is_rth_now() -> bool:
     now = datetime.now(CDT_TZ)
     if now.weekday() > 4:
@@ -191,7 +198,7 @@ def _is_rth_now() -> bool:
     return start <= now <= end
 
 # =========================
-# Strike helpers (local)
+# Strike helpers
 # =========================
 def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> Dict[str, Any]:
     call_strike = round_strike_to_common_increment(ul_px * 1.05)
@@ -204,7 +211,7 @@ def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> D
     }
 
 # =========================
-# Preflight (after-hours tolerant)
+# Preflight
 # =========================
 def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     checks: Dict[str, bool] = {}
@@ -215,11 +222,9 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     has_last  = isinstance(f.get("last"), (int, float)) or isinstance(f.get("mid"), (int, float))
 
     if rth:
-        # Require fresh NBBO during market hours
         checks["quote_fresh"] = (quote_age is not None and quote_age <= MAX_QUOTE_AGE_S and has_nbbo)
         checks["spread_ok"]   = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= MAX_SPREAD_PCT)
     else:
-        # After-hours: tolerate lack of NBBO if we at least have a recent trade/mark
         checks["quote_fresh"] = bool(has_last)
         checks["spread_ok"]   = True
 
@@ -317,21 +322,26 @@ async def startup():
         limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
     )
     WORKER_COUNT = int(os.getenv("WORKERS", "3"))
-    for _ in range(WORKER_COUNT):
+    for i in range(WORKER_COUNT):
         asyncio.create_task(_worker())
+    logger.info("startup complete; HTTP ready; workers=%d", WORKER_COUNT)
 
 async def shutdown():
     global HTTP
     if HTTP:
         await HTTP.aclose()
+        logger.info("shutdown complete; HTTP closed")
 
 async def _worker():
+    logger.info("worker task started")
     while True:
         job = await WORK_Q.get()
         try:
+            logger.info("processing alert job: %s", (job.get("alert_text") or "")[:200])
             await _process_tradingview_job(job)
+            logger.info("job processed")
         except Exception as e:
-            print(f"[worker] error: {e!r}")
+            logger.exception("[worker] error: %r", e)
         finally:
             WORK_Q.task_done()
 
@@ -342,8 +352,10 @@ def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
     job = {"alert_text": alert_text, "flags": flags}
     try:
         WORK_Q.put_nowait(job)
+        logger.info("enqueue ok; flags=%s", flags)
         return True
     except asyncio.QueueFull:
+        logger.warning("enqueue failed: queue full")
         return False
 
 # =========================
@@ -352,21 +364,23 @@ def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
 async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     global HTTP
     if HTTP is None:
-        print("[worker] HTTP client not ready")
+        logger.warning("[worker] HTTP client not ready")
         return
 
-    # 1) Parse TradingView alert text (drives chain-scan targeting)
+    # 1) Parse TradingView alert text
     try:
         alert = parse_alert_text(job["alert_text"])
+        logger.info("parsed alert: side=%s symbol=%s strike=%s expiry=%s",
+                    alert.get("side"), alert.get("symbol"), alert.get("strike"), alert.get("expiry"))
     except Exception as e:
-        print(f"[worker] bad alert payload: {e}")
+        logger.warning("[worker] bad alert payload: %s", e)
         return
 
     ib_enabled = bool(job["flags"].get("ib_enabled", IBKR_ENABLED))
     force_buy = bool(job["flags"].get("force_buy", False))
     qty = int(job["flags"].get("qty", IBKR_DEFAULT_QTY))
 
-    # 2) Compute a target expiry (2w Friday) to use when alert has no expiry
+    # 2) Compute default expiry if missing (2w Friday)
     ul_px = float(alert["underlying_price_from_alert"])
     today_utc = datetime.now(timezone.utc).date()
     target_expiry_date = two_weeks_friday(today_utc)
@@ -378,7 +392,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
     desired_strike = pm["strike_call"] if alert["side"] == "CALL" else pm["strike_put"]
 
-    # 3) CHAIN SCAN — primary contract selection driven by parsed alert
+    # 3) CHAIN SCAN — primary contract selection
     selection_debug: Dict[str, Any] = {}
     option_ticker = None
 
@@ -406,8 +420,8 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "best_item": best_from_scan,
             "chosen_expiry": chosen_expiry,
         }
+        logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
-        # fallback to delta selector or +/-5%
         chosen_expiry = str(alert.get("expiry") or target_expiry)
         try:
             option_ticker, sel_dbg = await choose_best_contract(
@@ -420,8 +434,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception:
             option_ticker = pm["contract_call"] if alert["side"] == "CALL" else pm["contract_put"]
             selection_debug = {"selected_by": "fallback_pm", "reason": "selector_error"}
+        logger.info("delta/fallback selected: %s (strike=%s exp=%s) via %s",
+                    option_ticker, desired_strike, chosen_expiry, selection_debug.get("selected_by"))
 
-    # 4) Build feature bundle and backfill quotes/greeks/IV
+    # 4) Build feature bundle + backfills
     f: Dict[str, Any] = {}
     chosen_expiry = selection_debug.get("chosen_expiry", str(alert.get("expiry") or target_expiry))
     try:
@@ -491,10 +507,10 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 pass
 
     except Exception as e:
-        print(f"[worker] Polygon/features error: {e}")
+        logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # 4a) If NBBO is still missing, probe a few times
+    # NBBO probe if missing
     try:
         if f.get("bid") is None or f.get("ask") is None:
             nbbo = await ensure_nbbo(HTTP, option_ticker, tries=6, delay=0.5)
@@ -504,7 +520,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-    # 5) PRE-LLM CHAIN-SCAN ALERT (based on parsed TradingView alert)
+    # 5) PRE-LLM CHAIN-SCAN ALERT
     if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by") == "chain_scan":
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -512,18 +528,23 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                     "🔎 Chain-Scan Pick (from TradingView alert)\n"
                     f"{alert['side']} {alert['symbol']} | Strike {desired_strike} | Exp {chosen_expiry}\n"
                     f"Contract: {option_ticker}\n"
-                    f"NBBO bid={f.get('bid')} ask={f.get('ask')}  Mark={f.get('mid')}  Last={f.get('last')}\n"
+                    f"NBBO {f.get('bid')}/{f.get('ask')}  Mark={f.get('mid')}  Last={f.get('last')}\n"
                     f"Spread%={f.get('option_spread_pct')}  QuoteAge(s)={f.get('quote_age_sec')}\n"
                     f"OI={f.get('oi')}  Vol={f.get('vol')}  IV={f.get('iv')}  Δ={f.get('delta')} Γ={f.get('gamma')}\n"
                     f"DTE={f.get('dte')}  Regime={f.get('regime_flag')}  (pre-LLM)\n"
                 )
+                logger.info("Telegram pre-LLM chainscan: sending…")
                 await send_telegram(pre_text)
+                logger.info("Telegram pre-LLM chainscan: sent")
+            else:
+                logger.info("Telegram pre-LLM chainscan: skipped (no bot/chat env)")
         except Exception as e:
-            print(f"[worker] Telegram pre-LLM chainscan error: {e}")
+            logger.exception("[worker] Telegram pre-LLM chainscan error: %s", e)
 
-    # 5b) SECOND ALERT — Top 3 candidates across next 3 weeks
+    # 5b) SECOND ALERT — Top 3 across next 3 weeks
     if SEND_CHAIN_SCAN_TOPN_ALERTS:
         try:
+            logger.info("computing chain top3 across next 3 weeks…")
             top3 = await scan_top_candidates_for_alert(
                 HTTP,
                 alert["symbol"],
@@ -537,23 +558,27 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             if top3 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 lines = [
                     f"📊 Chain Top 3 (next 3 weeks) for {alert['symbol']} {alert['side']}",
-                    "(ranked by strike fit + spread + liquidity)",
+                    "(ranked by strike fit + spread + liquidity)"
                 ]
                 for i, it in enumerate(top3, 1):
                     lines.append(
                         f"{i}. {it['expiry']} | {it['ticker']} | strike {it.get('strike')} | "
                         f"OI {it.get('oi')} Vol {it.get('vol')} | "
-                        f"NBBO {it.get('bid')}/{it.get('ask')} mid={it.get('mid')} | "
-                        f"spread%={it.get('spread_pct')}"
+                        f"NBBO {it.get('bid')}/{it.get('ask')} mid={it.get('mid')} | spread%={it.get('spread_pct')}"
                     )
+                logger.info("Telegram top3 chainscan: sending (%d items)…", len(top3))
                 await send_telegram("\n".join(lines))
+                logger.info("Telegram top3 chainscan: sent")
+            else:
+                logger.info("Telegram top3 chainscan: skipped (no results or no bot/chat env)")
         except Exception as e:
-            print(f"[worker] Telegram top3 chainscan error: {e}")
+            logger.exception("[worker] Telegram top3 chainscan error: %s", e)
 
-    # 6) Preflight + LLM
+    # 6) PRE-FLIGHT + LLM
     pf_ok, pf_checks = preflight_ok(f)
 
     try:
+        logger.info("running LLM analysis…")
         llm = await analyze_with_openai(alert, f)
         consume_llm()
     except Exception as e:
@@ -572,7 +597,9 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
     if force_buy:
         decision_final = "buy"
 
-    # 7) Telegram: full message with LLM outcome
+    logger.info("LLM decision=%s conf=%s pf_ok=%s", decision_final, llm.get("confidence"), pf_ok)
+
+    # 7) Telegram final
     tg_result = None
     try:
         tg_text = compose_telegram_text(
@@ -588,9 +615,13 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
         if selection_debug and selection_debug.get("selected_by") == "chain_scan":
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            logger.info("Telegram final alert: sending…")
             tg_result = await send_telegram(tg_text)
+            logger.info("Telegram final alert: sent")
+        else:
+            logger.info("Telegram final alert: skipped (no bot/chat env)")
     except Exception as e:
-        print(f"[worker] Telegram error: {e}")
+        logger.exception("[worker] Telegram error: %s", e)
 
     # 8) IBKR order (optional)
     ib_attempted = False
@@ -608,6 +639,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 use_market = not (IBKR_USE_MID_AS_LIMIT and (mid is not None))
             limit_px = None if use_market else float(mid) if mid is not None else None
 
+            logger.info("IBKR placing order qty=%s mode=%s", qty, IBKR_ORDER_MODE)
             ib_result_obj = await place_recommended_option_order(
                 symbol=alert["symbol"],
                 side=alert["side"],
@@ -618,6 +650,9 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
                 action="BUY",
                 tif=IBKR_TIF,
             )
+        else:
+            logger.info("IBKR not attempted (decision=%s ib_enabled=%s pf_ok=%s force_buy=%s)",
+                        decision_final, ib_enabled, pf_ok, force_buy)
     except Exception as e:
         ib_result_obj = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -652,7 +687,7 @@ async def _process_tradingview_job(job: Dict[str, Any]) -> None:
             "prev_day_high": f.get("prev_day_high"), "prev_day_low": f.get("prev_day_low"),
             "premarket_high": f.get("premarket_high"), "premarket_low": f.get("premarket_low"),
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
-            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pml"),
+            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
         },
         "pm_contracts": {
