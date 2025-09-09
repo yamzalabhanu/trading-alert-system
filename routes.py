@@ -1,13 +1,23 @@
 # routes.py
 import os
+import logging
 from urllib.parse import quote
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-# Use the orchestrator module directly
+# Orchestrator (trading engine) module
 import trading_engine as engine
+
+# Logger
+log = logging.getLogger("trading_engine.routes")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
+    log.addHandler(_h)
+log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
@@ -21,7 +31,7 @@ def bind_lifecycle(app: FastAPI):
     async def _shutdown():
         await engine.shutdown()
 
-# Optional alternative if you prefer this name
+# Optional alternative name
 def mount(app: FastAPI):
     return bind_lifecycle(app)
 
@@ -46,27 +56,18 @@ async def engine_quota():
 @router.post("/webhook")
 async def webhook(
     request: Request,
-    ib: bool = False,           # ?ib=1 to allow IBKR order when decision == buy
-    force: bool = False,        # ?force=1 to override to buy (still logs preflight)
-    qty: int = 1,               # ?qty=1 default
+    ib: bool = False,     # ?ib=1 to allow IBKR order when decision == buy
+    force: bool = False,  # ?force=1 to override to buy
+    qty: int = 1,         # ?qty=1 default
 ):
-    """
-    Accepts JSON {"message": "..."} or raw text body containing one of:
-      CALL Signal: <TICKER> at <UL_PRICE> Strike: <STRIKE> Expiry: YYYY-MM-DD
-      CALL Signal: <TICKER> at <UL_PRICE> Strike: <STRIKE>
-    (And same for PUT.)
-    """
+    log.info("webhook received; ib=%s force=%s qty=%s", ib, force, qty)
     text = await engine.get_alert_text_from_request(request)
     if not text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
 
     ok = engine.enqueue_webhook_job(
         alert_text=text,
-        flags={
-            "ib_enabled": bool(ib),
-            "qty": int(qty),
-            "force_buy": bool(force),
-        },
+        flags={"ib_enabled": bool(ib), "qty": int(qty), "force_buy": bool(force)},
     )
     if not ok:
         raise HTTPException(status_code=503, detail="Queue is full")
@@ -76,6 +77,16 @@ async def webhook(
         "queue_stats": engine.get_worker_stats(),
         "llm_quota": engine.llm_quota_snapshot(),
     })
+
+# Exact alias for TradingView (some users configure /webhook/tradingview)
+@router.post("/webhook/tradingview")
+async def webhook_tradingview(
+    request: Request,
+    ib: bool = False,
+    force: bool = False,
+    qty: int = 1,
+):
+    return await webhook(request=request, ib=ib, force=force, qty=qty)
 
 # ----- Diagnostics -----
 @router.get("/net/debug")
@@ -89,12 +100,12 @@ async def _http_json(client: httpx.AsyncClient, url: str, params=None, timeout: 
     try:
         r = await client.get(url, params=params or {}, timeout=timeout)
         if r.status_code in (402, 403, 404, 429):
-            return None
+            return {"status": r.status_code, "body": r.text[:400]}
         r.raise_for_status()
         js = r.json()
         return js if isinstance(js, dict) else None
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error": str(e)}
 
 @router.get("/diag/polygon")
 async def diag_polygon(underlying: str, contract: str):
@@ -115,7 +126,6 @@ async def diag_polygon(underlying: str, contract: str):
             {"apiKey": POLYGON_API_KEY},
             6.0,
         )
-        from datetime import datetime, timezone, timedelta
         yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
         out["open_close"] = await _http_json(
             HTTP,
@@ -140,30 +150,27 @@ async def diag_polygon(underlying: str, contract: str):
         "open_close": skim(out.get("open_close")),
     }
 
-# NBBO entitlement/rate-limit debugging
+# NBBO diag: show raw status/body for a contract
 @router.get("/diag/nbbo")
 async def diag_nbbo(ticker: str):
     """
     Example:
       /diag/nbbo?ticker=O:AAPL250912C00245000
-    Shows raw HTTP status/body snippet from Polygon last-quote for quick debugging.
+    Shows raw HTTP status/body from Polygon last-quote for quick debugging.
     """
-    if not POLYGON_API_KEY:
+    from trading_engine import _http_get_any, _encode_ticker_path, POLYGON_API_KEY as PK
+    if not PK:
         raise HTTPException(400, "POLYGON_API_KEY not configured")
-    enc = quote(ticker, safe="")
+
+    enc = _encode_ticker_path(ticker)
     url = f"https://api.polygon.io/v3/quotes/options/{enc}/last"
-    async with httpx.AsyncClient(timeout=6.0) as HTTP:
-        try:
-            r = await HTTP.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=6.0)
-            ct = r.headers.get("content-type", "")
-            try:
-                body = r.json() if "application/json" in ct else r.text
-            except Exception:
-                body = r.text
-            if isinstance(body, dict):
-                body_sample = {k: body[k] for k in list(body.keys())[:8]}
-            else:
-                body_sample = str(body)[:1000]
-            return {"status": r.status_code, "body_sample": body_sample}
-        except Exception as e:
-            return {"status": None, "error": f"{type(e).__name__}: {e}"}
+    res = await _http_get_any(url, params={"apiKey": PK}, timeout=6.0)
+    body = res.get("body")
+    if isinstance(body, dict):
+        body_sample = {k: body[k] for k in list(body.keys())[:6]}
+    else:
+        body_sample = (body or "")[:800]
+    return {
+        "status": res.get("status"),
+        "body_sample": body_sample,
+    }
