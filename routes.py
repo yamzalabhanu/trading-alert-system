@@ -77,6 +77,16 @@ async def webhook(
         "llm_quota": engine.llm_quota_snapshot(),
     })
 
+# Alias endpoint for TradingView (same behavior as /webhook)
+@router.post("/webhook/tradingview")
+async def webhook_tradingview(
+    request: Request,
+    ib: bool = False,
+    force: bool = False,
+    qty: int = 1,
+):
+    return await webhook(request=request, ib=ib, force=force, qty=qty)
+
 # ----- Diagnostics -----
 @router.get("/net/debug")
 async def net_debug():
