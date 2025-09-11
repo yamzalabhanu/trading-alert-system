@@ -4,7 +4,7 @@ import re
 import socket
 import logging
 from urllib.parse import quote
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone, timedelta, date
 
 import httpx
@@ -19,7 +19,7 @@ from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
 from reporting import _DECISIONS_LOG
 
-# Pull shared HTTP client from runtime (avoids circular resources)
+# Pull shared HTTP client (avoids import-time cycles)
 from engine_runtime import get_http_client
 
 # Market helpers
@@ -65,6 +65,9 @@ SCAN_MIN_OI_AH   = int(os.getenv("SCAN_MIN_OI_AH",  "100"))
 
 SEND_CHAIN_SCAN_ALERTS      = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "1"))
 SEND_CHAIN_SCAN_TOPN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "1"))
+
+# New: replace picked contract if it has no NBBO (even if "listed")
+REPLACE_IF_NO_NBBO = _env_truthy(os.getenv("REPLACE_IF_NO_NBBO", "1"))
 
 # =========================
 # Small helpers / time & quota
@@ -158,8 +161,7 @@ def two_weeks_friday(d: date) -> date:
     return _next_friday(d) + timedelta(days=7)
 
 def is_same_week(a: date, b: date) -> bool:
-    am = a - timedelta(days=a.weekday())
-    bm = b - timedelta(days=b.weekday())
+    am = a - timedelta(days=a.weekday()); bm = b - timedelta(days=b.weekday())
     return am == bm
 
 def _encode_ticker_path(t: str) -> str:
@@ -234,6 +236,7 @@ def compose_telegram_text(
     llm_reason: str,
     score: Optional[float],
     rating: Optional[str],
+    diff_note: str = "",
 ) -> str:
     header = (
         f"📣 Options Alert\n"
@@ -260,7 +263,8 @@ def compose_telegram_text(
         decision = "LLM Decision: SKIPPED"
         reason = f"Note: {llm_reason or 'LLM not executed'}"
         scoreline = ""
-    return "\n".join([header, contract, "", snap, decision, reason, scoreline]).strip()
+    parts = [header, contract, "", snap, diff_note.strip(), decision, reason, scoreline]
+    return "\n".join([p for p in parts if p]).strip()
 
 def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
     if res is None:
@@ -342,8 +346,7 @@ async def _pull_nbbo_direct(option_ticker: str) -> Dict[str, Any]:
             return out
         res = lastq.get("results") or {}
         last = res.get("last") or res
-        bid = last.get("bidPrice")
-        ask = last.get("askPrice")
+        bid = last.get("bidPrice"); ask = last.get("askPrice")
         ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
         if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
             mid = (bid + ask) / 2.0
@@ -443,6 +446,9 @@ async def _poly_reference_contracts_exists(underlying: str, expiry_iso: str, tic
 async def _rescan_best_replacement(
     symbol: str, side: str, desired_strike: float, expiry_iso: str, min_vol: int, min_oi: int,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Replacement when contract is truly not listed.
+    """
     try:
         try:
             top_same = await scan_top_candidates_for_alert(
@@ -464,16 +470,58 @@ async def _rescan_best_replacement(
             )
             pool = [it for it in (top_any or []) if it.get("expiry") == expiry_iso]
     except Exception:
+    # noqa: E722
         pool = []
 
-    # Enforce side correctness even if market_ops returns a mix
+    # enforce side
+    pool = [it for it in pool if _ticker_matches_side(it.get("ticker"), side)]
+
     def _rank(it: Dict[str, Any]):
         sd = abs(float(it.get("strike") or desired_strike) - desired_strike)
         sp = float(it.get("spread_pct") or 1e9)
         nbbo_missing = 0 if (it.get("bid") is not None and it.get("ask") is not None) else 1
         return (sd, nbbo_missing, sp, -(it.get("oi") or 0), -(it.get("vol") or 0))
 
-    pool = [it for it in pool if _ticker_matches_side(it.get("ticker"), side)]
+    pool.sort(key=_rank)
+    return pool[0] if pool else None
+
+async def _find_nbbo_replacement_same_expiry(
+    symbol: str, side: str, desired_strike: float, expiry_iso: str, min_vol: int, min_oi: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Softer replacement when current pick has no NBBO (404/missing) but is listed.
+    """
+    try:
+        pool = await scan_top_candidates_for_alert(
+            get_http_client(), symbol,
+            {"side": side, "symbol": symbol, "strike": desired_strike, "expiry": expiry_iso},
+            min_vol=min_vol, min_oi=min_oi,
+            top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
+            top_overall=10,
+            restrict_expiries=[expiry_iso],  # type: ignore
+        ) or []
+    except TypeError:
+        pool = await scan_top_candidates_for_alert(
+            get_http_client(), symbol,
+            {"side": side, "symbol": symbol, "strike": desired_strike, "expiry": expiry_iso},
+            min_vol=min_vol, min_oi=min_oi,
+            top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
+            top_overall=12,
+        ) or []
+        pool = [it for it in pool if it.get("expiry") == expiry_iso]
+    except Exception:
+        pool = []
+
+    # filter: correct side + has NBBO
+    pool = [it for it in pool if _ticker_matches_side(it.get("ticker"), side)
+            and it.get("bid") is not None and it.get("ask") is not None]
+
+    def _rank(it: Dict[str, Any]):
+        # prioritize close strike, lower spread, higher OI/Vol
+        sd = abs(float(it.get("strike") or desired_strike) - desired_strike)
+        sp = float(it.get("spread_pct") or 1e9)
+        return (sd, sp, -(it.get("oi") or 0), -(it.get("vol") or 0))
+
     pool.sort(key=_rank)
     return pool[0] if pool else None
 
@@ -486,7 +534,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] HTTP client not ready")
         return
 
-    # Ensure locals are always defined for later use
+    # Ensure locals are defined
     selection_debug: Dict[str, Any] = {}
     replacement_note: Optional[Dict[str, Any]] = None
     option_ticker: Optional[str] = None
@@ -504,6 +552,10 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     ib_enabled = bool(job["flags"].get("ib_enabled", IBKR_ENABLED))
     force_buy  = bool(job["flags"].get("force_buy", False))
     qty        = int(job["flags"].get("qty", IBKR_DEFAULT_QTY))
+
+    # Save originals for messaging
+    orig_strike = alert.get("strike")
+    orig_expiry = alert.get("expiry")
 
     # 2) Expiry defaulting
     ul_px = float(alert["underlying_price_from_alert"])
@@ -537,7 +589,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if best_from_scan and _ticker_matches_side(best_from_scan.get("ticker"), side):
         candidate = best_from_scan
     else:
-        # Fallback: pull a short list and filter by side
         try:
             pool = await scan_top_candidates_for_alert(
                 client,
@@ -545,7 +596,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
                 min_vol=scan_min_vol, min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
-                top_overall=5,
+                top_overall=6,
             ) or []
         except Exception:
             pool = []
@@ -557,42 +608,20 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         if isinstance(candidate.get("strike"), (int, float)):
             desired_strike = float(candidate["strike"])
         occ = _occ_meta(option_ticker)
-        chosen_expiry = occ["expiry"] if occ and occ.get("expiry") else str(candidate.get("expiry") or alert.get("expiry") or target_expiry)
+        chosen_expiry = occ["expiry"] if occ and occ.get("expiry") else str(candidate.get("expiry") or orig_expiry or target_expiry)
         selection_debug = {"selected_by": "chain_scan", "selected_ticker": option_ticker,
                            "best_item": candidate, "chosen_expiry": chosen_expiry}
         logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
-        # Try broadened single candidate (still filtered by side)
-        try:
-            one_best = await scan_top_candidates_for_alert(
-                client,
-                alert["symbol"],
-                {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
-                min_vol=scan_min_vol, min_oi=scan_min_oi, top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")), top_overall=8,
-            ) or []
-        except Exception:
-            one_best = []
-        one_best = [it for it in one_best if _ticker_matches_side(it.get("ticker"), side)]
-        if one_best:
-            it = one_best[0]
-            option_ticker = it["ticker"]
-            desired_strike = float(it.get("strike") or desired_strike)
-            occ = _occ_meta(option_ticker)
-            chosen_expiry = occ["expiry"] if occ else str(it.get("expiry") or alert.get("expiry") or target_expiry)
-            selection_debug = {"selected_by": "chain_scan_broadened", "selected_ticker": option_ticker,
-                               "best_item": it, "chosen_expiry": chosen_expiry}
-            logger.info("chain_scan (broadened) selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
-        else:
-            # Last resort: synthetic plus/minus respecting side
-            fallback_exp = str(alert.get("expiry") or target_expiry)
-            pm_fallback = _build_plus_minus_contracts(alert["symbol"], ul_px, fallback_exp)
-            option_ticker = pm_fallback["contract_call"] if side == "CALL" else pm_fallback["contract_put"]
-            desired_strike = pm_fallback["strike_call"] if side == "CALL" else pm_fallback["strike_put"]
-            chosen_expiry = fallback_exp
-            selection_debug = {"selected_by": "fallback_pm", "reason": "scan_empty", "chosen_expiry": fallback_exp}
-            logger.info("fallback selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
+        fallback_exp = str(orig_expiry or target_expiry)
+        pm_fallback = _build_plus_minus_contracts(alert["symbol"], ul_px, fallback_exp)
+        option_ticker = pm_fallback["contract_call"] if side == "CALL" else pm_fallback["contract_put"]
+        desired_strike = pm_fallback["strike_call"] if side == "CALL" else pm_fallback["strike_put"]
+        chosen_expiry = fallback_exp
+        selection_debug = {"selected_by": "fallback_pm", "reason": "scan_empty", "chosen_expiry": fallback_exp}
+        logger.info("fallback selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
 
-    chosen_expiry = selection_debug.get("chosen_expiry", str(alert.get("expiry") or target_expiry))
+    chosen_expiry = selection_debug.get("chosen_expiry", str(orig_expiry or target_expiry))
 
     # 4) Feature bundle + NBBO
     f: Dict[str, Any] = {}
@@ -685,7 +714,42 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # 404 replacement flow (keep side + expiry consistent)
+    # 4b) NBBO-driven replacement (listed but missing NBBO)
+    if REPLACE_IF_NO_NBBO and (f.get("bid") is None or f.get("ask") is None or (f.get("nbbo_http_status") and f.get("nbbo_http_status") != 200)):
+        try:
+            alt = await _find_nbbo_replacement_same_expiry(
+                symbol=alert["symbol"], side=side, desired_strike=desired_strike,
+                expiry_iso=chosen_expiry, min_vol=scan_min_vol, min_oi=scan_min_oi,
+            )
+        except Exception:
+            alt = None
+        if alt and alt.get("ticker") and alt["ticker"] != option_ticker:
+            old_tk = option_ticker
+            option_ticker = alt["ticker"]
+            desired_strike = float(alt.get("strike") or desired_strike)
+            occ = _occ_meta(option_ticker)
+            chosen_expiry = (occ["expiry"] if occ else str(alt.get("expiry") or chosen_expiry))
+            try:
+                extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
+                for k, v in (extra2 or {}).items():
+                    if v is not None:
+                        f[k] = v
+                for k, v in (await _pull_nbbo_direct(option_ticker)).items():
+                    if v is not None:
+                        f[k] = v
+                if f.get("bid") is None or f.get("ask") is None:
+                    nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker)
+                    for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
+                        if nbbo_dbg2.get(k) is not None:
+                            f[k] = nbbo_dbg2[k]
+                    f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
+                    f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
+                replacement_note = {"old": old_tk, "new": option_ticker, "why": "missing NBBO on initial pick"}
+                logger.info("Replaced due to missing NBBO: %s → %s", old_tk, option_ticker)
+            except Exception as e:
+                logger.warning("NBBO replacement refresh failed: %r", e)
+
+    # 5) 404 replacement if contract truly not listed
     if f.get("nbbo_http_status") == 404 and POLYGON_API_KEY:
         exist = await _poly_reference_contracts_exists(alert["symbol"], chosen_expiry, option_ticker)
         logger.info("NBBO 404 verification: listed=%s snapshot_ok=%s reason=%s",
@@ -701,7 +765,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 option_ticker = repl["ticker"]
                 desired_strike = float(repl.get("strike") or desired_strike)
                 try:
-                    # Update expiry to replacement (prefer OCC)
                     occ = _occ_meta(option_ticker)
                     chosen_expiry = (occ["expiry"] if occ else str(repl.get("expiry") or chosen_expiry))
                     extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
@@ -718,13 +781,16 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                                 f[k] = nbbo_dbg2[k]
                         f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
                         f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
-                    replacement_note = {"old": old_tk, "new": option_ticker, "why": "contract not listed in Polygon reference/snapshot"}
+                    replacement_note = {
+                        "old": old_tk, "new": option_ticker,
+                        "why": "contract not listed in Polygon reference/snapshot",
+                    }
                     logger.info("Replaced contract due to 404: %s → %s", old_tk, option_ticker)
                 except Exception as e:
                     logger.warning("Replacement contract fetch failed: %r", e)
                     replacement_note = None
 
-    # 5) Optional Telegram pre-LLM (only if scan picked)
+    # 6) Optional Telegram pre-LLM (only if scan picked)
     if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by", "").startswith("chain_scan"):
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -742,7 +808,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception as e:
             logger.exception("[worker] Telegram pre-LLM chainscan error: %s", e)
 
-    # 6) LLM
+    # 7) LLM
     pf_ok, pf_checks = preflight_ok(f)
     try:
         llm = await analyze_with_openai(alert, f)
@@ -751,7 +817,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         llm = {"decision": "wait", "confidence": 0.0, "reason": f"LLM error: {e}", "checklist": {}, "ev_estimate": {}}
     decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
 
-    score: Optional[float]; rating: Optional[str]
     try:
         score = compute_decision_score(f, llm)
         rating = map_score_to_rating(score, llm.get("decision"))
@@ -761,22 +826,31 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if force_buy:
         decision_final = "buy"
 
-    # 7) Telegram final
+    # Diff note for Telegram (make strike/expiry override explicit)
+    diff_bits = []
+    if isinstance(orig_strike, (int, float)) and isinstance(desired_strike, (int, float)) and float(orig_strike) != float(desired_strike):
+        diff_bits.append(f"🎯 Selected strike {desired_strike} (alert was {orig_strike})")
+    if orig_expiry and chosen_expiry and str(orig_expiry) != str(chosen_expiry):
+        diff_bits.append(f"🗓 Selected expiry {chosen_expiry} (alert was {orig_expiry})")
+    diff_note = "\n".join(diff_bits)
+
+    # 8) Telegram final
     try:
         tg_text = compose_telegram_text(
             alert={**alert, "strike": desired_strike, "expiry": chosen_expiry},
-            option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating
+            option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating,
+            diff_note=diff_note,
         )
         if selection_debug.get("selected_by","").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
         if replacement_note is not None:
-            tg_text += f"\n⚠️ Original contract {replacement_note['old']} not listed; switched to {replacement_note['new']}."
+            tg_text += f"\n⚠️ Replacement: {replacement_note['old']} → {replacement_note['new']} ({replacement_note['why']})."
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             await send_telegram(tg_text)
     except Exception as e:
         logger.exception("[worker] Telegram error: %s", e)
 
-    # 8) IBKR (optional)
+    # 9) IBKR (optional)
     ib_attempted = False
     ib_result_obj: Optional[Any] = None
     try:
@@ -801,7 +875,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         ib_result_obj = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    # 9) Decision log
+    # 10) Decision log
     _DECISIONS_LOG.append({
         "timestamp_local": market_now(),
         "symbol": alert["symbol"],
@@ -836,6 +910,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         },
         "ibkr": {"enabled": ib_enabled, "attempted": ib_attempted, "result": _ibkr_result_to_dict(ib_result_obj) if ib_result_obj is not None else None},
         "selection_debug": selection_debug,
+        "alert_original": {"strike": orig_strike, "expiry": orig_expiry},
+        "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
+        "replacement": replacement_note,
     })
 
 # =========================
