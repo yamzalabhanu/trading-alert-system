@@ -5,7 +5,7 @@ import logging
 from typing import Dict, Any
 import httpx
 
-from config import CDT_TZ  # used indirectly via engine_logic.market_now
+from config import CDT_TZ  # indirectly used via engine_logic.market_now
 
 # ----- logger -----
 logger = logging.getLogger("trading_engine")
@@ -38,9 +38,6 @@ def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
 
 # ----- lifecycle -----
 async def startup():
-    """
-    Initialize HTTP client and spawn workers.
-    """
     global HTTP, WORKER_COUNT
     HTTP = httpx.AsyncClient(
         http2=True,
@@ -53,9 +50,6 @@ async def startup():
     logger.info("startup complete; HTTP ready; workers=%d", WORKER_COUNT)
 
 async def shutdown():
-    """
-    Gracefully close HTTP client.
-    """
     global HTTP
     if HTTP:
         await HTTP.aclose()
@@ -65,13 +59,12 @@ async def shutdown():
 # ----- worker loop -----
 async def _worker():
     logger.info("worker task started")
-    # Import inside function to avoid import-cycle at module import time
     from engine_logic import process_tradingview_job
     while True:
         job = await WORK_Q.get()
         try:
             logger.info("processing alert job: %s", (job.get("alert_text") or "")[:200])
-            await process_tradingview_job(job)  # engine_logic pulls HTTP via get_http_client()
+            await process_tradingview_job(job)
             logger.info("job processed")
         except Exception as e:
             logger.exception("[worker] error: %r", e)
