@@ -42,6 +42,32 @@ from market_ops import (
 
 logger = logging.getLogger("trading_engine")
 
+# ---------- helpers for OCC parsing / formatting ----------
+_OCC_FULL_RE = re.compile(r":([A-Z0-9\.\-]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8,9})$")
+
+def _strike_from_occ(ticker: Optional[str]) -> Optional[float]:
+    """
+    Extract strike in dollars from an OCC ticker like O:JPM250912C00305000 -> 305.0
+    """
+    if not ticker:
+        return None
+    m = _OCC_FULL_RE.search(ticker)
+    if not m:
+        return None
+    raw = m.group(6)
+    try:
+        return int(raw) / 1000.0
+    except Exception:
+        return None
+
+def _fmt_num(v: Optional[float], digits: int = 2, none_char: str = "?") -> str:
+    if v is None:
+        return none_char
+    try:
+        return f"{float(v):.{digits}f}"
+    except Exception:
+        return str(v)
+
 # =========================
 # Core processing (called by runtime worker)
 # =========================
@@ -124,8 +150,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     if candidate:
         option_ticker = candidate["ticker"]
-        if isinstance(candidate.get("strike"), (int, float)):
-            desired_strike = float(candidate["strike"])
+        strike_from_pool = candidate.get("strike")
+        if not isinstance(strike_from_pool, (int, float)):
+            strike_from_pool = _strike_from_occ(option_ticker)
+        if isinstance(strike_from_pool, (int, float)):
+            desired_strike = float(strike_from_pool)
         occ = _occ_meta(option_ticker)
         chosen_expiry = occ["expiry"] if occ and occ.get("expiry") else str(candidate.get("expiry") or orig_expiry or target_expiry)
         selection_debug = {"selected_by": "chain_scan", "selected_ticker": option_ticker,
@@ -133,7 +162,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
         fallback_exp = str(orig_expiry or target_expiry)
-        # build fallback +/− strikes, then pick correct side
         option_ticker = pm["contract_call"] if side == "CALL" else pm["contract_put"]
         desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
         chosen_expiry = fallback_exp
@@ -245,7 +273,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         if alt and alt.get("ticker") and alt["ticker"] != option_ticker:
             old_tk = option_ticker
             option_ticker = alt["ticker"]
-            desired_strike = float(alt.get("strike") or desired_strike)
+            desired_strike = float(alt.get("strike") or _strike_from_occ(option_ticker) or desired_strike)
             occ = _occ_meta(option_ticker)
             chosen_expiry = (occ["expiry"] if occ else str(alt.get("expiry") or chosen_expiry))
             try:
@@ -282,7 +310,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             if repl:
                 old_tk = option_ticker
                 option_ticker = repl["ticker"]
-                desired_strike = float(repl.get("strike") or desired_strike)
+                desired_strike = float(repl.get("strike") or _strike_from_occ(option_ticker) or desired_strike)
                 try:
                     occ = _occ_meta(option_ticker)
                     chosen_expiry = (occ["expiry"] if occ else str(repl.get("expiry") or chosen_expiry))
@@ -343,15 +371,45 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         if top5:
             # choose closest to target_strike, pref NBBO, then tighter spread
             def rank(it: Dict[str, Any]):
-                sd = abs(float(it.get("strike") or target_strike) - float(target_strike))
+                strike_val = it.get("strike")
+                if not isinstance(strike_val, (int, float)):
+                    strike_val = _strike_from_occ(it.get("ticker"))
+                sd = abs(float(strike_val or target_strike) - float(target_strike))
                 nbbo_missing = 0 if (it.get("bid") is not None and it.get("ask") is not None) else 1
                 sp = float(it.get("spread_pct") or 1e9)
                 return (sd, nbbo_missing, sp, -(it.get("oi") or 0), -(it.get("vol") or 0))
+
             reco = sorted(top5, key=rank)[0]
+
+            # Try to enrich NBBO for the reco to avoid None/None print
+            try:
+                if reco.get("bid") is None or reco.get("ask") is None:
+                    nbbo_r = await ensure_nbbo(client, reco["ticker"], tries=6, delay=0.25)
+                    if nbbo_r:
+                        for k, v in nbbo_r.items():
+                            if v is not None:
+                                reco[k] = v
+                if reco.get("bid") is None or reco.get("ask") is None:
+                    probe_r = await _pull_nbbo_direct(reco["ticker"])
+                    if probe_r:
+                        for k, v in probe_r.items():
+                            if v is not None:
+                                reco[k] = v
+            except Exception:
+                pass
+
+            reco_strike = reco.get("strike")
+            if not isinstance(reco_strike, (int, float)):
+                reco_strike = _strike_from_occ(reco.get("ticker"))
+
             reco_line = (
-                f"📌 Recommended (±5% from UL): {reco.get('expiry')} | {reco.get('ticker')} | "
-                f"strike {reco.get('strike')} | OI {reco.get('oi')} Vol {reco.get('vol')} | "
-                f"NBBO {reco.get('bid')}/{reco.get('ask')} mid={reco.get('mid')} | spread%={reco.get('spread_pct')}"
+                "📌 Recommended (±5% from UL): "
+                f"{reco.get('expiry') or chosen_expiry} | {reco.get('ticker')} | "
+                f"strike { _fmt_num(reco_strike, 2) } | "
+                f"OI {reco.get('oi') or 0} Vol {reco.get('vol') or 0} | "
+                f"NBBO { _fmt_num(reco.get('bid'), 2) }/{ _fmt_num(reco.get('ask'), 2) } "
+                f"mid={ _fmt_num(reco.get('mid'), 3) } | "
+                f"spread%={ _fmt_num(reco.get('spread_pct'), 3) }"
             )
         else:
             reco_line = (
@@ -474,7 +532,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "prev_day_high": f.get("prev_day_high"), "prev_day_low": f.get("prev_day_low"),
             "premarket_high": f.get("premarket_high"), "premarket_low": f.get("premarket_low"),
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
-            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pml"),
+            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
             "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
         },
