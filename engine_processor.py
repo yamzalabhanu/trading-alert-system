@@ -3,7 +3,7 @@ import os
 import re
 import socket
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -22,10 +22,10 @@ from engine_common import (
     preflight_ok, compose_telegram_text,
 )
 from polygon_ops import (
-    _http_json, _http_get_any,
-    _pull_nbbo_direct, _probe_nbbo_verbose,
+    _http_json, _http_get_any, _pull_nbbo_direct, _probe_nbbo_verbose,
     _poly_reference_contracts_exists, _rescan_best_replacement, _find_nbbo_replacement_same_expiry,
 )
+
 from ibkr_client import place_recommended_option_order
 from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -42,88 +42,6 @@ from market_ops import (
 
 logger = logging.getLogger("trading_engine")
 
-# --------------------------
-# Helpers: two-weeks Friday
-# --------------------------
-def _next_friday(d): return d + timedelta(days=(4 - d.weekday()) % 7)
-def _same_week_friday(d): return (d - timedelta(days=d.weekday())) + timedelta(days=4)
-
-# --------------------------
-# Recommend ±5% contract from Top-5 (same expiry, correct side)
-# --------------------------
-async def _recommend_pm_from_top5(
-    client: httpx.AsyncClient,
-    symbol: str,
-    side: str,
-    ul_px: float,
-    expiry_iso: str,
-    min_vol: int,
-    min_oi: int,
-) -> Optional[Dict[str, Any]]:
-    """
-    Pick the contract closest to +5% (CALL) or -5% (PUT) strike from the Top-5 by (OI+Vol)
-    among candidates in the same expiry and correct side.
-    """
-    try:
-        # Pull a reasonably wide pool then filter down
-        try:
-            pool = await scan_top_candidates_for_alert(
-                client,
-                symbol,
-                {"side": side, "symbol": symbol, "strike": None, "expiry": expiry_iso},
-                min_vol=min_vol, min_oi=min_oi,
-                top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
-                top_overall=24,
-                restrict_expiries=[expiry_iso],  # type: ignore
-            ) or []
-        except TypeError:
-            pool_any = await scan_top_candidates_for_alert(
-                client,
-                symbol,
-                {"side": side, "symbol": symbol, "strike": None, "expiry": expiry_iso},
-                min_vol=min_vol, min_oi=min_oi,
-                top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
-                top_overall=28,
-            ) or []
-            pool = [it for it in pool_any if str(it.get("expiry")) == str(expiry_iso)]
-    except Exception:
-        pool = []
-
-    # Correct side only
-    pool = [it for it in pool if _ticker_matches_side(it.get("ticker"), side)]
-
-    # Rank by liquidity (OI+Vol), take Top-5
-    def _liq(it: Dict[str, Any]) -> int:
-        return int(it.get("oi") or 0) + int(it.get("vol") or 0)
-
-    pool.sort(key=lambda it: _liq(it), reverse=True)
-    top5 = pool[:5]
-
-    if not top5:
-        return None
-
-    # Target strike = ±5%
-    target = round(float(ul_px) * (1.05 if side == "CALL" else 0.95), 2)
-
-    # Choose nearest strike among Top-5 (break ties by better spread, then higher OI+Vol)
-    def _dist(it: Dict[str, Any]) -> float:
-        try:
-            return abs(float(it.get("strike")) - target)
-        except Exception:
-            return 1e9
-
-    def _spread(it: Dict[str, Any]) -> float:
-        try:
-            return float(it.get("spread_pct") or 1e9)
-        except Exception:
-            return 1e9
-
-    def _rank_choice(it: Dict[str, Any]):
-        return (_dist(it), _spread(it), -_liq(it))
-
-    top5.sort(key=_rank_choice)
-    return top5[0]
-
 # =========================
 # Core processing (called by runtime worker)
 # =========================
@@ -136,7 +54,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     selection_debug: Dict[str, Any] = {}
     replacement_note: Optional[Dict[str, Any]] = None
     option_ticker: Optional[str] = None
-    recommended_line: str = ""
 
     # 1) Parse
     try:
@@ -157,11 +74,15 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     orig_strike = alert.get("strike")
     orig_expiry = alert.get("expiry")
 
-    # 2) Expiry defaulting (two-weeks Friday; avoid same-week overlap)
+    # 2) Expiry defaulting
     ul_px = float(alert["underlying_price_from_alert"])
     today_utc = datetime.now(timezone.utc).date()
+
+    def _next_friday(d): return d + timedelta(days=(4 - d.weekday()) % 7)
+    def same_week_friday(d): return (d - timedelta(days=d.weekday())) + timedelta(days=4)
+
     target_expiry_date = _next_friday(today_utc) + timedelta(days=7)
-    swf = _same_week_friday(today_utc)
+    swf = same_week_friday(today_utc)
     if (target_expiry_date - timedelta(days=target_expiry_date.weekday())) == (swf - timedelta(days=swf.weekday())):
         target_expiry_date = swf + timedelta(days=7)
     target_expiry = target_expiry_date.isoformat()
@@ -196,7 +117,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 {"side": side, "symbol": symbol, "strike": alert.get("strike"), "expiry": alert.get("expiry")},
                 min_vol=scan_min_vol, min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
-                top_overall=8,
+                top_overall=6,
             ) or []
         except Exception:
             pool = []
@@ -222,23 +143,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     chosen_expiry = selection_debug.get("chosen_expiry", str(orig_expiry or target_expiry))
 
-    # 3b) Compute a recommendation line (±5% from UL) from Top-5 OI+Vol in same expiry/side
-    try:
-        reco = await _recommend_pm_from_top5(
-            client=client, symbol=symbol, side=side, ul_px=ul_px,
-            expiry_iso=chosen_expiry, min_vol=scan_min_vol, min_oi=scan_min_oi
-        )
-    except Exception:
-        reco = None
-
-    if reco:
-        recommended_line = (
-            f"📌 Recommended (±5% from UL): {reco.get('expiry')} | {reco.get('ticker')} | "
-            f"strike {reco.get('strike')} | OI {reco.get('oi')} Vol {reco.get('vol')} | "
-            f"NBBO {reco.get('bid')}/{reco.get('ask')} mid={reco.get('mid')} | spread%={reco.get('spread_pct')}"
-        )
-
-    # 4) Feature bundle + NBBO (snapshot-first; quotes fallback)
+    # 4) Feature bundle + NBBO
     f: Dict[str, Any] = {}
     try:
         if not POLYGON_API_KEY:
@@ -256,20 +161,18 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # A) rich backfill (OI/Vol/Greeks/IV + last)
-            extra = await poly_option_backfill(client, symbol, option_ticker, datetime.now(timezone.utc).date())
+            extra = await poly_option_backfill(get_http_client(), symbol, option_ticker, datetime.now(timezone.utc).date())
             for k, v in (extra or {}).items():
                 if v is not None:
                     f[k] = v
 
-            # B) snapshot-consistent features (VWAP/regime/headroom/etc.)
-            snap = await polygon_get_option_snapshot_export(client, underlying=symbol, option_ticker=option_ticker)
-            core = await build_features(client, alert={**alert, "strike": desired_strike, "expiry": chosen_expiry}, snapshot=snap)
+            snap = await polygon_get_option_snapshot_export(get_http_client(), underlying=symbol, option_ticker=option_ticker)
+            core = await build_features(get_http_client(), alert={**alert, "strike": desired_strike, "expiry": chosen_expiry}, snapshot=snap)
             for k, v in (core or {}).items():
                 if v is not None or k not in f:
                     f[k] = v
 
-            # C) derive mid/spread if NBBO present
+            # derive mid/spread
             try:
                 bid = f.get("bid"); ask = f.get("ask"); mid = f.get("mid")
                 if bid is not None and ask is not None:
@@ -282,30 +185,28 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # D) try existing ensure_nbbo (if your impl was updated); otherwise harmless
+            # ensure NBBO
             try:
                 if f.get("bid") is None or f.get("ask") is None:
-                    nbbo = await ensure_nbbo(client, option_ticker, tries=8, delay=0.25)
+                    nbbo = await ensure_nbbo(get_http_client(), option_ticker, tries=12, delay=0.35)
                     for k, v in (nbbo or {}).items():
                         if v is not None:
                             f[k] = v
             except Exception:
                 pass
 
-            # E) NEW: snapshot-first, quotes fallback (uses updated polygon_ops)
+            # direct probe (no 'underlying' kw here)
             if f.get("bid") is None or f.get("ask") is None:
-                for k, v in (await _pull_nbbo_direct(option_ticker, underlying=symbol)).items():
+                for k, v in (await _pull_nbbo_direct(option_ticker)).items():
                     if v is not None:
                         f[k] = v
 
-            # F) derive dte if missing
             if f.get("dte") is None:
                 try:
                     f["dte"] = (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days
                 except Exception:
                     pass
 
-            # G) change% vs prev close
             if f.get("quote_change_pct") is None:
                 try:
                     prev_close = f.get("prev_close")
@@ -315,23 +216,18 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 except Exception:
                     pass
 
-            # H) synthetic mark from last (AH convenience)
             if (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("last"), (int, float)):
                 f.setdefault("mid", float(f["last"]))
 
-            # I) Verbose NBBO probe for final debug/status, fill if found
             if f.get("bid") is None or f.get("ask") is None:
-                nbbo_dbg = await _probe_nbbo_verbose(option_ticker, underlying=symbol)
+                nbbo_dbg = await _probe_nbbo_verbose(option_ticker)
                 for k in ("bid", "ask", "mid", "option_spread_pct", "quote_age_sec"):
                     if nbbo_dbg.get(k) is not None:
                         f[k] = nbbo_dbg[k]
-                # Debug statuses
                 f["nbbo_http_status"] = nbbo_dbg.get("nbbo_http_status")
-                f["snapshot_http_status"] = nbbo_dbg.get("snapshot_http_status")
-                f["quotes_http_status"] = nbbo_dbg.get("quotes_http_status")
                 f["nbbo_reason"] = nbbo_dbg.get("nbbo_reason")
+                f["nbbo_body_sample"] = nbbo_dbg.get("nbbo_body_sample")
 
-            # J) soft spread if only have mark/last
             if (f.get("option_spread_pct") is None) and (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("mid"), (int, float)):
                 f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
 
@@ -355,21 +251,20 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             occ = _occ_meta(option_ticker)
             chosen_expiry = (occ["expiry"] if occ else str(alt.get("expiry") or chosen_expiry))
             try:
-                extra2 = await poly_option_backfill(client, symbol, option_ticker, datetime.now(timezone.utc).date())
+                extra2 = await poly_option_backfill(get_http_client(), symbol, option_ticker, datetime.now(timezone.utc).date())
                 for k, v in (extra2 or {}).items():
                     if v is not None:
                         f[k] = v
-                for k, v in (await _pull_nbbo_direct(option_ticker, underlying=symbol)).items():
+                # direct probe again (no 'underlying' kw)
+                for k, v in (await _pull_nbbo_direct(option_ticker)).items():
                     if v is not None:
                         f[k] = v
                 if f.get("bid") is None or f.get("ask") is None:
-                    nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker, underlying=symbol)
+                    nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker)
                     for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
                         if nbbo_dbg2.get(k) is not None:
                             f[k] = nbbo_dbg2[k]
                     f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
-                    f["snapshot_http_status"] = nbbo_dbg2.get("snapshot_http_status")
-                    f["quotes_http_status"] = nbbo_dbg2.get("quotes_http_status")
                     f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
                 replacement_note = {"old": old_tk, "new": option_ticker, "why": "missing NBBO on initial pick"}
                 logger.info("Replaced due to missing NBBO: %s → %s", old_tk, option_ticker)
@@ -394,21 +289,20 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 try:
                     occ = _occ_meta(option_ticker)
                     chosen_expiry = (occ["expiry"] if occ else str(repl.get("expiry") or chosen_expiry))
-                    extra2 = await poly_option_backfill(client, symbol, option_ticker, datetime.now(timezone.utc).date())
+                    extra2 = await poly_option_backfill(get_http_client(), symbol, option_ticker, datetime.now(timezone.utc).date())
                     for k, v in (extra2 or {}).items():
                         if v is not None:
                             f[k] = v
-                    for k, v in (await _pull_nbbo_direct(option_ticker, underlying=symbol)).items():
+                    # direct probe again (no 'underlying' kw)
+                    for k, v in (await _pull_nbbo_direct(option_ticker)).items():
                         if v is not None:
                             f[k] = v
                     if f.get("bid") is None or f.get("ask") is None:
-                        nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker, underlying=symbol)
+                        nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker)
                         for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
                             if nbbo_dbg2.get(k) is not None:
                                 f[k] = nbbo_dbg2[k]
                         f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
-                        f["snapshot_http_status"] = nbbo_dbg2.get("snapshot_http_status")
-                        f["quotes_http_status"] = nbbo_dbg2.get("quotes_http_status")
                         f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
                     replacement_note = {
                         "old": old_tk, "new": option_ticker,
@@ -431,10 +325,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     f"Spread%={f.get('option_spread_pct')}  QuoteAge(s)={f.get('quote_age_sec')}\n"
                     f"OI={f.get('oi')}  Vol={f.get('vol')}  IV={f.get('iv')}  Δ={f.get('delta')} Γ={f.get('gamma')}\n"
                     f"DTE={f.get('dte')}  Regime={f.get('regime_flag')}  (pre-LLM)\n"
-                    f"NBBO dbg: snap={f.get('snapshot_http_status')} quotes={f.get('quotes_http_status')} reason={f.get('nbbo_reason')}\n"
+                    f"NBBO dbg: status={f.get('nbbo_http_status')} reason={f.get('nbbo_reason')}\n"
                 )
-                if recommended_line:
-                    pre_text = recommended_line + "\n" + pre_text
                 await send_telegram(pre_text)
         except Exception as e:
             logger.exception("[worker] Telegram pre-LLM chainscan error: %s", e)
@@ -472,8 +364,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating,
             diff_note=diff_note,
         )
-        if recommended_line:
-            tg_text = recommended_line + "\n" + tg_text
         if selection_debug.get("selected_by","").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
         if replacement_note is not None:
@@ -533,12 +423,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "prev_day_high": f.get("prev_day_high"), "prev_day_low": f.get("prev_day_low"),
             "premarket_high": f.get("premarket_high"), "premarket_low": f.get("premarket_low"),
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
-            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
+            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pml"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
-            "nbbo_http_status": f.get("nbbo_http_status"),
-            "snapshot_http_status": f.get("snapshot_http_status"),
-            "quotes_http_status": f.get("quotes_http_status"),
-            "nbbo_reason": f.get("nbbo_reason"),
+            "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
         },
         "pm_contracts": {
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
@@ -549,7 +436,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "alert_original": {"strike": orig_strike, "expiry": orig_expiry},
         "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
         "replacement": replacement_note,
-        "recommended": reco if reco else None,
     })
 
 # =========================
@@ -582,8 +468,8 @@ async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
     )
     out["last_quote"] = await _http_json(
         client,
-        f"https://api.polygon.io/v3/quotes/{enc}",
-        {"apiKey": POLYGON_API_KEY, "limit": 1, "order": "desc", "sort": "timestamp"},
+        f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+        {"apiKey": POLYGON_API_KEY},
         timeout=6.0
     )
     yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
