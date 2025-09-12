@@ -3,7 +3,7 @@ import os
 import re
 import socket
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -41,6 +41,184 @@ from market_ops import (
 )
 
 logger = logging.getLogger("trading_engine")
+
+
+# =========================
+# Helpers: indicators
+# =========================
+def _sma(vals: List[float], n: int) -> Optional[float]:
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    if len(vals) < n: return None
+    return sum(vals[-n:]) / float(n)
+
+def _ema(vals: List[float], n: int) -> Optional[float]:
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    if len(vals) < n: return None
+    k = 2.0 / (n + 1)
+    ema = vals[0]
+    for v in vals[1:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+def _rsi(vals: List[float], n: int = 14) -> Optional[float]:
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    if len(vals) <= n: return None
+    gains = []; losses = []
+    for i in range(1, len(vals)):
+        chg = vals[i] - vals[i-1]
+        gains.append(max(0.0, chg))
+        losses.append(max(0.0, -chg))
+    avg_gain = _sma(gains, n); avg_loss = _sma(losses, n)
+    if avg_gain is None or avg_loss is None: return None
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def _macd(vals: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, Optional[float]]:
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    if len(vals) < slow + signal: return {"macd": None, "signal": None, "hist": None}
+    def ema_n(vs, n):
+        k = 2.0 / (n + 1); e = vs[0]
+        for x in vs[1:]: e = x * k + e * (1 - k)
+        return e
+    # simple rolling emas (approximate)
+    ema_fast = ema_n(vals[-(slow+signal+5):], fast)
+    ema_slow = ema_n(vals[-(slow+signal+5):], slow)
+    macd_line = ema_fast - ema_slow
+    # signal on a short tail built from last macd estimates (approx)
+    macd_tail = []
+    tail = vals[-(slow+signal+5):]
+    for i in range(signal+5):
+        seg = tail[:len(tail)-i] if len(tail)-i >= slow else tail
+        if len(seg) < slow: break
+        ema_f = ema_n(seg, fast); ema_s = ema_n(seg, slow)
+        macd_tail.append(ema_f - ema_s)
+    macd_tail = macd_tail[::-1] or [macd_line]
+    signal_line = ema_n(macd_tail, signal) if len(macd_tail) >= signal else macd_line
+    return {"macd": macd_line, "signal": signal_line, "hist": macd_line - signal_line}
+
+
+# =========================
+# Enrichment fetch for LLM
+# =========================
+async def _build_llm_enrichment(symbol: str) -> Dict[str, Any]:
+    """
+    Pulls Polygon data beyond options NBBO, to enrich LLM decisions.
+    - Reference (ticker info)
+    - Corporate actions (latest dividend/split)
+    - Stock snapshot
+    - 1-minute aggregates (recent window)
+    - 1-second aggregates (short window)
+    - Technical indicators (SMA20, EMA20, RSI14, MACD)
+    Returns dict; safe to attach to features as f['llm_enrichment'].
+    """
+    if not POLYGON_API_KEY:
+        return {"note": "polygon api key missing"}
+
+    client = get_http_client()
+    if client is None:
+        return {"note": "http client not ready"}
+
+    out: Dict[str, Any] = {}
+    try:
+        # --- Reference data ---
+        ref = await _http_get_any(
+            f"https://api.polygon.io/v3/reference/tickers",
+            params={"ticker": symbol, "active": "true", "limit": 1, "apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        if ref.get("status") == 200 and isinstance(ref.get("body"), dict):
+            results = (ref["body"].get("results") or [])
+            out["reference"] = results[0] if results else {}
+        else:
+            out["reference"] = {"status": ref.get("status"), "hint": "reference list"}
+
+        # --- Corporate actions ---
+        div = await _http_get_any(
+            "https://api.polygon.io/v3/reference/dividends",
+            params={"ticker": symbol, "limit": 1, "apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        spl = await _http_get_any(
+            "https://api.polygon.io/v3/reference/splits",
+            params={"ticker": symbol, "limit": 1, "apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        out["corporate_actions"] = {
+            "dividend_latest": (div.get("body") or {}).get("results", [{}])[0] if isinstance(div.get("body"), dict) else {},
+            "split_latest": (spl.get("body") or {}).get("results", [{}])[0] if isinstance(spl.get("body"), dict) else {},
+        }
+
+        # --- Stock snapshot (v3; fallback deliver status only) ---
+        snap = await _http_get_any(
+            f"https://api.polygon.io/v3/snapshot/stocks/{symbol}",
+            params={"apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        out["stock_snapshot"] = snap.get("body") if isinstance(snap.get("body"), dict) else {"status": snap.get("status")}
+
+        # --- Minute aggregates (last ~120 minutes) ---
+        now = datetime.now(timezone.utc)
+        frm = (now - timedelta(minutes=180)).isoformat()
+        to  = now.isoformat()
+        aggs_1m = await _http_get_any(
+            f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/min/{frm}/{to}",
+            params={"adjusted": "true", "sort": "asc", "limit": 2000, "apiKey": POLYGON_API_KEY},
+            timeout=8.0
+        )
+        aggs_1m_body = aggs_1m.get("body") if isinstance(aggs_1m.get("body"), dict) else {}
+        series = aggs_1m_body.get("results") or []
+        closes = [float(x.get("c")) for x in series if isinstance(x, dict) and isinstance(x.get("c"), (int, float))]
+
+        # --- Second aggregates (last ~120s) ---
+        frm2 = (now - timedelta(seconds=180)).isoformat()
+        aggs_1s = await _http_get_any(
+            f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/second/{frm2}/{to}",
+            params={"adjusted": "true", "sort": "asc", "limit": 1200, "apiKey": POLYGON_API_KEY},
+            timeout=8.0
+        )
+
+        # --- Technical indicators on minute closes ---
+        sma20 = _sma(closes, 20); ema20 = _ema(closes, 20); rsi14 = _rsi(closes, 14)
+        macd = _macd(closes, 12, 26, 9)
+        out["technical_indicators"] = {
+            "sma20": sma20, "ema20": ema20, "rsi14": rsi14,
+            "macd": macd.get("macd"), "macd_signal": macd.get("signal"), "macd_hist": macd.get("hist"),
+        }
+
+        # simple 5m momentum (% change last close vs mean of prior 5 bars)
+        try:
+            if len(closes) >= 10:
+                last = closes[-1]
+                base = sum(closes[-10:-5]) / 5.0
+                out["momentum_5m_pct"] = round((last - base) / base * 100.0, 3) if base else None
+        except Exception:
+            out["momentum_5m_pct"] = None
+
+        out["aggs_1m_recent"] = {
+            "status": aggs_1m.get("status"),
+            "count": len(series),
+            "last_close": closes[-1] if closes else None,
+        }
+        out["aggs_1s_recent"] = {
+            "status": aggs_1s.get("status"),
+            "count": len(((aggs_1s.get("body") or {}).get("results") or []) if isinstance(aggs_1s.get("body"), dict) else []),
+        }
+
+        # Lightweight market sentiment
+        rsi = out["technical_indicators"]["rsi14"]
+        mom = out.get("momentum_5m_pct")
+        sentiment = "neutral"
+        if rsi is not None and mom is not None:
+            if rsi >= 60 and mom > 0.15: sentiment = "bullish"
+            elif rsi <= 40 and mom < -0.15: sentiment = "bearish"
+        out["market_sentiment"] = sentiment
+
+    except Exception as e:
+        out.setdefault("error", f"enrichment_failed: {type(e).__name__}: {e}")
+
+    return out
+
 
 # =========================
 # Core processing (called by runtime worker)
@@ -143,7 +321,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     chosen_expiry = selection_debug.get("chosen_expiry", str(orig_expiry or target_expiry))
 
-    # 4) Feature bundle + NBBO
+    # 4) Feature bundle + NBBO + ENRICHMENT
     f: Dict[str, Any] = {}
     try:
         if not POLYGON_API_KEY:
@@ -160,7 +338,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 "vwap": None, "vwap_dist": None,
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
+            f["llm_enrichment"] = {"note": "polygon api key missing"}
         else:
+            # Option-focused backfills
             extra = await poly_option_backfill(get_http_client(), symbol, option_ticker, datetime.now(timezone.utc).date())
             for k, v in (extra or {}).items():
                 if v is not None:
@@ -195,7 +375,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # direct probe (no 'underlying' kw here)
             if f.get("bid") is None or f.get("ask") is None:
                 for k, v in (await _pull_nbbo_direct(option_ticker)).items():
                     if v is not None:
@@ -231,9 +410,16 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             if (f.get("option_spread_pct") is None) and (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("mid"), (int, float)):
                 f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
 
+            # ===== NEW: Enrichment for LLM =====
+            enrichment = await _build_llm_enrichment(symbol)
+            f["llm_enrichment"] = enrichment
+            # expose a compact sentiment flag directly for the LLM
+            f["market_sentiment"] = enrichment.get("market_sentiment")
+
     except Exception as e:
         logger.exception("[worker] Polygon/features error: %s", e)
-        f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
+        f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days,
+                  "llm_enrichment": {"error": f"features_failed: {type(e).__name__}: {e}"}}
 
     # 4b) NBBO-driven replacement (listed but missing NBBO)
     if REPLACE_IF_NO_NBBO and (f.get("bid") is None or f.get("ask") is None or (f.get("nbbo_http_status") and f.get("nbbo_http_status") != 200)):
@@ -255,7 +441,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 for k, v in (extra2 or {}).items():
                     if v is not None:
                         f[k] = v
-                # direct probe again (no 'underlying' kw)
                 for k, v in (await _pull_nbbo_direct(option_ticker)).items():
                     if v is not None:
                         f[k] = v
@@ -293,7 +478,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     for k, v in (extra2 or {}).items():
                         if v is not None:
                             f[k] = v
-                    # direct probe again (no 'underlying' kw)
                     for k, v in (await _pull_nbbo_direct(option_ticker)).items():
                         if v is not None:
                             f[k] = v
@@ -334,6 +518,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     # 7) LLM
     pf_ok, pf_checks = preflight_ok(f)
     try:
+        # NOTE: enrichment is now inside f["llm_enrichment"] and f["market_sentiment"]
         llm = await analyze_with_openai(alert, f)
         consume_llm()
     except Exception as e:
@@ -349,13 +534,22 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if force_buy:
         decision_final = "buy"
 
-    # Diff note (strike/expiry changes)
+    # Diff note (strike/expiry changes) + enrichment summary for visibility
     diff_bits = []
     if isinstance(orig_strike, (int, float)) and isinstance(desired_strike, (int, float)) and float(orig_strike) != float(desired_strike):
         diff_bits.append(f"🎯 Selected strike {desired_strike} (alert was {orig_strike})")
     if orig_expiry and chosen_expiry and str(orig_expiry) != str(chosen_expiry):
         diff_bits.append(f"🗓 Selected expiry {chosen_expiry} (alert was {orig_expiry})")
-    diff_note = "\n".join(diff_bits)
+
+    enr = f.get("llm_enrichment") or {}
+    ti = (enr.get("technical_indicators") or {})
+    rsi14 = ti.get("rsi14"); sma20 = ti.get("sma20"); ema20 = ti.get("ema20")
+    mom5 = enr.get("momentum_5m_pct"); sent = enr.get("market_sentiment")
+    enr_line = f"📈 RSI14={round(rsi14,2) if isinstance(rsi14,(int,float)) else rsi14}  SMA20≈{round(sma20,2) if isinstance(sma20,(int,float)) else sma20}  EMA20≈{round(ema20,2) if isinstance(ema20,(int,float)) else ema20}  5mΔ%={mom5}  Sentiment={sent}" if ti else ""
+
+    diff_note = "\n".join([b for b in diff_bits if b])
+    if enr_line:
+        diff_note = (diff_note + ("\n" if diff_note else "") + enr_line).strip()
 
     # 8) Telegram final
     try:
@@ -423,9 +617,12 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "prev_day_high": f.get("prev_day_high"), "prev_day_low": f.get("prev_day_low"),
             "premarket_high": f.get("premarket_high"), "premarket_low": f.get("premarket_low"),
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
-            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pml"),
+            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
             "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
+            # expose enrichment & sentiment inside features for audit
+            "llm_enrichment": f.get("llm_enrichment"),
+            "market_sentiment": f.get("market_sentiment"),
         },
         "pm_contracts": {
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
@@ -437,6 +634,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
         "replacement": replacement_note,
     })
+
 
 # =========================
 # Diagnostics
