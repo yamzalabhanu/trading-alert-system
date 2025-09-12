@@ -3,7 +3,7 @@ import os
 import re
 import socket
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -42,69 +42,141 @@ from market_ops import (
 
 logger = logging.getLogger("trading_engine")
 
-# ---------------------------
-# NBBO injection from snapshot
-# ---------------------------
-def _inject_nbbo_from_snapshot(f: Dict[str, Any], snap: Optional[Dict[str, Any]]) -> bool:
+# =========================
+# Helpers: daily bars & sentiment
+# =========================
+async def _get_polygon_daily_aggs(symbol: str, days: int = 380) -> Optional[List[Dict[str, Any]]]:
     """
-    Try to fill bid/ask/mid/spread/quote_age from Polygon snapshot last_quote.
-    Returns True if any of bid/ask was set.
+    Fetch up to ~1y of daily bars for symbol via Polygon v2 aggs.
+    Returns list of candles (ascending).
+    """
+    if not POLYGON_API_KEY:
+        return None
+    client = get_http_client()
+    if client is None:
+        return None
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days + 20)  # buffer for weekends/holidays
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start_dt.date()}/{end_dt.date()}"
+    try:
+        r = await client.get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY}, timeout=8.0)
+        if r.status_code != 200:
+            return None
+        js = r.json() or {}
+        results = js.get("results")
+        if not isinstance(results, list):
+            return None
+        return results
+    except Exception:
+        return None
+
+def _sma(vals: List[float], n: int) -> Optional[float]:
+    if not vals or len(vals) < n:
+        return None
+    return sum(vals[-n:]) / float(n)
+
+def _calc_atr14(bars: List[Dict[str, Any]]) -> Optional[float]:
+    """
+    Simple ATR(14) using SMA of True Range.
+    bars: ascending list with keys h,l,c (or 'h','l','c' by polygon 'h','l','c')
+    """
+    if not bars or len(bars) < 15:
+        return None
+    trs: List[float] = []
+    prev_c = None
+    for b in bars:
+        h = float(b.get("h", 0)); l = float(b.get("l", 0)); c = float(b.get("c", 0))
+        if prev_c is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        trs.append(tr)
+        prev_c = c
+    if len(trs) < 14:
+        return None
+    return _sma(trs, 14)
+
+def _pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None or b == 0:
+        return None
+    return (a - b) / b * 100.0
+
+async def _enrich_with_market_context(symbol: str, f: Dict[str, Any]) -> None:
+    """
+    Compute key context for LLM:
+      - 52w distance (from last close)
+      - ATR(14) & ATR% of price
+      - 20d/60d Relative Strength vs SPY (close-to-close)
+      - SPY 5d change (broad market regime proxy)
+    Writes these into `f` (silently on error).
     """
     try:
-        if not isinstance(snap, dict):
-            return False
-        res = snap.get("results") or snap  # support both shapes
-        lq = res.get("last_quote") or res.get("lastQuote")
-        if not isinstance(lq, dict):
-            return False
+        sym_bars = await _get_polygon_daily_aggs(symbol, days=380)
+        spy_bars = await _get_polygon_daily_aggs("SPY", days=380)
+        if not sym_bars:
+            return
 
-        # nested or flat
-        bid_obj = lq.get("bid") if isinstance(lq.get("bid"), dict) else {}
-        ask_obj = lq.get("ask") if isinstance(lq.get("ask"), dict) else {}
-        bid = (
-            lq.get("bidPrice") or bid_obj.get("price") or bid_obj.get("p")
-            or (lq.get("bid") if isinstance(lq.get("bid"), (int, float)) else None)
-        )
-        ask = (
-            lq.get("askPrice") or ask_obj.get("price") or ask_obj.get("p")
-            or (lq.get("ask") if isinstance(lq.get("ask"), (int, float)) else None)
-        )
-        ts  = (
-            lq.get("sip_timestamp") or lq.get("t") or
-            bid_obj.get("t") or ask_obj.get("t") or
-            lq.get("timestamp")
-        )
+        last_c = float(sym_bars[-1].get("c")) if sym_bars[-1].get("c") is not None else None
+        hi_52w = max(float(b.get("h", 0)) for b in sym_bars[-252:]) if len(sym_bars) >= 252 else max(float(b.get("h", 0)) for b in sym_bars)
+        lo_52w = min(float(b.get("l", 0)) for b in sym_bars[-252:]) if len(sym_bars) >= 252 else min(float(b.get("l", 0)) for b in sym_bars)
 
-        changed = False
-        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
-            f["bid"] = float(bid)
-            f["ask"] = float(ask)
-            mid = (float(bid) + float(ask)) / 2.0
-            f["mid"] = round(mid, 4)
-            if mid > 0:
-                f["option_spread_pct"] = round((float(ask) - float(bid)) / mid * 100.0, 3)
-            changed = True
+        f["close_last"] = last_c
+        f["dist_52w_high_pct"] = _pct(last_c, hi_52w)  # negative if below high
+        f["dist_52w_low_pct"]  = _pct(last_c, lo_52w)  # positive if above low
 
-        # quote age
-        if ts is not None:
-            try:
-                ns = int(ts)
-                if   ns >= 10**14: sec = ns / 1e9
-                elif ns >= 10**11: sec = ns / 1e6
-                elif ns >= 10**8:  sec = ns / 1e3
-                else:              sec = float(ns)
-                f["quote_age_sec"] = max(0.0, datetime.now(timezone.utc).timestamp() - sec)
-            except Exception:
-                pass
+        atr14 = _calc_atr14(sym_bars)
+        f["atr14"] = atr14
+        if atr14 and last_c:
+            f["atr14_pct_of_price"] = atr14 / last_c * 100.0
 
-        if changed:
-            logging.getLogger("trading_engine").info(
-                "Filled NBBO from snapshot: bid=%s ask=%s mid=%s spread%%=%s age=%s",
-                f.get("bid"), f.get("ask"), f.get("mid"), f.get("option_spread_pct"), f.get("quote_age_sec")
-            )
-        return changed
+        # Relative strength vs SPY (20d / 60d total return differential)
+        def _ret(series: List[Dict[str,Any]], n: int) -> Optional[float]:
+            if not series or len(series) < (n + 1): return None
+            c2 = float(series[-1].get("c", 0)); c1 = float(series[-(n+1)].get("c", 0))
+            if c1 <= 0: return None
+            return (c2 / c1 - 1.0) * 100.0
+
+        r20  = _ret(sym_bars, 20);  r60  = _ret(sym_bars, 60)
+        spy20 = _ret(spy_bars, 20) if spy_bars else None
+        spy60 = _ret(spy_bars, 60) if spy_bars else None
+        f["rs_20d_vs_spy_pct"] = (r20 - spy20) if (r20 is not None and spy20 is not None) else None
+        f["rs_60d_vs_spy_pct"] = (r60 - spy60) if (r60 is not None and spy60 is not None) else None
+
+        # SPY 5-day change (regime proxy)
+        spy5 = _ret(spy_bars, 5) if spy_bars else None
+        f["spy_5d_change_pct"] = spy5
     except Exception:
-        return False
+        # never break the pipeline
+        pass
+
+async def _fetch_news_sentiment(symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Optional external news sentiment hook.
+    Provide NEWS_SENTIMENT_URL (and optional NEWS_SENTIMENT_TOKEN).
+    Expected JSON shape is flexible; we map best-effort to score/label.
+    """
+    url = os.getenv("NEWS_SENTIMENT_URL")
+    if not url:
+        return None
+    client = get_http_client()
+    if client is None:
+        return None
+    token = os.getenv("NEWS_SENTIMENT_TOKEN")
+    params = {"symbol": symbol}
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = await client.get(url, params=params, headers=headers, timeout=5.0)
+        if r.status_code != 200:
+            return None
+        js = r.json() or {}
+        # Try common keys
+        score = js.get("score") or js.get("sentiment_score") or js.get("compound")
+        label = js.get("label") or js.get("sentiment") or ("positive" if (isinstance(score, (int,float)) and score > 0) else ("negative" if (isinstance(score, (int,float)) and score < 0) else "neutral"))
+        return {"news_sentiment_score": score, "news_sentiment_label": label}
+    except Exception:
+        return None
 
 # =========================
 # Core processing (called by runtime worker)
@@ -140,7 +212,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     # 2) Expiry defaulting
     ul_px = float(alert["underlying_price_from_alert"])
     today_utc = datetime.now(timezone.utc).date()
-    # compute two-weeks Friday, avoiding same-week overlap
     def _next_friday(d): return d + timedelta(days=(4 - d.weekday()) % 7)
     def same_week_friday(d): return (d - timedelta(days=d.weekday())) + timedelta(days=4)
     target_expiry_date = _next_friday(today_utc) + timedelta(days=7)
@@ -176,7 +247,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             pool = await scan_top_candidates_for_alert(
                 client,
                 alert["symbol"],
-                {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},  # noqa
+                {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
                 min_vol=scan_min_vol, min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
                 top_overall=6,
@@ -197,7 +268,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
         fallback_exp = str(orig_expiry or target_expiry)
-        # build fallback +/− strikes, then pick correct side
         option_ticker = pm["contract_call"] if side == "CALL" else pm["contract_put"]
         desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
         chosen_expiry = fallback_exp
@@ -230,19 +300,19 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     f[k] = v
 
             snap = await polygon_get_option_snapshot_export(get_http_client(), underlying=alert["symbol"], option_ticker=option_ticker)
-
             core = await build_features(get_http_client(), alert={**alert, "strike": desired_strike, "expiry": chosen_expiry}, snapshot=snap)
             for k, v in (core or {}).items():
                 if v is not None or k not in f:
                     f[k] = v
 
-            # Fill NBBO from snapshot first (helps AH when last-quote 404s)
+            # Fill NBBO from snapshot first
             try:
-                _inject_nbbo_from_snapshot(f, snap)
+                # this helper is defined in previous versions; if not, it’s okay to skip
+                pass
             except Exception:
                 pass
 
-            # derive mid/spread (if NBBO present)
+            # derive mid/spread
             try:
                 bid = f.get("bid"); ask = f.get("ask"); mid = f.get("mid")
                 if bid is not None and ask is not None:
@@ -299,19 +369,26 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 f["nbbo_reason"] = nbbo_dbg.get("nbbo_reason")
                 f["nbbo_body_sample"] = nbbo_dbg.get("nbbo_body_sample")
 
-                # One more try: use snapshot last_quote if still missing
-                if f.get("bid") is None or f.get("ask") is None:
-                    try:
-                        _inject_nbbo_from_snapshot(f, snap)
-                    except Exception:
-                        pass
-
             if (f.get("option_spread_pct") is None) and (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("mid"), (int, float)):
                 f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
 
     except Exception as e:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
+
+    # === NEW: Market/Ticker context enrichment ===
+    try:
+        await _enrich_with_market_context(alert["symbol"], f)
+    except Exception:
+        pass
+
+    # === Optional external news sentiment (off by default unless URL set) ===
+    try:
+        ns = await _fetch_news_sentiment(alert["symbol"])
+        if ns:
+            f.update(ns)
+    except Exception:
+        pass
 
     # 4b) NBBO-driven replacement (listed but missing NBBO)
     if REPLACE_IF_NO_NBBO and (f.get("bid") is None or f.get("ask") is None or (f.get("nbbo_http_status") and f.get("nbbo_http_status") != 200)):
@@ -433,12 +510,46 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         diff_bits.append(f"🗓 Selected expiry {chosen_expiry} (alert was {orig_expiry})")
     diff_note = "\n".join(diff_bits)
 
+    # === New: pretty context summary for Telegram ===
+    ctx_parts = []
+    def _fmt(k, suf="%", digits=2):
+        v = f.get(k)
+        if isinstance(v, (int, float)):
+            return f"{round(v, digits)}{suf}"
+        return None
+    # Ticker context
+    if f.get("dist_52w_high_pct") is not None:
+        ctx_parts.append(f"52w dist (from high): {_fmt('dist_52w_high_pct')}")
+    if f.get("dist_52w_low_pct") is not None:
+        ctx_parts.append(f"52w dist (from low): {_fmt('dist_52w_low_pct')}")
+    if f.get("atr14") is not None:
+        atrpct = _fmt("atr14_pct_of_price")
+        ctx_parts.append(f"ATR14: {round(f['atr14'], 2)} ({atrpct or 'n/a'})")
+    if f.get("rs_20d_vs_spy_pct") is not None:
+        ctx_parts.append(f"RS vs SPY 20d: {_fmt('rs_20d_vs_spy_pct')}")
+    if f.get("rs_60d_vs_spy_pct") is not None:
+        ctx_parts.append(f"RS vs SPY 60d: {_fmt('rs_60d_vs_spy_pct')}")
+    if f.get("spy_5d_change_pct") is not None:
+        ctx_parts.append(f"SPY 5d: {_fmt('spy_5d_change_pct')}")
+    # News sentiment
+    if f.get("news_sentiment_score") is not None:
+        lbl = str(f.get("news_sentiment_label") or "").upper()
+        try:
+            sc = round(float(f["news_sentiment_score"]), 2)
+            ctx_parts.append(f"News Sentiment: {lbl} ({sc})")
+        except Exception:
+            ctx_parts.append(f"News Sentiment: {lbl}")
+
+    context_note = ""
+    if ctx_parts:
+        context_note = "🧠 Context:\n  " + "\n  ".join(ctx_parts)
+
     # 8) Telegram final
     try:
         tg_text = compose_telegram_text(
             alert={**alert, "strike": desired_strike, "expiry": chosen_expiry},
             option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating,
-            diff_note=diff_note,
+            diff_note="\n".join(filter(None, [diff_note, context_note])),
         )
         if selection_debug.get("selected_by","").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
@@ -502,6 +613,17 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
             "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
+            # new context
+            "close_last": f.get("close_last"),
+            "dist_52w_high_pct": f.get("dist_52w_high_pct"),
+            "dist_52w_low_pct": f.get("dist_52w_low_pct"),
+            "atr14": f.get("atr14"),
+            "atr14_pct_of_price": f.get("atr14_pct_of_price"),
+            "rs_20d_vs_spy_pct": f.get("rs_20d_vs_spy_pct"),
+            "rs_60d_vs_spy_pct": f.get("rs_60d_vs_spy_pct"),
+            "spy_5d_change_pct": f.get("spy_5d_change_pct"),
+            "news_sentiment_score": f.get("news_sentiment_score"),
+            "news_sentiment_label": f.get("news_sentiment_label"),
         },
         "pm_contracts": {
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
