@@ -42,9 +42,8 @@ from market_ops import (
 
 logger = logging.getLogger("trading_engine")
 
-
 # =========================
-# Indicator math (best-effort)
+# Indicator helpers (per-metric fallbacks 1m→5m→1d)
 # =========================
 def _sma(vals: List[float], n: int) -> Optional[float]:
     vals = [v for v in vals if isinstance(v, (int, float))]
@@ -54,7 +53,7 @@ def _sma(vals: List[float], n: int) -> Optional[float]:
 
 def _ema(vals: List[float], n: int) -> Optional[float]:
     vals = [v for v in vals if isinstance(v, (int, float))]
-    if not vals:
+    if len(vals) < max(5, n // 2):  # require a few points for stability
         return None
     k = 2.0 / (n + 1)
     e = vals[0]
@@ -82,7 +81,7 @@ def _rsi(vals: List[float], n: int = 14) -> Optional[float]:
 
 def _macd(vals: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     vals = [v for v in vals if isinstance(v, (int, float))]
-    if len(vals) < slow:
+    if len(vals) < slow + 1:
         return (None, None, None)
 
     def ema_series(seq: List[float], n: int) -> List[float]:
@@ -97,6 +96,8 @@ def _macd(vals: List[float], fast: int = 12, slow: int = 26, signal: int = 9) ->
     ema_fast = ema_series(vals, fast)
     ema_slow = ema_series(vals, slow)
     cut = min(len(ema_fast), len(ema_slow))
+    if cut == 0:
+        return (None, None, None)
     macd_series = [ema_fast[-cut+i] - ema_slow[-cut+i] for i in range(cut)]
     if not macd_series:
         return (None, None, None)
@@ -110,14 +111,15 @@ def _macd(vals: List[float], fast: int = 12, slow: int = 26, signal: int = 9) ->
     else:
         return (macd_line, None, None)
 
+def _fmt2(v: Optional[float]) -> str:
+    return "None" if v is None else f"{float(v):.2f}"
 
-# =========================
-# Bars fetch with relaxed thresholds & diagnostics
-# =========================
-async def _fetch_bars_for_indicators(symbol: str) -> Dict[str, Any]:
+async def _fetch_bars_for_indicators_best_effort(symbol: str) -> Dict[str, Any]:
     """
-    Pull bars from Polygon (1m/5m/1d) with generous windows, choose the series with most
-    bars and compute indicators best-effort. Returns diagnostics too.
+    Pull 1m/5m/1d bars with generous windows.
+    Compute each indicator independently with per-metric fallbacks:
+      RSI needs >=15 bars, SMA20 >=20, EMA20 >=~10, MACD needs >=27, Δ% >=2.
+    Returns values + which timeframe was used for each metric.
     """
     if not POLYGON_API_KEY:
         return {"note": "polygon api key missing"}
@@ -132,67 +134,74 @@ async def _fetch_bars_for_indicators(symbol: str) -> Dict[str, Any]:
         res = body.get("results") or []
         return [float(x.get("c")) for x in res if isinstance(x, dict) and isinstance(x.get("c"), (int, float))]
 
-    async def _get_aggs(timespan_mult: int, timespan_unit: str, start: str, end: str, timeout: float = 8.0) -> Dict[str, Any]:
-        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{timespan_mult}/{timespan_unit}/{start}/{end}"
-        resp = await _http_get_any(url, params={"adjusted":"true","sort":"asc","limit":2000,"apiKey":POLYGON_API_KEY}, timeout=timeout)
+    async def _get_aggs(mult: int, unit: str, start: str, end: str, timeout: float = 9.0) -> Dict[str, Any]:
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{mult}/{unit}/{start}/{end}"
+        resp = await _http_get_any(
+            url,
+            params={"adjusted": "true", "sort": "asc", "limit": 2000, "apiKey": POLYGON_API_KEY},
+            timeout=timeout,
+        )
         body = resp.get("body")
         closes = _closes_from(body)
-        return {
-            "status": resp.get("status"),
-            "count": len(closes),
-            "closes": closes,
-        }
+        return {"status": resp.get("status"), "closes": closes, "count": len(closes)}
 
     now = datetime.now(timezone.utc)
-    to_iso = now.isoformat()
+    to_date = now.date().isoformat()
+    to_iso  = now.isoformat()
 
-    r_1m = await _get_aggs(1, "min", (now - timedelta(hours=8)).isoformat(), to_iso)              # last 8h
-    r_5m = await _get_aggs(5, "min", (now - timedelta(days=15)).isoformat(), to_iso)              # last 15d
-    r_1d = await _get_aggs(1, "day", (now - timedelta(days=400)).date().isoformat(), to_iso)      # last ~400d
+    # Windows generous enough to work AH / weekends
+    r_1m = await _get_aggs(1, "min", (now - timedelta(hours=24)).isoformat(), to_iso)
+    r_5m = await _get_aggs(5, "min", (now - timedelta(days=30)).isoformat(), to_iso)
+    r_1d = await _get_aggs(1, "day", (now - timedelta(days=720)).date().isoformat(), to_date)
 
-    series = [
-        ("1m", r_1m.get("closes", []), r_1m.get("status")),
-        ("5m", r_5m.get("closes", []), r_5m.get("status")),
-        ("1d", r_1d.get("closes", []), r_1d.get("status")),
-    ]
-    source, closes, status = max(series, key=lambda t: len(t[1]))
-
-    out: Dict[str, Any] = {
-        "bars_source": source,
-        "indicator_closes_count": len(closes),
-        "last_close": closes[-1] if closes else None,
-        "aggs_status": {"1m": r_1m.get("status"), "5m": r_5m.get("status"), "1d": r_1d.get("status")},
-        "aggs_counts": {"1m": r_1m.get("count"),  "5m": r_5m.get("count"),  "1d": r_1d.get("count")},
+    series_map = {
+        "1m": r_1m.get("closes", []),
+        "5m": r_5m.get("closes", []),
+        "1d": r_1d.get("closes", []),
     }
+    counts_map = {k: len(v) for k, v in series_map.items()}
+    status_map = {"1m": r_1m.get("status"), "5m": r_5m.get("status"), "1d": r_1d.get("status")}
 
-    if len(closes) >= 2:
-        out["sma20"] = _sma(closes, 20) if len(closes) >= 20 else None
-        # EMA can compute with short history (less stable but useful)
-        out["ema20"] = _ema(closes, 20)
-        out["rsi14"] = _rsi(closes, 14)
-        macd_line, macd_sig, macd_hist = _macd(closes, 12, 26, 9)
-        out["macd"] = macd_line
-        out["macd_signal"] = macd_sig
-        out["macd_hist"] = macd_hist
+    def pick(min_needed: int, order=("1m", "5m", "1d")) -> Tuple[Optional[List[float]], Optional[str]]:
+        for tf in order:
+            seq = series_map.get(tf, [])
+            if len(seq) >= min_needed:
+                return seq, tf
+        # fall back to longest available even if short (will yield None for some)
+        tf_longest = max(series_map.keys(), key=lambda k: len(series_map[k]))
+        return series_map.get(tf_longest, []), tf_longest
 
-        # simple momentum: last bar vs prior bar
-        prev = closes[-2]
-        out["delta_pct"] = None if prev == 0 else ((closes[-1] - prev) / prev) * 100.0
-    else:
-        out["sma20"] = None
-        out["ema20"] = None
-        out["rsi14"] = None
-        out["macd"] = None
-        out["macd_signal"] = None
-        out["macd_hist"] = None
-        out["delta_pct"] = None
+    # Per-metric picks
+    closes_rsi, rsi_src = pick(15)          # needs n+1 bars (n=14)
+    closes_sma, sma_src = pick(20)
+    closes_ema, ema_src = pick(10)          # let EMA run with ~10+ bars for stability
+    closes_mac, mac_src = pick(27)          # 26 slow + 1
+    closes_dp,  dp_src  = pick(2)
 
-    return out
+    rsi14 = _rsi(closes_rsi, 14) if closes_rsi else None
+    sma20 = _sma(closes_sma, 20) if closes_sma else None
+    ema20 = _ema(closes_ema, 20) if closes_ema else None
+    macd_line, macd_sig, macd_hist = _macd(closes_mac, 12, 26, 9) if closes_mac else (None, None, None)
+    delta_pct = None
+    if closes_dp and len(closes_dp) >= 2:
+        prev = closes_dp[-2]
+        if prev:
+            delta_pct = (closes_dp[-1] - prev) / prev * 100.0
 
+    # Choose the overall source as the TF with most bars (for logging only)
+    overall_src = max(series_map.keys(), key=lambda k: len(series_map[k])) if series_map else None
 
-def _fmt2(v: Optional[float]) -> str:
-    return "None" if v is None else f"{float(v):.2f}"
-
+    return {
+        "rsi14": rsi14, "rsi_source": rsi_src,
+        "sma20": sma20, "sma_source": sma_src,
+        "ema20": ema20, "ema_source": ema_src,
+        "macd": macd_line, "macd_signal": macd_sig, "macd_hist": macd_hist, "macd_source": mac_src,
+        "delta_pct": delta_pct, "delta_pct_source": dp_src,
+        "bars_source": overall_src,
+        "indicator_closes_count": counts_map.get(overall_src) if overall_src else 0,
+        "aggs_status": status_map, "aggs_counts": counts_map,
+        "last_close": {tf: (series_map[tf][-1] if series_map[tf] else None) for tf in ("1m", "5m", "1d")},
+    }
 
 # =========================
 # Core processing (called by runtime worker)
@@ -229,6 +238,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     # 2) Expiry defaulting
     ul_px = float(alert["underlying_price_from_alert"])
     today_utc = datetime.now(timezone.utc).date()
+    # compute two-weeks Friday, avoiding same-week overlap
     def _next_friday(d): return d + timedelta(days=(4 - d.weekday()) % 7)
     def same_week_friday(d): return (d - timedelta(days=d.weekday())) + timedelta(days=4)
     target_expiry_date = _next_friday(today_utc) + timedelta(days=7)
@@ -285,6 +295,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
         fallback_exp = str(orig_expiry or target_expiry)
+        # build fallback +/− strikes, then pick correct side
         option_ticker = pm["contract_call"] if side == "CALL" else pm["contract_put"]
         desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
         chosen_expiry = fallback_exp
@@ -384,16 +395,19 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # === 4a) Best-effort indicators from Polygon aggregates ===
+    # === 4a) Indicators (per-metric fallbacks; never all-or-nothing) ===
     try:
-        ind = await _fetch_bars_for_indicators(symbol)
+        ind = await _fetch_bars_for_indicators_best_effort(symbol)
     except Exception as e:
         ind = {"note": f"indicator fetch error: {type(e).__name__}: {e}"}
 
-    # Attach to features (so LLM gets them)
-    for k in ("sma20", "ema20", "rsi14", "macd", "macd_signal", "macd_hist", "delta_pct",
-              "bars_source", "indicator_closes_count", "aggs_status", "aggs_counts", "last_close"):
-        if ind.get(k) is not None:
+    # Attach to features for LLM
+    for k in (
+        "sma20","ema20","rsi14","macd","macd_signal","macd_hist","delta_pct",
+        "sma_source","ema_source","rsi_source","macd_source","delta_pct_source",
+        "bars_source","indicator_closes_count","aggs_status","aggs_counts","last_close"
+    ):
+        if k in ind:
             f[k] = ind[k]
 
     # 4b) NBBO-driven replacement (listed but missing NBBO)
@@ -508,24 +522,30 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if force_buy:
         decision_final = "buy"
 
-    # Diff & indicator note for Telegram
+    # Diff note (strike/expiry changes)
     diff_bits = []
     if isinstance(orig_strike, (int, float)) and isinstance(desired_strike, (int, float)) and float(orig_strike) != float(desired_strike):
         diff_bits.append(f"🎯 Selected strike {desired_strike} (alert was {orig_strike})")
     if orig_expiry and chosen_expiry and str(orig_expiry) != str(chosen_expiry):
         diff_bits.append(f"🗓 Selected expiry {chosen_expiry} (alert was {orig_expiry})")
-
-    # Indicators summary
-    ind_line = f"📈 RSI14={_fmt2(ind.get('rsi14'))} SMA20≈{_fmt2(ind.get('sma20'))} EMA20≈{_fmt2(ind.get('ema20'))} Δ%≈{_fmt2(ind.get('delta_pct'))} src:{ind.get('bars_source','?')}"
-    diff_bits.append(ind_line)
     diff_note = "\n".join(diff_bits)
+
+    # Indicator summary line (shows values + source TF for each)
+    ind_line = (
+        "📈 "
+        f"RSI14={_fmt2(f.get('rsi14'))}({f.get('rsi_source')}) "
+        f"SMA20={_fmt2(f.get('sma20'))}({f.get('sma_source')}) "
+        f"EMA20={_fmt2(f.get('ema20'))}({f.get('ema_source')}) "
+        f"Δ%={_fmt2(f.get('delta_pct'))}({f.get('delta_pct_source')})"
+    )
+    combined_note = "\n".join([x for x in [diff_note, ind_line] if x])
 
     # 8) Telegram final
     try:
         tg_text = compose_telegram_text(
             alert={**alert, "strike": desired_strike, "expiry": chosen_expiry},
             option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating,
-            diff_note=diff_note,
+            diff_note=combined_note,
         )
         if selection_debug.get("selected_by","").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
@@ -571,7 +591,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "decision_path": f"llm.{decision_final}",
         "prescore": None,
         "llm": {"ran": True, "decision": llm.get("decision"),
-                "confidence": llm.get("confidence"), "reason": llm.get("reason")},  # noqa
+                "confidence": llm.get("confidence"), "reason": llm.get("reason")},
         "features": {
             "reco_expiry": chosen_expiry,
             "oi": f.get("oi"), "vol": f.get("vol"),
@@ -590,11 +610,16 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
             "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
             # indicators
-            "sma20": f.get("sma20"), "ema20": f.get("ema20"), "rsi14": f.get("rsi14"),
+            "rsi14": f.get("rsi14"), "sma20": f.get("sma20"), "ema20": f.get("ema20"),
             "macd": f.get("macd"), "macd_signal": f.get("macd_signal"), "macd_hist": f.get("macd_hist"),
-            "ind_bars_source": f.get("bars_source"), "ind_bars_count": f.get("indicator_closes_count"),
-            "ind_aggs_status": f.get("aggs_status"), "ind_aggs_counts": f.get("aggs_counts"),
-            "ind_last_close": f.get("last_close"), "ind_delta_pct": f.get("delta_pct"),
+            "delta_pct": f.get("delta_pct"),
+            "rsi_source": f.get("rsi_source"), "sma_source": f.get("sma_source"),
+            "ema_source": f.get("ema_source"), "macd_source": f.get("macd_source"),
+            "delta_pct_source": f.get("delta_pct_source"),
+            "bars_source": f.get("bars_source"),
+            "indicator_closes_count": f.get("indicator_closes_count"),
+            "aggs_status": f.get("aggs_status"), "aggs_counts": f.get("aggs_counts"),
+            "last_close": f.get("last_close"),
         },
         "pm_contracts": {
             "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
@@ -606,7 +631,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
         "replacement": replacement_note,
     })
-
 
 # =========================
 # Diagnostics
