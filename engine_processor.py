@@ -262,7 +262,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
     # 4b) NBBO-driven replacement (listed but missing NBBO)
-    if REPLACE_IF_NO_NBBO and (f.get("bid") is None or f.get("ask") is None or (f.get("nbbo_http_status") and f.get("nbbo_http_status") != 200)):
+    if REPLACE_IF_NO_NBBO and (f.get("bid") is None or f.get("ask") is None or (f.get("_status") and f.get("_status") != 200)):
         try:
             alt = await _find_nbbo_replacement_same_expiry(
                 symbol=alert["symbol"], side=side, desired_strike=desired_strike,
@@ -289,7 +289,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
                         if nbbo_dbg2.get(k) is not None:
                             f[k] = nbbo_dbg2[k]
-                    f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
+                    f["_status"] = nbbo_dbg2.get("_status")
                     f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
                 replacement_note = {"old": old_tk, "new": option_ticker, "why": "missing NBBO on initial pick"}
                 logger.info("Replaced due to missing NBBO: %s → %s", old_tk, option_ticker)
@@ -336,7 +336,48 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 except Exception as e:
                     logger.warning("Replacement contract fetch failed: %r", e)
                     replacement_note = None
+    else:
+        # Listed but last-quote still 404 (AH/illiquid). Prefer a same-expiry contract with NBBO.
+        # Use softer gates (half the AH/RTH min_vol/min_oi) to improve odds.
+        if REPLACE_IF_NO_NBBO:
+            try:
+                soft_min_vol = max(0, (scan_min_vol // 2))
+                soft_min_oi  = max(0, (scan_min_oi  // 2))
+                alt = await _find_nbbo_replacement_same_expiry(
+                    symbol=alert["symbol"], side=side, desired_strike=desired_strike,
+                    expiry_iso=chosen_expiry, min_vol=soft_min_vol, min_oi=soft_min_oi,
+                )
+            except Exception:
+                alt = None
 
+            if alt and alt.get("ticker") and alt["ticker"] != option_ticker:
+                old_tk = option_ticker
+                option_ticker = alt["ticker"]
+                desired_strike = float(alt.get("strike") or _strike_from_occ(option_ticker) or desired_strike)
+                try:
+                    occ = _occ_meta(option_ticker)
+                    chosen_expiry = (occ["expiry"] if occ else str(alt.get("expiry") or chosen_expiry))
+                    extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
+                    for k, v in (extra2 or {}).items():
+                        if v is not None:
+                            f[k] = v
+                    for k, v in (await _pull_nbbo_direct(option_ticker)).items():
+                        if v is not None:
+                            f[k] = v
+                    if f.get("bid") is None or f.get("ask") is None:
+                        nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker)
+                        for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
+                            if nbbo_dbg2.get(k) is not None:
+                                f[k] = nbbo_dbg2[k]
+                        f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
+                        f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
+                    replacement_note = {
+                        "old": old_tk, "new": option_ticker,
+                        "why": "404 on last-quote; swapped to same-expiry contract with NBBO",
+                    }
+                    logger.info("Replaced contract due to 404 (listed but no NBBO): %s → %s", old_tk, option_ticker)
+                except Exception as e:
+                    logger.warning("NBBO replacement (listed 404) refresh failed: %r", e)
     # 5b) Build a ±5% strike recommendation FROM top-5 high OI/Vol (same side, prefer same expiry)
     reco_line = ""
     try:
