@@ -88,6 +88,7 @@ def _score_ema_stack(side: str, price: Optional[float], ema20: Optional[float], 
                 if rel < 0: pts += 3.3; notes.append(f"{name}↓")
                 else:       pts -= 2.0; notes.append(f"{name}↑")
     else:
+        # fallback to EMAs cross structure if price missing
         if ema20 and ema50 and ema200:
             if ema20 > ema50 > ema200:
                 pts += 6.0; notes.append("20>50>200")
@@ -207,6 +208,87 @@ def _score_dte(dte: Optional[float]) -> Tuple[float, str]:
     elif dte > 45:         pts -= 2.0
     return pts, _mk_reason("DTE", pts, f"{dte} days")
 
+# --- trade horizon inference (baseline) --------------------------------------
+
+def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float, str]:
+    """
+    Classify 'intraday' vs 'swing' with a simple score:
+      swing_score > 0 -> 'swing', else 'intraday'
+    Drivers:
+      + DTE 5..35 favors swing; 0-2 favors intraday
+      + Consistent EMA20/50/200 alignment favors swing
+      + ORB15 break favors intraday
+      + Large |VWAP distance| favors intraday scalps
+      + IV Rank mid favors swing; extreme high favors quick trades
+      + RSI mid-zone favors swing; extremes favor intraday mean-reversion
+      + Very wide spreads reduce intraday viability
+    """
+    side = (alert.get("side") or "").upper()
+    ul_price = _f(alert.get("underlying_price_from_alert"))
+
+    dte = _f(f.get("dte"))
+    ema20, ema50, ema200 = _f(f.get("ema20")), _f(f.get("ema50")), _f(f.get("ema200"))
+    rsi14 = _f(f.get("rsi14"))
+    iv_rank = _f(f.get("iv_rank"))
+    vwap = _f(f.get("vwap"))
+    vwap_dist = _f(f.get("vwap_dist"))
+    orb_h = _f(f.get("orb15_high")); orb_l = _f(f.get("orb15_low"))
+    spread = _f(f.get("option_spread_pct"))
+
+    swing = 0.0
+    notes: List[str] = []
+
+    # DTE
+    if dte is not None:
+        if dte <= 2:
+            swing -= 3.0; notes.append("short DTE → intraday bias")
+        elif 5 <= dte <= 35:
+            swing += 2.0; notes.append("5–35 DTE → swing friendly")
+        elif dte > 45:
+            swing += 1.0; notes.append(">45 DTE → swing tilt")
+
+    # EMA structure
+    if ema20 and ema50 and ema200:
+        if ema20 > ema50 > ema200:
+            swing += (2.0 if side == "CALL" else 1.0); notes.append("EMA stack trend (bull)")
+        elif ema20 < ema50 < ema200:
+            swing += (2.0 if side == "PUT" else 1.0); notes.append("EMA stack trend (bear)")
+
+    # ORB and VWAP
+    if ul_price is not None:
+        if (orb_h and ul_price > orb_h) or (orb_l and ul_price < orb_l):
+            swing -= 2.0; notes.append("ORB15 break → intraday")
+        dist = vwap_dist
+        if dist is None and vwap is not None:
+            dist = _pct(ul_price, vwap)
+        if dist is not None and abs(dist) >= 0.8:
+            swing -= 1.0; notes.append("far from VWAP → intraday")
+
+    # IV Rank
+    if iv_rank is not None:
+        if 0.3 <= iv_rank <= 0.7:
+            swing += 1.0; notes.append("mid IV rank → swing friendly")
+        elif iv_rank > 0.85:
+            swing -= 1.0; notes.append("high IV rank → quick move bias")
+
+    # RSI
+    if rsi14 is not None:
+        if 40 <= rsi14 <= 60:
+            swing += 1.0; notes.append("RSI mid-zone")
+        elif rsi14 < 30 or rsi14 > 70:
+            swing -= 1.0; notes.append("RSI extreme → intraday")
+
+    # Spreads
+    if spread is not None:
+        if spread > 12:
+            swing -= 0.5; notes.append("wide spread")
+        elif spread <= 5:
+            swing += 0.3; notes.append("tight spread")
+
+    horizon = "swing" if swing > 0 else "intraday"
+    reason = "; ".join(notes) or "neutral mix"
+    return horizon, round(swing, 2), reason
+
 # --- rule-based blend (guardrails) -------------------------------------------
 
 def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
@@ -250,7 +332,6 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
 
     factor_lines = [rsi_note, ema_note, macd_note, vwap_note, boll_note, orb_note, struct_note, delta_note, iv_note, dte_note, liq_note]
 
-    # quick human summary (baseline) if LLM is offline
     positives = [ln for ln in factor_lines if " +" in ln]
     negatives = [ln for ln in factor_lines if " -" in ln]
     base_summary = (
@@ -259,6 +340,9 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
         f"Positives: {', '.join(p.split('] ')[1] for p in positives[:3]) or 'none'}. "
         f"Watchouts: {', '.join(n.split('] ')[1] for n in negatives[:3]) or 'none'}."
     )
+
+    # horizon inference
+    horizon, horizon_score, horizon_reason = _infer_horizon(alert, f)
 
     checklist = {
         "technicals": {
@@ -278,6 +362,7 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
         },
         "structure": {
             "dte": _f(f.get("dte")), "mtf_align": f.get("mtf_align"), "regime_flag": f.get("regime_flag"),
+            "horizon": horizon, "horizon_score": horizon_score, "horizon_reason": horizon_reason,
         }
     }
 
@@ -287,8 +372,10 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
         "reason": base_summary + "\n" + _multiline(factor_lines),
         "checklist": checklist,
         "ev_estimate": {"edge_pct": round((score - 50.0) / 1.5, 2), "score": round(score, 2)},
-        "factor_lines": factor_lines,     # expose for LLM refine prompt
-        "base_summary": base_summary,     # expose for LLM refine prompt
+        "factor_lines": factor_lines,
+        "base_summary": base_summary,
+        "horizon": horizon,
+        "horizon_reason": horizon_reason,
     }
 
 # --- OpenAI wrapper (refine within guardrails) --------------------------------
@@ -308,17 +395,21 @@ def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
 
 async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Returns: { decision, confidence, reason, checklist, ev_estimate }
+    Returns: { decision, confidence, reason, checklist, ev_estimate, horizon, horizon_reason }
     - Deterministic weighted blend (RSI/EMA(20/50/200)/MACD/VWAP/Bollinger/ORB15 + Greeks/IV + structure + execution).
-    - Stronger default model (gpt-4.1) produces: human 'summary' (2–4 sentences) + factor bullets; total adjustment ≤ ±10 pts.
-    - Missing NBBO never auto-skips; if synthetic_nbbo_used=true, apply cautious-but-acceptable execution treatment.
+    - Stronger default model (gpt-4.1) produces: human 'summary' + factor bullets + 'horizon' ('intraday'|'swing') with rationale.
+    - Missing NBBO never auto-skips; synthetic_nbbo_used=true is cautious-but-acceptable.
     """
     baseline = _rule_blend(alert, features)
 
-    # If OpenAI missing/offline, return baseline (already human-friendly)
+    # If OpenAI missing/offline, return baseline (already human-friendly with horizon)
     if AsyncOpenAI is None or not os.getenv("OPENAI_API_KEY") or os.getenv("LLM_OFFLINE", "0") == "1":
         if "(offline rule-based)" not in baseline["reason"]:
-            baseline["reason"] += "\n(offline rule-based)"
+            baseline["reason"] = (
+                f"🕒 Suggested trade: {baseline['horizon'].upper()} — {baseline['horizon_reason']}\n"
+                + baseline["reason"]
+                + "\n(offline rule-based)"
+            ).strip()
         return baseline
 
     try:
@@ -331,10 +422,11 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
             "Greeks (Δ/Θ/ν) & IV/IV Rank, plus execution (spread, OI/Vol). "
             "Use the provided baseline weighted score; you may adjust modestly (<= ±10 absolute points) only with strong justification. "
             "Do NOT auto-skip just because NBBO is missing; if synthetic_nbbo_used=true, treat execution as cautious but acceptable. "
-            "Return JSON with: decision, confidence (0..1), summary (string), factors (array of short bullet strings), checklist (object), ev_estimate (object)."
+            "You MUST classify the trade as 'intraday' or 'swing' and explain why, considering DTE, ORB/VWAP context, EMA structure, IV Rank, RSI, and spreads. "
+            "Return JSON with: decision, confidence (0..1), summary (string), factors (array of short bullet strings), "
+            "horizon ('intraday'|'swing'), horizon_reason (string), checklist (object), ev_estimate (object)."
         )
 
-        # Build a compact payload the model can reason about
         user_payload = {
             "alert": {
                 "side": alert.get("side"),
@@ -350,6 +442,8 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
                 "score": baseline.get("ev_estimate", {}).get("score"),
                 "summary": baseline.get("base_summary"),
                 "factors": baseline.get("factor_lines"),
+                "horizon": baseline.get("horizon"),
+                "horizon_reason": baseline.get("horizon_reason"),
             },
             "boundaries": {"buy_threshold": BUY_THRESHOLD, "wait_threshold": WAIT_THRESHOLD, "max_adjust_abs_points": 10}
         }
@@ -364,7 +458,7 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
                     "role": "user",
                     "content": (
                         "Refine the baseline. Keep adjustments ≤ ±10 pts. "
-                        "Include a concise 'summary' and 'factors' list (bullets like '[RSI +3.0] ...'). "
+                        "Include a concise 'summary', 'factors' list, and a firm 'horizon' with 'horizon_reason'. "
                         "Be conservative with liquidity penalties if synthetic_nbbo_used=true.\n\n"
                         + json.dumps(user_payload, ensure_ascii=False)
                     ),
@@ -387,14 +481,23 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         except Exception:
             confidence = baseline["confidence"]
 
-        # combine human summary + bullets into the single 'reason' string our app displays
+        # human summary + bullets + horizon line
         summary = parsed.get("summary") or baseline.get("base_summary") or ""
         factors = parsed.get("factors") or baseline.get("factor_lines") or []
         if isinstance(factors, list):
             factors_block = "\n".join(factors)
         else:
             factors_block = str(factors)
-        reason = (summary.strip() + ("\n" if summary else "") + factors_block).strip()
+        horizon = str(parsed.get("horizon") or baseline.get("horizon") or "intraday").lower()
+        if horizon not in ("intraday", "swing"):
+            horizon = baseline.get("horizon", "intraday")
+        horizon_reason = parsed.get("horizon_reason") or baseline.get("horizon_reason") or "neutral mix"
+
+        reason = (
+            f"🕒 Suggested trade: {str(horizon).upper()} — {horizon_reason}\n"
+            + (summary.strip() + ("\n" if summary else ""))
+            + factors_block
+        ).strip()
 
         checklist = parsed.get("checklist") or baseline.get("checklist") or {}
         ev_estimate = parsed.get("ev_estimate") or baseline.get("ev_estimate") or {}
@@ -402,14 +505,21 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         return {
             "decision": decision,
             "confidence": confidence,
-            "reason": reason,
+            "reason": reason,  # already includes horizon + human summary + bullets
             "checklist": checklist,
             "ev_estimate": ev_estimate,
+            "horizon": horizon,
+            "horizon_reason": horizon_reason,
         }
 
     except Exception as e:
         logger.exception("LLM refine failed: %s", e)
         out = dict(baseline)
         add = f"(LLM refine error: {type(e).__name__}: {e})"
-        out["reason"] = (out.get("reason","") + ("\n" if out.get("reason") else "") + add).strip()
+        out["reason"] = (
+            f"🕒 Suggested trade: {out['horizon'].upper()} — {out['horizon_reason']}\n"
+            + out.get("reason","")
+            + ("\n" if out.get("reason") else "")
+            + add
+        ).strip()
         return out
