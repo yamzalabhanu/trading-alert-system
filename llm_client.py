@@ -17,6 +17,7 @@ logger = logging.getLogger("trading_engine.llm")
 BUY_THRESHOLD = float(os.getenv("LLM_BUY_THRESHOLD", "60"))
 WAIT_THRESHOLD = float(os.getenv("LLM_WAIT_THRESHOLD", "45"))
 
+# primary weights (sum ≈ 100 when fully normalized)
 W_TECH = float(os.getenv("LLM_W_TECH", "60"))          # RSI/EMA/MACD/VWAP/Bollinger
 W_STRUCT = float(os.getenv("LLM_W_STRUCT", "15"))       # ORB15 + regime/MTF
 W_OPTION = float(os.getenv("LLM_W_OPTION", "15"))       # Delta + IV + OI/Vol tilt
@@ -42,17 +43,21 @@ def _mk_reason(name: str, score_delta: float, why: str) -> str:
     s = f"+{score_delta:.1f}" if score_delta >= 0 else f"{score_delta:.1f}"
     return f"[{name} {s}] {why}"
 
+def _multiline(reasons: List[str]) -> str:
+    # compact multi-line explanation
+    return "\n".join(reasons)
+
 # --- indicator scoring --------------------------------------------------------
 
 def _score_rsi(side: str, rsi14: Optional[float]) -> Tuple[float, str]:
     if rsi14 is None:
         return 0.0, _mk_reason("RSI", 0, "missing")
-    # Balanced: avoid buying calls at >70 or puts at <30 unless reversal
+    # Balanced: prefer mid zones; allow mean reversion hints
     if side == "CALL":
         if 40 <= rsi14 <= 65:
             return 7.0, _mk_reason("RSI", +7, f"constructive zone {rsi14:.1f}")
         if rsi14 < 30:
-            return 4.0, _mk_reason("RSI", +4, "oversold (potential bounce)")
+            return 4.0, _mk_reason("RSI", +4, "oversold (bounce potential)")
         if rsi14 > 70:
             return -4.0, _mk_reason("RSI", -4, "overbought (late risk)")
     else:  # PUT
@@ -72,50 +77,59 @@ def _price_vs(val: Optional[float], ref: Optional[float]) -> Optional[int]:
 def _score_ema_stack(side: str, price: Optional[float], ema20: Optional[float], ema50: Optional[float], ema200: Optional[float]) -> Tuple[float, str]:
     pts = 0.0
     notes: List[str] = []
-    # each alignment worth ~3–4 points (total ~10)
-    for name, ema in (("EMA20", ema20), ("EMA50", ema50), ("EMA200", ema200)):
-        rel = _price_vs(price, ema)
-        if rel is None:
-            continue
-        if side == "CALL":
-            if rel > 0:
-                pts += 3.3; notes.append(f"{name}↑")
+    # with price (preferred): price vs each EMA
+    if price is not None:
+        for name, ema in (("EMA20", ema20), ("EMA50", ema50), ("EMA200", ema200)):
+            rel = _price_vs(price, ema)
+            if rel is None:
+                continue
+            if side == "CALL":
+                if rel > 0:
+                    pts += 3.3; notes.append(f"{name}↑")
+                else:
+                    pts -= 2.0; notes.append(f"{name}↓")
             else:
-                pts -= 2.0; notes.append(f"{name}↓")
-        else:
-            if rel < 0:
-                pts += 3.3; notes.append(f"{name}↓")
-            else:
-                pts -= 2.0; notes.append(f"{name}↑")
+                if rel < 0:
+                    pts += 3.3; notes.append(f"{name}↓")
+                else:
+                    pts -= 2.0; notes.append(f"{name}↑")
+    else:
+        # fallback (no price): favor stacked EMAs
+        if ema20 and ema50 and ema200:
+            if ema20 > ema50 > ema200:
+                pts += 6.0; notes.append("20>50>200")
+            elif ema20 < ema50 < ema200:
+                pts += 6.0 if side == "PUT" else -3.0
+                notes.append("20<50<200")
     if not notes:
         return 0.0, _mk_reason("EMA stack", 0, "missing")
     return pts, _mk_reason("EMA stack", pts, ",".join(notes))
 
-def _score_macd(side: str, macd: Optional[float], macd_signal: Optional[float], macd_hist: Optional[float]) -> Tuple[float, str]:
-    if macd is None or macd_signal is None:
+def _score_macd(side: str, macd_line: Optional[float], macd_signal: Optional[float], macd_hist: Optional[float]) -> Tuple[float, str]:
+    if macd_line is None or macd_signal is None:
         return 0.0, _mk_reason("MACD", 0, "missing")
     pts = 0.0
-    cross = macd - macd_signal
+    cross = macd_line - macd_signal
     if side == "CALL":
-        if macd > 0 and cross > 0:
+        if macd_line > 0 and cross > 0:
             pts += 6.0
         elif cross > 0:
             pts += 3.0
-        elif macd < 0 and cross < 0:
+        elif macd_line < 0 and cross < 0:
             pts -= 3.0
     else:
-        if macd < 0 and cross < 0:
+        if macd_line < 0 and cross < 0:
             pts += 6.0
         elif cross < 0:
             pts += 3.0
-        elif macd > 0 and cross > 0:
+        elif macd_line > 0 and cross > 0:
             pts -= 3.0
     if macd_hist is not None:
         pts += _clip((macd_hist * (1 if side == "CALL" else -1)) * 4.0, -2.0, 2.0)
-    return pts, _mk_reason("MACD", pts, f"macd={macd:.3f},sig={macd_signal:.3f}")
+    return pts, _mk_reason("MACD", pts, f"macd={macd_line:.3f},sig={macd_signal:.3f}")
 
 def _score_vwap(side: str, price: Optional[float], vwap: Optional[float], vwap_dist: Optional[float]) -> Tuple[float, str]:
-    # prefer above VWAP for CALLs, below for PUTs; use either dist or raw price-vwap
+    # prefer above VWAP for CALLs, below for PUTs
     if vwap is None and vwap_dist is None:
         return 0.0, _mk_reason("VWAP", 0, "missing")
     pts = 0.0
@@ -131,16 +145,15 @@ def _score_vwap(side: str, price: Optional[float], vwap: Optional[float], vwap_d
     return pts, _mk_reason("VWAP", pts, f"dist≈{dist:.2f}%")
 
 def _score_bollinger(side: str, price: Optional[float], bb_upper: Optional[float], bb_lower: Optional[float], sma20: Optional[float]) -> Tuple[float, str]:
-    # If near upper band -> favor PUTs; near lower band -> favor CALLs.
-    if price is None or (bb_upper is None and bb_lower is None and sma20 is None):
+    if price is None and sma20 is None and bb_upper is None and bb_lower is None:
         return 0.0, _mk_reason("Bollinger", 0, "missing")
     pts = 0.0
     notes: List[str] = []
-    if bb_upper is not None and price >= bb_upper:
+    if price is not None and bb_upper is not None and price >= bb_upper:
         pts += (5.0 if side == "PUT" else -3.0); notes.append("touch U")
-    if bb_lower is not None and price <= bb_lower:
+    if price is not None and bb_lower is not None and price <= bb_lower:
         pts += (5.0 if side == "CALL" else -3.0); notes.append("touch L")
-    if sma20 is not None:
+    if price is not None and sma20 is not None:
         rel = _price_vs(price, sma20)
         if rel is not None:
             if side == "CALL":
@@ -169,19 +182,18 @@ def _score_delta(side: str, delta: Optional[float]) -> Tuple[float, str]:
     pts = 0.0
     if side == "CALL":
         # sweet spot ~0.3-0.6
-        pts = 6.0 - (abs(delta - 0.45) / 0.15) * 3.0  # ~[−? , +6]
+        pts = 6.0 - (abs(delta - 0.45) / 0.15) * 3.0
     else:
         pts = 6.0 - (abs(delta + 0.45) / 0.15) * 3.0
     pts = _clip(pts, -3.0, 6.0)
     return pts, _mk_reason("Delta", pts, f"Δ={delta:.3f}")
 
 def _score_iv(side: str, iv: Optional[float], iv_rank: Optional[float]) -> Tuple[float, str]:
-    # For option BUY, too-high IV hurts due to premium; moderate ranks best.
+    # For option BUY, too-high IV hurts; mid ranks better.
     if iv is None and iv_rank is None:
         return 0.0, _mk_reason("IV", 0, "missing")
     pts = 0.0
     if iv_rank is not None:
-        # favor mid ranks (0.3-0.7), penalize extremes
         if 0.3 <= iv_rank <= 0.7:
             pts += 4.0
         elif iv_rank > 0.85:
@@ -207,7 +219,7 @@ def _score_liquidity(spread_pct: Optional[float], oi: Optional[float], vol: Opti
     if vol is not None and vol <= 10:
         pts -= 1.0
     if synthetic_nbbo_used:
-        # reduce penalty sensitivity when synthetic used (we don't want LLM to auto-skip)
+        # reduce penalty sensitivity when synthetic used (avoid auto-skip)
         pts += 1.5
         notes.append("synthetic-ok")
     return pts, _mk_reason("Liquidity", pts, "/".join(notes) if notes else "n/a")
@@ -217,9 +229,10 @@ def _score_structure(mtf_align: Any, regime_flag: Any) -> Tuple[float, str]:
     if isinstance(mtf_align, bool):
         pts += (4.0 if mtf_align else -2.0)
     if isinstance(regime_flag, str):
-        if regime_flag.lower().startswith("trending"):
+        rf = regime_flag.lower()
+        if rf.startswith("trending"):
             pts += 3.0
-        elif regime_flag.lower().startswith("choppy"):
+        elif rf.startswith("choppy"):
             pts -= 2.0
     return pts, _mk_reason("Structure", pts, f"mtf={mtf_align},regime={regime_flag}")
 
@@ -227,7 +240,6 @@ def _score_dte(dte: Optional[float]) -> Tuple[float, str]:
     if dte is None:
         return 0.0, _mk_reason("DTE", 0, "missing")
     pts = 0.0
-    # Light touch: avoid zero DTE unless forced; mild penalty for very long
     if dte <= 0:
         pts -= 10.0
         return pts, _mk_reason("DTE", pts, "0DTE high risk")
@@ -248,7 +260,8 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     # technicals
     rsi_pts, rsi_note = _score_rsi(side, _f(f.get("rsi14")))
     ema_pts, ema_note = _score_ema_stack(side, ul_price, _f(f.get("ema20")), _f(f.get("ema50")), _f(f.get("ema200")))
-    macd_pts, macd_note = _score_macd(side, _f(f.get("macd")), _f(f.get("macd_signal")), _f(f.get("macd_hist")))
+    macd_line = _f(f.get("macd_line")) if f.get("macd_line") is not None else _f(f.get("macd"))
+    macd_pts, macd_note = _score_macd(side, macd_line, _f(f.get("macd_signal")), _f(f.get("macd_hist")))
     vwap_pts, vwap_note = _score_vwap(side, ul_price, _f(f.get("vwap")), _f(f.get("vwap_dist")))
     boll_pts, boll_note = _score_bollinger(side, ul_price, _f(f.get("bb_upper")), _f(f.get("bb_lower")), _f(f.get("sma20")))
     tech_raw = rsi_pts + ema_pts + macd_pts + vwap_pts + boll_pts
@@ -284,12 +297,12 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     else:
         decision = "skip"
 
-    # confidence proportional to distance from boundary
+    # confidence proportional to distance from midline
     conf = 0.5 + abs(score - 50.0) / 100.0  # 0.5..1.0
     conf = round(_clip(conf, 0.5, 0.95), 2)
 
     reasons = [rsi_note, ema_note, macd_note, vwap_note, boll_note, orb_note, struct_note, delta_note, iv_note, dte_note, liq_note]
-    reason_text = "; ".join(reasons)
+    reason_text = _multiline(reasons)
 
     checklist = {
         "technicals": {
@@ -297,7 +310,7 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
             "ema20": _f(f.get("ema20")),
             "ema50": _f(f.get("ema50")),
             "ema200": _f(f.get("ema200")),
-            "macd": _f(f.get("macd")),
+            "macd_line": macd_line,
             "macd_signal": _f(f.get("macd_signal")),
             "macd_hist": _f(f.get("macd_hist")),
             "vwap": _f(f.get("vwap")),
@@ -334,8 +347,7 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
         "reason": reason_text,
         "checklist": checklist,
         "ev_estimate": {
-            # very rough directional "edge" proxy mapped from score
-            "edge_pct": round((score - 50.0) / 1.5, 2),  # -33..+33 approx
+            "edge_pct": round((score - 50.0) / 1.5, 2),  # rough directional proxy
             "score": round(score, 2),
         },
     }
@@ -344,11 +356,12 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
 
 def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
-        "rsi14","sma20","ema20","ema50","ema200","macd","macd_signal","macd_hist",
+        "rsi14","sma20","ema20","ema50","ema200",
+        "macd_line","macd","macd_signal","macd_hist",
         "vwap","vwap_dist","bb_upper","bb_lower","bb_width",
         "orb15_high","orb15_low","mtf_align","regime_flag","dte",
         "delta","gamma","theta","vega","iv","iv_rank","oi","vol",
-        "bid","ask","mid","option_spread_pct","synthetic_nbbo_used",
+        "bid","ask","mid","option_spread_pct","synthetic_nbbo_used","synthetic_nbbo_spread_est",
         "prev_close","quote_change_pct","nbbo_http_status","nbbo_reason","ta_src"
     ]
     out = {}
@@ -360,30 +373,32 @@ def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
 async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
     """
     Returns dict: {decision: buy|wait|skip, confidence: float, reason: str, checklist: {}, ev_estimate: {}}
-    - Explicit weights for RSI/EMA20/50/200/MACD/VWAP/Bollinger/ORB15 are applied in a deterministic rule blend.
-    - If OPENAI_API_KEY is present, we prompt a model to refine/justify, but we keep the structure & guardrails.
+    - Deterministic rule blend explicitly weighs RSI/EMA20/50/200/MACD/VWAP/Bollinger/ORB15, IV Rank, Greeks, structure & regime.
+    - If OPENAI_API_KEY is present, a model refines/justifies within ±10 absolute points; JSON-only output.
+    - Missing NBBO should not auto-skip; synthetic_nbbo_used reduces liquidity penalties.
     """
     # 1) Rule-based baseline
     baseline = _rule_blend(alert, features)
 
     # 2) If OpenAI not configured, return baseline
     if AsyncOpenAI is None or not os.getenv("OPENAI_API_KEY") or os.getenv("LLM_OFFLINE", "0") == "1":
-        baseline.setdefault("reason", "(offline rule-based)")
+        # annotate rather than overwrite detailed reasons
+        baseline["reason"] = baseline.get("reason", "") + ("\n(offline rule-based)" if "(offline rule-based)" not in baseline.get("reason","") else "")
         return baseline
 
     # 3) Ask model to refine *within bounds* and produce JSON
     try:
         client = AsyncOpenAI()
-        model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        model = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
         system_msg = (
-            "You are an options-trading analyst. You must weigh technical indicators explicitly:\n"
-            "- RSI(14), EMA(20/50/200) stack, MACD (line/signal/hist), VWAP distance,\n"
-            "- Bollinger (upper/lower/centerline), and 15-min ORB breakout/inside.\n"
-            "Blend with Greeks (Δ, Θ, ν) and IV/IV rank, plus execution (spread, OI/Vol).\n"
-            "Given a baseline weighted score, you may adjust modestly (<= ±10 absolute points) only if the narrative strongly supports it.\n"
-            "Never auto-skip solely from missing NBBO; if synthetic_nbbo_used is true, reduce execution penalties.\n"
-            "Return ONLY valid JSON with fields: decision, confidence, reason, checklist, ev_estimate."
+            "You are an options-trading analyst. Weigh factors explicitly with numeric contributions:\n"
+            "- RSI(14), EMA(20/50/200) stack, MACD(line/signal/hist), VWAP distance,\n"
+            "- Bollinger(20,2σ) upper/lower/centerline, 15m ORB breakout/inside,\n"
+            "- Greeks (Δ/Θ/ν) & IV/IV Rank, structure (MTF/regime), liquidity (spread, OI/Vol).\n"
+            "Use the provided baseline score and adjust modestly (≤ ±10 absolute points) only when justified.\n"
+            "Do NOT auto-skip merely for missing NBBO; if synthetic_nbbo_used=true, treat execution as cautious but acceptable.\n"
+            "Return ONLY valid JSON with keys: decision, confidence, reason, checklist, ev_estimate."
         )
 
         user_payload = {
@@ -419,9 +434,10 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
                     "role": "user",
                     "content": (
                         "Refine the baseline decision using the explicit weights. "
-                        "Be conservative with liquidity penalties if synthetic_nbbo_used=true. "
-                        "If key TA is missing, state that and do NOT over-weight liquidity/DTE. "
-                        "Here is the data:\n\n" + json.dumps(user_payload)
+                        "Penalize liquidity carefully if synthetic_nbbo_used=true. "
+                        "If key TA is missing, say so and avoid over-weighting liquidity/DTE. "
+                        "Make reasons multi-line with bracketed factor deltas like [RSI +x.x].\n\n"
+                        + json.dumps(user_payload, ensure_ascii=False)
                     ),
                 },
             ],
@@ -458,5 +474,7 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         logger.exception("LLM refine failed: %s", e)
         # Fall back to baseline, but annotate
         out = dict(baseline)
-        out["reason"] = f"{baseline['reason']} | LLM refine error: {type(e).__name__}: {e}"
+        add = f"(LLM refine error: {type(e).__name__}: {e})"
+        if add not in out.get("reason",""):
+            out["reason"] = out.get("reason","") + ("\n" if out.get("reason") else "") + add
         return out
