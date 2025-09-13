@@ -349,7 +349,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                         if nbbo_dbg2.get(k) is not None:
                             f[k] = nbbo_dbg2[k]
                     f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
-                    f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason"]
+                    f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
                 replacement_note = {"old": old_tk, "new": option_ticker, "why": "missing NBBO on initial pick"}
                 logger.info("Replaced due to missing NBBO: %s → %s", old_tk, option_ticker)
             except Exception as e:
