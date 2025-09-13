@@ -22,7 +22,7 @@ W_OPTION = float(os.getenv("LLM_W_OPTION", "15"))   # Delta + IV + OI/Vol tilt
 W_EXEC   = float(os.getenv("LLM_W_EXEC",   "10"))   # Spread + synthetic NBBO relief
 
 # model choice: stronger default (overridable)
-DEFAULT_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.1"))
+DEFAULT_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-5"))
 
 # --- tiny helpers -------------------------------------------------------------
 
