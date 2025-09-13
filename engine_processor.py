@@ -21,20 +21,10 @@ from engine_common import (
     _build_plus_minus_contracts,
     preflight_ok, compose_telegram_text,
 )
-# ---- polygon_ops imports with safe fallback for _rescan_best_replacement ----
-try:
-    from polygon_ops import (
-        _http_json, _http_get_any, _pull_nbbo_direct, _probe_nbbo_verbose,
-        _poly_reference_contracts_exists, _rescan_best_replacement, _find_nbbo_replacement_same_expiry,
-    )
-except ImportError:
-    from polygon_ops import (
-        _http_json, _http_get_any, _pull_nbbo_direct, _probe_nbbo_verbose,
-        _poly_reference_contracts_exists, _find_nbbo_replacement_same_expiry,
-    )
-    async def _rescan_best_replacement(*args, **kwargs):
-        # Fallback if polygon_ops doesn’t export it on your plan/build
-        return None
+from polygon_ops import (
+    _http_json, _http_get_any, _pull_nbbo_direct, _probe_nbbo_verbose,
+    _poly_reference_contracts_exists, _rescan_best_replacement, _find_nbbo_replacement_same_expiry,
+)
 
 from ibkr_client import place_recommended_option_order
 from llm_client import analyze_with_openai
@@ -53,6 +43,76 @@ from market_ops import (
 logger = logging.getLogger("trading_engine")
 
 
+# ---------- Synthetic NBBO helpers ----------
+def _synth_spread_pct_default() -> float:
+    """
+    Spread estimate depending on RTH/AH (overridable via env):
+      - SYNTH_SPREAD_PCT_RTH (default 1.0)
+      - SYNTH_SPREAD_PCT_AH  (default 2.0)
+      - fallback SYNTH_SPREAD_PCT (applies to both if specific not set)
+    """
+    fallback = os.getenv("SYNTH_SPREAD_PCT")
+    if fallback is not None:
+        try:
+            return float(fallback)
+        except Exception:
+            pass
+    rth = _is_rth_now()
+    return float(os.getenv("SYNTH_SPREAD_PCT_RTH", "1.0") if rth else os.getenv("SYNTH_SPREAD_PCT_AH", "2.0"))
+
+
+def _make_synthetic_nbbo_from_base(base_px: Optional[float], spread_pct: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Build synthetic NBBO around base price (last or mid). Returns keys:
+      synthetic_bid, synthetic_ask, synthetic_mid, synthetic_spread_pct
+    """
+    if not isinstance(base_px, (int, float)) or base_px <= 0:
+        return {}
+    spct = float(spread_pct if spread_pct is not None else _synth_spread_pct_default())
+    # Convert % to +/- half around base
+    half = spct / 200.0
+    bid = base_px * (1 - half / 100.0)
+    ask = base_px * (1 + half / 100.0)
+    mid = (bid + ask) / 2.0
+    return {
+        "synthetic_bid": round(bid, 4),
+        "synthetic_ask": round(ask, 4),
+        "synthetic_mid": round(mid, 4),
+        "synthetic_spread_pct": round((ask - bid) / mid * 100.0, 3) if mid > 0 else spct,
+    }
+
+
+def _adopt_synthetic_nbbo_if_missing(f: Dict[str, Any]) -> None:
+    """
+    If real NBBO is missing, adopt synthetic fields built from last/mid.
+    Sets flags so you can show it in Telegram & pass to LLM.
+    """
+    # Already have NBBO? nothing to do
+    if isinstance(f.get("bid"), (int, float)) and isinstance(f.get("ask"), (int, float)):
+        return
+
+    base = f.get("mid")
+    if not isinstance(base, (int, float)) or base <= 0:
+        base = f.get("last")
+
+    if not isinstance(base, (int, float)) or base <= 0:
+        # still no usable base
+        return
+
+    # Build (or rebuild) synthetic around base
+    synth = _make_synthetic_nbbo_from_base(base)
+    for k, v in synth.items():
+        f[k] = v
+
+    # Now adopt into NBBO fields if still missing
+    f.setdefault("bid", f.get("synthetic_bid"))
+    f.setdefault("ask", f.get("synthetic_ask"))
+    f.setdefault("mid", f.get("synthetic_mid"))
+    f.setdefault("option_spread_pct", f.get("synthetic_spread_pct"))
+    f["synthetic_nbbo_used"] = True
+    f["synthetic_nbbo_spread_est"] = synth.get("synthetic_spread_pct")
+
+
 # =========================
 # Core processing (called by runtime worker)
 # =========================
@@ -65,7 +125,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     selection_debug: Dict[str, Any] = {}
     replacement_note: Optional[Dict[str, Any]] = None
     option_ticker: Optional[str] = None
-    synthetic_used: bool = False  # flag to annotate Telegram when we adopt synthetic NBBO
 
     # 1) Parse
     try:
@@ -88,7 +147,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     # 2) Expiry defaulting
     ul_px = float(alert["underlying_price_from_alert"])
     today_utc = datetime.now(timezone.utc).date()
-    # compute two-weeks Friday, avoiding same-week overlap
     def _next_friday(d): return d + timedelta(days=(4 - d.weekday()) % 7)
     def same_week_friday(d): return (d - timedelta(days=d.weekday())) + timedelta(days=4)
     target_expiry_date = _next_friday(today_utc) + timedelta(days=7)
@@ -124,7 +182,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             pool = await scan_top_candidates_for_alert(
                 client,
                 alert["symbol"],
-                {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},  # noqa
+                {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
                 min_vol=scan_min_vol, min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
                 top_overall=6,
@@ -145,7 +203,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
         fallback_exp = str(orig_expiry or target_expiry)
-        # build fallback +/− strikes, then pick correct side
         option_ticker = pm["contract_call"] if side == "CALL" else pm["contract_put"]
         desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
         chosen_expiry = fallback_exp
@@ -172,20 +229,19 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            # backfill snapshot/greeks/oi/vol/iv/etc.
+            # A) enrich
             extra = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
             for k, v in (extra or {}).items():
                 if v is not None:
                     f[k] = v
 
-            # compute enriched features (adds synthetic_* fields when needed)
             snap = await polygon_get_option_snapshot_export(get_http_client(), underlying=alert["symbol"], option_ticker=option_ticker)
             core = await build_features(get_http_client(), alert={**alert, "strike": desired_strike, "expiry": chosen_expiry}, snapshot=snap)
             for k, v in (core or {}).items():
                 if v is not None or k not in f:
                     f[k] = v
 
-            # derive mid/spread when real NBBO present
+            # B) derive mid/spread if NBBO present
             try:
                 bid = f.get("bid"); ask = f.get("ask"); mid = f.get("mid")
                 if bid is not None and ask is not None:
@@ -198,7 +254,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # try live NBBO helpers
+            # C) aggressively ensure NBBO
             try:
                 if f.get("bid") is None or f.get("ask") is None:
                     nbbo = await ensure_nbbo(get_http_client(), option_ticker, tries=12, delay=0.35)
@@ -208,19 +264,20 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
+            # D) direct last-quote probe
             if f.get("bid") is None or f.get("ask") is None:
                 for k, v in (await _pull_nbbo_direct(option_ticker)).items():
                     if v is not None:
                         f[k] = v
 
-            # ensure DTE
+            # E) ensure DTE
             if f.get("dte") is None:
                 try:
                     f["dte"] = (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days
                 except Exception:
                     pass
 
-            # compute change% vs prev close (using mid or last)
+            # F) change vs prev close
             if f.get("quote_change_pct") is None:
                 try:
                     prev_close = f.get("prev_close")
@@ -230,11 +287,14 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 except Exception:
                     pass
 
-            # mid fallback from last
-            if (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("last"), (int, float)):
-                f.setdefault("mid", float(f["last"]))
+            # G) if NBBO still missing but we have last, adopt synthetic around last/mid
+            _adopt_synthetic_nbbo_if_missing(f)
 
-            # verbose NBBO probe (for status/reason)
+            # H) if still no spread but we have mid, set a soft spread (legacy fallback)
+            if (f.get("option_spread_pct") is None) and isinstance(f.get("mid"), (int, float)):
+                f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
+
+            # I) attach verbose NBBO status for debugging
             if f.get("bid") is None or f.get("ask") is None:
                 nbbo_dbg = await _probe_nbbo_verbose(option_ticker)
                 for k in ("bid", "ask", "mid", "option_spread_pct", "quote_age_sec"):
@@ -243,29 +303,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 f["nbbo_http_status"] = nbbo_dbg.get("nbbo_http_status")
                 f["nbbo_reason"] = nbbo_dbg.get("nbbo_reason")
                 f["nbbo_body_sample"] = nbbo_dbg.get("nbbo_body_sample")
-
-            # >>> adopt synthetic NBBO if real NBBO still missing <<<
-            if (f.get("bid") is None or f.get("ask") is None) and f.get("synthetic_mid") is not None:
-                f.setdefault("bid", f.get("synthetic_bid"))
-                f.setdefault("ask", f.get("synthetic_ask"))
-                f.setdefault("mid", f.get("synthetic_mid"))
-                f.setdefault("option_spread_pct", f.get("synthetic_spread_pct"))
-                if f.get("quote_age_sec") is None and f.get("synthetic_quote_age_sec") is not None:
-                    f["quote_age_sec"] = f["synthetic_quote_age_sec"]
-                # recompute change% once mid exists
-                try:
-                    if f.get("quote_change_pct") is None:
-                        prev_close = f.get("prev_close")
-                        mark = f.get("mid")
-                        if isinstance(mark, (int, float)) and isinstance(prev_close, (int, float)) and prev_close > 0:
-                            f["quote_change_pct"] = round((float(mark) - float(prev_close)) / float(prev_close) * 100.0, 3)
-                except Exception:
-                    pass
-                synthetic_used = True
-
-            # final soft-spread fallback
-            if (f.get("option_spread_pct") is None) and (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("mid"), (int, float)):
-                f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
 
     except Exception as e:
         logger.exception("[worker] Polygon/features error: %s", e)
@@ -361,6 +398,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     f"DTE={f.get('dte')}  Regime={f.get('regime_flag')}  (pre-LLM)\n"
                     f"NBBO dbg: status={f.get('nbbo_http_status')} reason={f.get('nbbo_reason')}\n"
                 )
+                if f.get("synthetic_nbbo_used"):
+                    pre_text += f"🧪 Synthetic NBBO used ({f.get('synthetic_nbbo_spread_est')}% spread est.)\n"
                 await send_telegram(pre_text)
         except Exception as e:
             logger.exception("[worker] Telegram pre-LLM chainscan error: %s", e)
@@ -368,6 +407,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     # 7) LLM
     pf_ok, pf_checks = preflight_ok(f)
     try:
+        # pass richer context for deeper rationale
         llm = await analyze_with_openai(alert, f)
         consume_llm()
     except Exception as e:
@@ -383,16 +423,14 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if force_buy:
         decision_final = "buy"
 
-    # Diff note (strike/expiry changes)
+    # Diff note (strike/expiry changes + synthetic NBBO note)
     diff_bits = []
     if isinstance(orig_strike, (int, float)) and isinstance(desired_strike, (int, float)) and float(orig_strike) != float(desired_strike):
         diff_bits.append(f"🎯 Selected strike {desired_strike} (alert was {orig_strike})")
     if orig_expiry and chosen_expiry and str(orig_expiry) != str(chosen_expiry):
         diff_bits.append(f"🗓 Selected expiry {chosen_expiry} (alert was {orig_expiry})")
-    if synthetic_used:
-        sp = f.get("option_spread_pct")
-        sp_txt = f"{sp:.1f}%" if isinstance(sp, (int, float)) else "est."
-        diff_bits.append(f"🧪 Synthetic NBBO used ({sp_txt} spread est.)")
+    if f.get("synthetic_nbbo_used"):
+        diff_bits.append(f"🧪 Synthetic NBBO used ({f.get('synthetic_nbbo_spread_est')}% spread est.)")
     diff_note = "\n".join(diff_bits)
 
     # 8) Telegram final
@@ -458,11 +496,13 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "dte": f.get("dte"), "em_vs_be_ok": f.get("em_vs_be_ok"),
             "mtf_align": f.get("mtf_align"), "sr_ok": f.get("sr_headroom_ok"), "iv": f.get("iv"),
             "iv_rank": f.get("iv_rank"), "rv20": f.get("rv20"), "regime": f.get("regime_flag"),
-            "prev_day_high": f.get("prev_day_high"), "prev_day_low": f.get("prev_day_low"),
-            "premarket_high": f.get("premarket_high"), "premarket_low": f.get("premarket_low"),
-            "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
-            "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
-            "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
+            "rsi14": f.get("rsi14"), "sma20": f.get("sma20"), "ema20": f.get("ema20"),
+            "ema50": f.get("ema50"), "ema200": f.get("ema200"),
+            "macd_line": f.get("macd_line"), "macd_signal": f.get("macd_signal"), "macd_hist": f.get("macd_hist"),
+            "bb_upper": f.get("bb_upper"), "bb_lower": f.get("bb_lower"), "bb_mid": f.get("bb_mid"),
+            "vwap": f.get("vwap"), "orb15_high": f.get("orb15_high"), "orb15_low": f.get("orb15_low"),
+            "synthetic_nbbo_used": f.get("synthetic_nbbo_used"),
+            "synthetic_nbbo_spread_est": f.get("synthetic_nbbo_spread_est"),
             "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
         },
         "pm_contracts": {
@@ -474,7 +514,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "alert_original": {"strike": orig_strike, "expiry": orig_expiry},
         "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
         "replacement": replacement_note,
-        "synthetic_nbbo_used": synthetic_used,
     })
 
 
@@ -545,7 +584,6 @@ async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
         "aggs": skim(out.get("aggs")),
     }
 
-
 async def net_debug_info() -> Dict[str, Any]:
     host = os.getenv("IBKR_HOST", "127.0.0.1")
     port = int(os.getenv("IBKR_PORT", "7497"))
@@ -564,6 +602,5 @@ async def net_debug_info() -> Dict[str, Any]:
         can_connect = False
         err = f"{e.__class__.__name__}: {e}"
     return {"ibkr_host": host, "ibkr_port": port, "egress_ip": out_ip, "connect_test": can_connect, "error": err}
-
 
 __all__ = ["process_tradingview_job", "diag_polygon_bundle", "net_debug_info"]
