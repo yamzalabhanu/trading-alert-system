@@ -1,28 +1,22 @@
-# feature_engine.py
 import os
 import math
+import time
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timedelta, timezone
-
-import numpy as np
-import httpx
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
 from engine_runtime import get_http_client
-from engine_common import POLYGON_API_KEY
-from config import CDT_TZ
+from engine_common import POLYGON_API_KEY, CDT_TZ
 
 logger = logging.getLogger("trading_engine.feature_engine")
 
-# =========================
-# HTTP helper
-# =========================
-async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+# ---------- Small HTTP helper ----------
+async def _http_json(url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+    client = get_http_client()
+    if client is None:
+        return None
     try:
         r = await client.get(url, params=params, timeout=timeout)
-        if r.status_code in (402, 403, 404, 429):
-            logger.info("[feature] aggs status=%s for %s", r.status_code, url)
-            return None
         r.raise_for_status()
         js = r.json()
         return js if isinstance(js, dict) else None
@@ -30,422 +24,408 @@ async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]
         logger.warning("[feature] _http_json error: %r", e)
         return None
 
-# =========================
-# NumPy TA primitives
-# =========================
-def _ema(x: np.ndarray, n: int) -> np.ndarray:
-    if x.size == 0:
-        return np.array([])
-    alpha = 2.0 / (n + 1.0)
-    out = np.empty_like(x, dtype=np.float64)
-    out[0] = x[0]
-    for i in range(1, x.size):
-        out[i] = alpha * x[i] + (1 - alpha) * out[i - 1]
-    return out
+# ---------- Time helpers ----------
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _sma(x: np.ndarray, n: int) -> np.ndarray:
-    if x.size < n:
-        return np.array([np.nan] * x.size)
-    csum = np.cumsum(x, dtype=float)
-    csum[n:] = csum[n:] - csum[:-n]
-    sma = csum[n - 1:] / n
-    return np.concatenate([np.full(n - 1, np.nan), sma])
-
-def _std(x: np.ndarray, n: int) -> np.ndarray:
-    if x.size < n:
-        return np.array([np.nan] * x.size)
-    out = np.full(x.size, np.nan)
-    for i in range(n - 1, x.size):
-        window = x[i - n + 1:i + 1]
-        out[i] = np.std(window, ddof=0)
-    return out
-
-def _rsi_wilder(close: np.ndarray, n: int = 14) -> np.ndarray:
-    if close.size < n + 1:
-        return np.array([np.nan] * close.size)
-    delta = np.diff(close, prepend=close[0])
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    avg_gain = np.empty_like(close); avg_loss = np.empty_like(close)
-    avg_gain[:n] = np.nan; avg_loss[:n] = np.nan
-    avg_gain[n] = np.mean(gain[1:n+1]); avg_loss[n] = np.mean(loss[1:n+1])
-    for i in range(n + 1, close.size):
-        avg_gain[i] = (avg_gain[i - 1] * (n - 1) + gain[i]) / n
-        avg_loss[i] = (avg_loss[i - 1] * (n - 1) + loss[i]) / n
-    rs = avg_gain / np.where(avg_loss == 0, np.nan, avg_loss)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi[:n] = np.nan
-    return rsi
-
-def _macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    ema_fast = _ema(close, fast)
-    ema_slow = _ema(close, slow)
-    macd = ema_fast - ema_slow
-    macd_signal = _ema(macd, signal)
-    macd_hist = macd - macd_signal
-    return macd, macd_signal, macd_hist
-
-def _vwap_from_bars(prices: np.ndarray, volumes: np.ndarray) -> Optional[float]:
-    if prices.size == 0 or volumes.size == 0 or np.sum(volumes) <= 0:
-        return None
-    return float(np.sum(prices * volumes) / np.sum(volumes))
-
-# =========================
-# Utilities
-# =========================
-def _ms(dt: datetime) -> int:
+def _to_ms(dt: datetime) -> int:
+    # Polygon v2/aggs accepts epoch ms or YYYY-MM-DD.
+    # We use epoch ms to get precise intraday windows.
     return int(dt.timestamp() * 1000)
 
-def _date(dt: datetime) -> str:
-    return dt.date().isoformat()  # YYYY-MM-DD (no tz, no time)
+# ---------- Basic TA ----------
+def _sma(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
 
-# =========================
-# Multi-tier aggregates (with correct path formats)
-# =========================
-async def _fetch_aggs_multi_tier(symbol: str) -> Tuple[str, List[Dict[str, Any]]]:
+def _ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    ema_val = sum(values[:period]) / period
+    for v in values[period:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
+
+def _rsi(values: List[float], period: int = 14) -> Optional[float]:
+    if len(values) <= period:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        chg = values[i] - values[i - 1]
+        if chg >= 0:
+            gains.append(chg)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-chg)
+    # Wilder's smoothing
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def _stddev(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    window = values[-period:]
+    mean = sum(window) / period
+    var = sum((x - mean) ** 2 for x in window) / period
+    return math.sqrt(var)
+
+def _macd(values: List[float], f=12, s=26, sig=9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if len(values) < (s + sig):
+        return (None, None, None)
+    ema_fast = _ema(values, f)
+    ema_slow = _ema(values, s)
+    if ema_fast is None or ema_slow is None:
+        return (None, None, None)
+    macd_line_series: List[float] = []
+    # Build EMA series to get proper macd signal
+    # We'll approximate by recomputing EMA across the whole list for robustness
+    # (Lightweight and sufficient here)
+    def ema_series(vals: List[float], period: int) -> List[Optional[float]]:
+        k = 2 / (period + 1)
+        out: List[Optional[float]] = []
+        if len(vals) < period:
+            return [None] * len(vals)
+        ema_v = sum(vals[:period]) / period
+        out.extend([None] * (period - 1))
+        out.append(ema_v)
+        for v in vals[period:]:
+            ema_v = v * k + ema_v * (1 - k)
+            out.append(ema_v)
+        return out
+
+    ema_f_series = ema_series(values, f)
+    ema_s_series = ema_series(values, s)
+    for ef, es in zip(ema_f_series, ema_s_series):
+        if ef is None or es is None:
+            macd_line_series.append(None)
+        else:
+            macd_line_series.append(ef - es)
+
+    # signal line EMA on macd_line
+    macd_clean = [m for m in macd_line_series if m is not None]
+    if len(macd_clean) < sig:
+        return (None, None, None)
+
+    # compute EMA over macd_line_series (ignoring Nones)
+    def ema_over_series(series: List[Optional[float]], period: int) -> List[Optional[float]]:
+        vals = [x for x in series if x is not None]
+        if len(vals) < period:
+            return [None] * len(series)
+        k2 = 2 / (period + 1)
+        ema_v2 = sum(vals[:period]) / period
+        result: List[Optional[float]] = []
+        # placeholders for the leading Nones
+        lead_nones = series.index(vals[0])
+        result.extend([None] * lead_nones)
+        # first EMA
+        result.append(ema_v2)
+        idx_vals = period
+        for i in range(lead_nones + 1, len(series)):
+            cur = series[i]
+            if cur is None:
+                result.append(result[-1])
+            else:
+                if idx_vals < len(vals):
+                    # should never happen in this flow
+                    pass
+                ema_v2 = cur * k2 + result[-1] * (1 - k2)
+                result.append(ema_v2)
+        # fix length
+        result = result[:len(series)]
+        if len(result) < len(series):
+            result.extend([None] * (len(series) - len(result)))
+        return result
+
+    macd_signal_series = ema_over_series(macd_line_series, sig)
+    macd_line = macd_line_series[-1]
+    macd_signal = macd_signal_series[-1]
+    if macd_line is None or macd_signal is None:
+        return (None, None, None)
+    macd_hist = macd_line - macd_signal
+    return (macd_line, macd_signal, macd_hist)
+
+# ---------- Polygon bars fetch ----------
+async def _fetch_aggs_polygon(
+    symbol: str,
+    multiplier: int,
+    timespan: str,  # "minute" or "day"
+    start: datetime,
+    end: datetime,
+    limit: int = 50000,
+) -> List[Dict[str, Any]]:
     """
-    Returns (src, bars) where src in {"1m","5m","1d","none"}.
-
-    Polygon v2 range path requirements:
-      • 1m/5m: use epoch milliseconds in the path
-      • 1d   : use YYYY-MM-DD (simple date) in the path
+    Returns list of bars with keys (t, o, h, l, c, v, vw) when available.
+    Uses epoch ms for from/to to satisfy Polygon v2 aggs format.
     """
     if not POLYGON_API_KEY:
-        return "none", []
-    client = get_http_client()
-    if client is None:
-        return "none", []
+        return []
 
-    now_utc = datetime.now(timezone.utc)
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{_to_ms(start)}/{_to_ms(end)}"
+    js = await _http_json(url, {"adjusted": "true", "sort": "asc", "limit": str(limit), "apiKey": POLYGON_API_KEY}, timeout=10.0)
+    if not js or not isinstance(js.get("results"), list):
+        return []
+    return js["results"]
 
-    # ---- 1m (3 days back) ----
+def _pick_close_series(bars: List[Dict[str, Any]]) -> List[float]:
+    out: List[float] = []
+    for b in bars:
+        c = b.get("c")
+        if isinstance(c, (int, float)):
+            out.append(float(c))
+    return out
+
+def _intraday_vwap(bars: List[Dict[str, Any]]) -> Optional[float]:
+    """
+    Session VWAP via sum(vw_i * v_i) / sum(v_i) if 'vw' present; else sum(c_i * v_i)/sum(v_i).
+    """
+    tot_pv = 0.0
+    tot_v = 0.0
+    for b in bars:
+        v = float(b.get("v") or 0.0)
+        if v <= 0:
+            continue
+        vw = b.get("vw")
+        if isinstance(vw, (int, float)):
+            price = float(vw)
+        else:
+            c = b.get("c")
+            if not isinstance(c, (int, float)):
+                continue
+            price = float(c)
+        tot_pv += price * v
+        tot_v += v
+    return (tot_pv / tot_v) if tot_v > 0 else None
+
+def _orb_15(bars_today_1m: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Opening Range Breakout (first 15 mins) for US equities:
+    RTH open ~ 13:30:00 UTC. We take bars where t in [13:30, 13:45) UTC.
+    """
+    if not bars_today_1m:
+        return (None, None)
+    # Polygon bar 't' is epoch ms UTC
+    open_utc = datetime.combine(datetime.utcnow().date(), datetime.min.time()).replace(tzinfo=timezone.utc) \
+               .replace(hour=13, minute=30, second=0, microsecond=0)
+    end_utc = open_utc + timedelta(minutes=15)
+    lo = None
+    hi = None
+    start_ms = _to_ms(open_utc)
+    end_ms = _to_ms(end_utc)
+    for b in bars_today_1m:
+        ts = b.get("t")
+        if not isinstance(ts, (int, float)):
+            continue
+        if start_ms <= ts < end_ms:
+            low = b.get("l"); high = b.get("h")
+            if isinstance(low, (int, float)):
+                lo = low if lo is None else min(lo, low)
+            if isinstance(high, (int, float)):
+                hi = high if hi is None else max(hi, high)
+    return (hi, lo)
+
+# ---------- TA Orchestrator ----------
+async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
+    """
+    Multi-tier fetch: 1m (2-3 days) -> 5m (~2 weeks) -> 1d (~2 years).
+    We combine to get best-available RSI/SMA/EMA/MACD/Bollinger/VWAP/ORB.
+    """
+    now = _now_utc()
+    out: Dict[str, Any] = {"ta_src": None}
+
+    # 1) 1-minute bars for today (VWAP & ORB) and recent history (RSI/EMA/SMA if enough)
     try:
-        frm = now_utc - timedelta(days=3)
-        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/min/{_ms(frm)}/{_ms(now_utc)}"
-        js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
-        bars_1m = (js or {}).get("results") or []
-        if len(bars_1m) >= 120:
-            return "1m", bars_1m
+        start_1m_hist = now - timedelta(days=3)
+        bars_1m = await _fetch_aggs_polygon(symbol, 1, "minute", start_1m_hist, now, limit=50000)
     except Exception as e:
         logger.warning("[feature] 1m fetch failed: %r", e)
+        bars_1m = []
 
-    # ---- 5m (14 days back) ----
+    # Today subset for VWAP/ORB
+    bars_1m_today: List[Dict[str, Any]] = []
+    if bars_1m:
+        # Keep bars with date == today
+        today_date = now.date()
+        for b in bars_1m:
+            ts = b.get("t")
+            if not isinstance(ts, (int, float)):
+                continue
+            dt = datetime.fromtimestamp(ts/1000.0, tz=timezone.utc).astimezone(timezone.utc)
+            if dt.date() == today_date:
+                bars_1m_today.append(b)
+
+    vwap = _intraday_vwap(bars_1m_today) if bars_1m_today else None
+    orb_hi, orb_lo = _orb_15(bars_1m_today) if bars_1m_today else (None, None)
+
+    closes_1m = _pick_close_series(bars_1m)
+    rsi14_1m = _rsi(closes_1m, 14) if len(closes_1m) >= 50 else None
+    sma20_1m = _sma(closes_1m, 20)
+    ema20_1m = _ema(closes_1m, 20)
+    ema50_1m = _ema(closes_1m, 50)
+    ema200_1m = _ema(closes_1m, 200)
+    macd_line_1m, macd_signal_1m, macd_hist_1m = _macd(closes_1m)
+
+    # 2) 5-minute bars as fallback
     try:
-        frm = now_utc - timedelta(days=14)
-        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/5/min/{_ms(frm)}/{_ms(now_utc)}"
-        js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
-        bars_5m = (js or {}).get("results") or []
-        if len(bars_5m) >= 120:
-            return "5m", bars_5m
+        start_5m = now - timedelta(days=14)
+        bars_5m = await _fetch_aggs_polygon(symbol, 5, "minute", start_5m, now, limit=50000)
     except Exception as e:
         logger.warning("[feature] 5m fetch failed: %r", e)
+        bars_5m = []
+    closes_5m = _pick_close_series(bars_5m)
+    rsi14_5m = _rsi(closes_5m, 14) if len(closes_5m) >= 50 else None
+    sma20_5m = _sma(closes_5m, 20)
+    ema20_5m = _ema(closes_5m, 20)
+    ema50_5m = _ema(closes_5m, 50)
+    ema200_5m = _ema(closes_5m, 200)
+    macd_line_5m, macd_signal_5m, macd_hist_5m = _macd(closes_5m)
 
-    # ---- 1d (2 years back) ----
+    # 3) Daily bars for longer trends / Bollinger
     try:
-        frm = now_utc - timedelta(days=365 * 2)
-        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{_date(frm)}/{_date(now_utc)}"
-        js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
-        bars_1d = (js or {}).get("results") or []
-        if len(bars_1d) >= 60:
-            return "1d", bars_1d
+        start_1d = now - timedelta(days=750)  # ~3 years to get EMA200 safely
+        bars_1d = await _fetch_aggs_polygon(symbol, 1, "day", start_1d, now, limit=50000)
     except Exception as e:
         logger.warning("[feature] 1d fetch failed: %r", e)
+        bars_1d = []
+    closes_1d = _pick_close_series(bars_1d)
+    rsi14_1d = _rsi(closes_1d, 14) if len(closes_1d) >= 30 else None
+    sma20_1d = _sma(closes_1d, 20)
+    ema20_1d = _ema(closes_1d, 20)
+    ema50_1d = _ema(closes_1d, 50)
+    ema200_1d = _ema(closes_1d, 200)
+    macd_line_1d, macd_signal_1d, macd_hist_1d = _macd(closes_1d)
 
-    return "none", []
+    # Bollinger (20, 2σ) from daily closes
+    bb_mid_1d = sma20_1d
+    bb_std_1d = _stddev(closes_1d, 20) if len(closes_1d) >= 20 else None
+    bb_upper_1d = (bb_mid_1d + 2 * bb_std_1d) if (bb_mid_1d is not None and bb_std_1d is not None) else None
+    bb_lower_1d = (bb_mid_1d - 2 * bb_std_1d) if (bb_mid_1d is not None and bb_std_1d is not None) else None
 
-# =========================
-# ORB-15 (intraday)
-# =========================
-def _orb15_from_intraday(bars: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
-    if not bars:
-        return None, None
-    today_local = datetime.now(CDT_TZ).date()
-    session_open_local = datetime.now(CDT_TZ).replace(hour=8, minute=30, second=0, microsecond=0)
-    session_open_local = session_open_local.replace(year=today_local.year, month=today_local.month, day=today_local.day)
-    first_15_end = session_open_local + timedelta(minutes=15)
-    hi = None; lo = None
-    for b in bars:
-        t_ms = int(b.get("t", 0))
-        t = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).astimezone(CDT_TZ)
-        if t.date() != today_local:
-            continue
-        if session_open_local <= t < first_15_end:
-            h = float(b.get("h", math.nan)); l = float(b.get("l", math.nan))
-            if not math.isnan(h):
-                hi = h if hi is None else max(hi, h)
-            if not math.isnan(l):
-                lo = l if lo is None else min(lo, l)
-    return hi, lo
-
-# =========================
-# TA from bars
-# =========================
-def _build_ta_from_bars(symbol: str, side: str, ul_price: Optional[float], src: str, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"ta_src": src}
-    if not bars:
-        return out
-
-    closes = np.array([float(b.get("c", np.nan)) for b in bars], dtype=float)
-    vols   = np.array([float(b.get("v", 0.0)) for b in bars], dtype=float)
-    if closes.size == 0 or np.all(np.isnan(closes)):
-        return out
-
-    rsi_series = _rsi_wilder(closes, 14)
-    rsi14 = float(rsi_series[-1]) if not np.isnan(rsi_series[-1]) else None
-
-    ema20_series  = _ema(closes, 20)
-    ema50_series  = _ema(closes, 50)
-    ema200_series = _ema(closes, 200)
-    ema20  = float(ema20_series[-1])  if not np.isnan(ema20_series[-1])  else None
-    ema50  = float(ema50_series[-1])  if not np.isnan(ema50_series[-1])  else None
-    ema200 = float(ema200_series[-1]) if not np.isnan(ema200_series[-1]) else None
-
-    sma20_series = _sma(closes, 20)
-    sma20 = float(sma20_series[-1]) if not np.isnan(sma20_series[-1]) else None
-
-    macd, macd_signal, macd_hist = _macd(closes, 12, 26, 9)
-    macd_v      = float(macd[-1])        if not np.isnan(macd[-1])        else None
-    macd_sig_v  = float(macd_signal[-1]) if not np.isnan(macd_signal[-1]) else None
-    macd_hist_v = float(macd_hist[-1])   if not np.isnan(macd_hist[-1])   else None
-
-    std20 = _std(closes, 20)
-    if not np.isnan(sma20_series[-1]) and not np.isnan(std20[-1]):
-        bb_upper = float(sma20_series[-1] + 2.0 * std20[-1])
-        bb_lower = float(sma20_series[-1] - 2.0 * std20[-1])
-        bb_width = float((bb_upper - bb_lower) / sma20_series[-1]) if sma20_series[-1] != 0 else None
-    else:
-        bb_upper = bb_lower = bb_width = None
-
-    # Session VWAP (today) if intraday bars available; else whole-window VWAP fallback
-    vwap = None
-    if src in ("1m", "5m"):
-        today_local = datetime.now(CDT_TZ).date()
-        px = []; vv = []
-        for b in bars:
-            t_ms = int(b.get("t", 0))
-            t = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).astimezone(CDT_TZ)
-            if t.date() == today_local:
-                px.append(float(b.get("c", np.nan))); vv.append(float(b.get("v", 0.0)))
-        if px and vv:
-            vwap = _vwap_from_bars(np.array(px, dtype=float), np.array(vv, dtype=float))
-    if vwap is None:
-        vwap = _vwap_from_bars(closes, vols)
-
-    vwap_dist = None
-    if vwap is not None and ul_price is not None and vwap != 0:
-        vwap_dist = float((ul_price - vwap) / vwap * 100.0)
-
-    if src in ("1m", "5m"):
-        orb_hi, orb_lo = _orb15_from_intraday(bars)
-    else:
-        orb_hi, orb_lo = (None, None)
-
-    out.update({
-        "rsi14": rsi14,
-        "sma20": sma20,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "macd": macd_v,
-        "macd_signal": macd_sig_v,
-        "macd_hist": macd_hist_v,
-        "bb_upper": bb_upper,
-        "bb_lower": bb_lower,
-        "bb_width": bb_width,
-        "vwap": vwap,
-        "vwap_dist": vwap_dist,
-        "orb15_high": orb_hi,
-        "orb15_low": orb_lo,
-    })
-    return out
-
-# =========================
-# Reference / Corporate actions
-# =========================
-async def _enrich_reference_and_corp(symbol: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    if not POLYGON_API_KEY:
-        return out
-    client = get_http_client()
-    if client is None:
-        return out
-
-    try:
-        ref = await _http_json(client, f"https://api.polygon.io/v3/reference/tickers/{symbol}",
-                               {"apiKey": POLYGON_API_KEY}, timeout=6.0)
-        if isinstance(ref, dict):
-            res = ref.get("results") or {}
-            out["ref_primary_exchange"] = (res.get("primary_exchange") or {}).get("mic")
-            out["ref_market_cap"] = res.get("market_cap")
-            out["ref_name"] = res.get("name")
-    except Exception:
-        pass
-
-    try:
-        dvd = await _http_json(client, "https://api.polygon.io/v3/reference/dividends",
-                               {"ticker": symbol, "limit": 1, "order": "desc", "apiKey": POLYGON_API_KEY}, timeout=6.0)
-        if isinstance(dvd, dict):
-            rs = (dvd.get("results") or [])
-            if rs:
-                r0 = rs[0]
-                out["dividend_ex_date"] = r0.get("ex_dividend_date")
-                out["dividend_amount"] = r0.get("cash_amount")
-    except Exception:
-        pass
-
-    try:
-        spl = await _http_json(client, "https://api.polygon.io/v3/reference/splits",
-                               {"ticker": symbol, "limit": 1, "order": "desc", "apiKey": POLYGON_API_KEY}, timeout=6.0)
-        if isinstance(spl, dict):
-            rs = (spl.get("results") or [])
-            if rs:
-                r0 = rs[0]
-                out["last_split_date"] = r0.get("execution_date")
-                out["last_split_ratio"] = (r0.get("split_from"), r0.get("split_to"))
-    except Exception:
-        pass
-
-    return out
-
-# =========================
-# Synthetic NBBO helpers
-# =========================
-def _convert_poly_ts_to_sec(ts_val: float) -> Optional[float]:
-    try:
-        ns = int(ts_val)
-        if ns >= 10**14: return ns / 1e9
-        if ns >= 10**11: return ns / 1e6
-        if ns >= 10**8:  return ns / 1e3
-        return float(ns)
-    except Exception:
+    # Choose best available granularity for each TA
+    # Preference: 1m (richest) -> 5m -> 1d
+    def _pick(*vals):
+        for v in vals:
+            if v is not None:
+                return v
         return None
 
-def _extract_last_price_and_ts(snapshot: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    last_price: Optional[float] = None
-    last_ts_sec: Optional[float] = None
-
-    def walk(obj: Any):
-        nonlocal last_price, last_ts_sec
-        if isinstance(obj, dict):
-            price_keys = ("price", "p", "last", "last_price", "lastPrice")
-            ts_keys = ("t", "timestamp", "sip_timestamp", "ts", "time")
-            found_price = None
-            for k in price_keys:
-                v = obj.get(k)
-                if isinstance(v, (int, float)):
-                    found_price = float(v)
-                    break
-            if found_price is not None and last_price is None:
-                last_price = found_price
-                for kt in ts_keys:
-                    tv = obj.get(kt)
-                    if isinstance(tv, (int, float)):
-                        last_ts_sec = _convert_poly_ts_to_sec(tv)
-                        break
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for it in obj:
-                walk(it)
-
-    try:
-        walk(snapshot or {})
-    except Exception:
-        pass
-    return last_price, last_ts_sec
-
-def synthesize_nbbo_from_last(last_price: Optional[float], spread_pct: Optional[float] = None,
-                              last_ts_sec: Optional[float] = None) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    if last_price is None or not isinstance(last_price, (int, float)) or last_price <= 0:
-        return out
-    try:
-        sp = float(spread_pct) if spread_pct is not None else float(
-            os.getenv("SYNTH_SPREAD_PCT", os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "12.0"))
-        )
-    except Exception:
-        sp = 12.0
-
-    half = sp / 200.0
-    bid = round(float(last_price) * (1.0 - half), 4)
-    ask = round(float(last_price) * (1.0 + half), 4)
-    mid = round((bid + ask) / 2.0, 4)
-
     out.update({
-        "synthetic_bid": bid,
-        "synthetic_ask": ask,
-        "synthetic_mid": mid,
-        "synthetic_spread_pct": float(sp),
+        "rsi14":    _pick(rsi14_1m, rsi14_5m, rsi14_1d),
+        "sma20":    _pick(sma20_1m, sma20_5m, sma20_1d),
+        "ema20":    _pick(ema20_1m, ema20_5m, ema20_1d),
+        "ema50":    _pick(ema50_1m, ema50_5m, ema50_1d),
+        "ema200":   _pick(ema200_1m, ema200_5m, ema200_1d),
+        "macd_line":   _pick(macd_line_1m, macd_line_5m, macd_line_1d),
+        "macd_signal": _pick(macd_signal_1m, macd_signal_5m, macd_signal_1d),
+        "macd_hist":   _pick(macd_hist_1m, macd_hist_5m, macd_hist_1d),
+        "bb_upper": bb_upper_1d,
+        "bb_lower": bb_lower_1d,
+        "bb_mid":   bb_mid_1d,
+        "vwap": vwap,
+        "orb15_high": orb_hi,
+        "orb15_low":  orb_lo,
     })
 
-    if last_ts_sec is not None:
-        try:
-            now_sec = datetime.now(timezone.utc).timestamp()
-            out["synthetic_quote_age_sec"] = max(0.0, now_sec - float(last_ts_sec))
-        except Exception:
-            pass
-
+    # Mark the primary source we managed to use for RSI/EMA20/SMA20
+    ta_src = None
+    if out["rsi14"] is not None and out["ema20"] is not None and out["sma20"] is not None:
+        if rsi14_1m == out["rsi14"] or ema20_1m == out["ema20"] or sma20_1m == out["sma20"]:
+            ta_src = "1m"
+        elif rsi14_5m == out["rsi14"] or ema20_5m == out["ema20"] or sma20_5m == out["sma20"]:
+            ta_src = "5m"
+        else:
+            ta_src = "1d"
+    else:
+        # pick the best available hint
+        ta_src = "1m" if closes_1m else ("5m" if closes_5m else ("1d" if closes_1d else None))
+    out["ta_src"] = ta_src
     return out
 
-def attach_synthetic_nbbo_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not snapshot:
+# ---------- Synthetic NBBO ----------
+def _synthetic_nbbo_from_last(last: Optional[float], base_spread_pct: float = None) -> Dict[str, Any]:
+    if not isinstance(last, (int, float)) or last <= 0:
         return {}
-    last_price, last_ts = _extract_last_price_and_ts(snapshot)
-    return synthesize_nbbo_from_last(last_price, None, last_ts)
+    # Wider synthetic after-hours, tighter in RTH via env knob
+    spread_pct = float(base_spread_pct if base_spread_pct is not None else os.getenv("SYNTH_SPREAD_PCT", "1.0"))
+    half = spread_pct / 200.0
+    bid = last * (1 - half / 100.0)
+    ask = last * (1 + half / 100.0)
+    mid = (bid + ask) / 2.0
+    return {
+        "synthetic_bid": round(bid, 4),
+        "synthetic_ask": round(ask, 4),
+        "synthetic_mid": round(mid, 4),
+        "synthetic_spread_pct": round((ask - bid) / mid * 100.0, 3) if mid > 0 else spread_pct,
+        "synthetic_quote_age_sec": None,  # set by caller if they have a timestamp
+    }
 
-# =========================
-# Public API
-# =========================
+# ---------- Public builder ----------
 async def build_features(
-    client: httpx.AsyncClient,
+    client,
     alert: Dict[str, Any],
     snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Build a rich feature bundle:
-      • TA (RSI14, SMA20, EMA20/50/200, MACD, Bollinger, VWAP, ORB-15) with multi-tier fallback (1m→5m→1d)
-      • Reference / Corporate actions (best-effort)
-      • Synthetic NBBO (returned as synthetic_* keys; does NOT overwrite real NBBO)
+    Build a unified feature dict combining:
+      - Option snapshot enrichments (when provided)
+      - TA on the UNDERLYING (RSI/SMA/EMA/MACD/BBands/VWAP/ORB)
+      - Synthetic NBBO fields (if needed) based on option 'last'
     """
-    symbol = str(alert.get("symbol") or "").upper()
-    side = str(alert.get("side") or "").upper()
-    try:
-        ul_price = float(alert.get("underlying_price_from_alert"))
-    except Exception:
-        ul_price = None
-
+    symbol = alert.get("symbol")
     out: Dict[str, Any] = {}
 
-    # --- TA via multi-tier bars (fixed date formats) ---
+    # Carry over some snapshot enrichments if provided by caller (market_ops)
+    if snapshot and isinstance(snapshot.get("results"), dict):
+        res = snapshot["results"]
+        # best-effort extra fields (these may already be incorporated by caller)
+        for k in ("day", "underlying_asset", "greeks", "implied_volatility"):
+            if k in res and out.get(k) is None:
+                out[k] = res[k]
+
+    # Technicals on the underlying
     try:
-        src, bars = await _fetch_aggs_multi_tier(symbol)
-        ta = _build_ta_from_bars(symbol, side, ul_price, src, bars)
+        ta = await _compute_ta_bundle(symbol)
         out.update(ta)
     except Exception as e:
-        logger.warning("[feature] TA build failed: %r", e)
-        out.setdefault("ta_src", "none")
+        logger.warning("[feature] TA compute failed: %r", e)
 
-    # Placeholders to keep downstream compatible
-    out.setdefault("regime_flag", "trending")
-    out.setdefault("mtf_align", False)
-
-    # --- Reference / Corp actions ---
+    # % change vs prior close on underlying (daily bars)
     try:
-        out.update(await _enrich_reference_and_corp(symbol))
+        now = _now_utc()
+        # Small 5d range to catch yesterday
+        bars_y = await _fetch_aggs_polygon(symbol, 1, "day", now - timedelta(days=5), now)
+        if isinstance(bars_y, list) and len(bars_y) >= 2:
+            last_c = bars_y[-1].get("c")
+            prev_c = bars_y[-2].get("c")
+            if isinstance(last_c, (int, float)) and isinstance(prev_c, (int, float)) and prev_c > 0:
+                out["ul_change_pct"] = round((float(last_c) - float(prev_c)) / float(prev_c) * 100.0, 3)
     except Exception as e:
-        logger.info("[feature] ref/corp enrich failed: %r", e)
+        logger.warning("[feature] UL change pct failed: %r", e)
 
-    # --- Synthetic NBBO from snapshot (safe: synthetic_* keys only) ---
+    # Synthetic NBBO seed from LAST if option NBBO missing downstream
+    # Caller will adopt synthetic_* if real NBBO still missing.
+    option_last = None
+    # If caller passed an option-level snapshot dict, try to extract last trade price
     try:
-        if snapshot:
-            out.update(attach_synthetic_nbbo_from_snapshot(snapshot))
-    except Exception as e:
-        logger.info("[feature] synthetic NBBO attach failed: %r", e)
+        if snapshot and isinstance(snapshot.get("results"), dict):
+            opt = snapshot["results"].get("option", {})
+            last_trade = opt.get("last_quote") or {}
+            # Not always present; we rely on market_ops.poly_option_backfill to set f['last'] too.
+    except Exception:
+        pass
 
+    # The caller (engine_processor) merges our fields into 'f' and already fetched f['last']
+    # We don't see that here. Provide a synthetic pack that engine can overlay later.
+    synth = _synthetic_nbbo_from_last(option_last, None)  # likely None here; engine will call this again if needed
+    out.update(synth)
     return out
-
-__all__ = [
-    "build_features",
-    "synthesize_nbbo_from_last",
-    "attach_synthetic_nbbo_from_snapshot",
-]
