@@ -1,9 +1,10 @@
 # engine_processor.py
 import os
 import re
+import math
 import socket
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -42,17 +43,11 @@ from market_ops import (
 
 logger = logging.getLogger("trading_engine")
 
-# ---------------------------------------------------------------------------
-# Synthetic NBBO helpers (new)
-# ---------------------------------------------------------------------------
+
+# =============================================================================
+# Synthetic NBBO helpers
+# =============================================================================
 def _spread_pct_heuristic(f: Dict[str, Any], rth: Optional[bool]) -> float:
-    """
-    Adaptive spread% when we synthesize bid/ask:
-      • tighter for high OI/Vol
-      • wider for thin / deep OTM (|delta| small) / penny options
-      • wider after-hours
-    Respect env override FALLBACK_SYNTH_SPREAD_PCT if set.
-    """
     env_override = os.getenv("FALLBACK_SYNTH_SPREAD_PCT")
     if env_override:
         try:
@@ -66,24 +61,15 @@ def _spread_pct_heuristic(f: Dict[str, Any], rth: Optional[bool]) -> float:
     mark_hint = f.get("mid", f.get("last", f.get("prev_close", 0.0)))
 
     # base by liquidity
-    if oi >= 5000 or vol >= 5000:
-        base = 3.0
-    elif oi >= 1000 or vol >= 1000:
-        base = 5.0
-    elif oi >= 200 or vol >= 200:
-        base = 8.0
-    else:
-        base = 12.0
+    if oi >= 5000 or vol >= 5000: base = 3.0
+    elif oi >= 1000 or vol >= 1000: base = 5.0
+    elif oi >= 200 or vol >= 200: base = 8.0
+    else: base = 12.0
 
-    # deep OTM often wider
     if isinstance(delta, (int, float)) and abs(delta) < 0.10:
         base += 2.0
-
-    # sub-10c options often trade wider
     if isinstance(mark_hint, (int, float)) and mark_hint < 0.10:
         base += 5.0
-
-    # after hours
     if rth is False:
         base *= 1.5
 
@@ -91,7 +77,6 @@ def _spread_pct_heuristic(f: Dict[str, Any], rth: Optional[bool]) -> float:
 
 
 def _ensure_mid(f: Dict[str, Any]) -> Optional[float]:
-    """Ensure we have a usable 'mid' anchor."""
     if isinstance(f.get("mid"), (int, float)):
         return float(f["mid"])
     if isinstance(f.get("last"), (int, float)):
@@ -104,10 +89,6 @@ def _ensure_mid(f: Dict[str, Any]) -> Optional[float]:
 
 
 def synthesize_nbbo_if_missing(f: Dict[str, Any], rth: Optional[bool]) -> bool:
-    """
-    If bid/ask are missing, synthesize bid/ask/spread around a mid anchor.
-    Returns True if synthesis applied.
-    """
     has_nbbo = isinstance(f.get("bid"), (int, float)) and isinstance(f.get("ask"), (int, float))
     if has_nbbo:
         return False
@@ -131,9 +112,159 @@ def synthesize_nbbo_if_missing(f: Dict[str, Any], rth: Optional[bool]) -> bool:
     f.setdefault("nbbo_http_status", 200)
     return True
 
-# =========================
-# Core processing (called by runtime worker)
-# =========================
+
+# =============================================================================
+# TA indicator helpers (RSI/SMA/EMA/MACD) with multi-tier Polygon aggregates
+# =============================================================================
+def _sma(vals: List[float], period: int) -> Optional[float]:
+    if len(vals) < period: return None
+    return float(sum(vals[-period:]) / period)
+
+def _ema(vals: List[float], period: int) -> Optional[float]:
+    if len(vals) < period: return None
+    k = 2.0 / (period + 1.0)
+    ema_val = sum(vals[:period]) / period  # seed with SMA of first 'period'
+    for v in vals[period:]:
+        ema_val = v * k + ema_val * (1.0 - k)
+    return float(ema_val)
+
+def _rsi(vals: List[float], period: int = 14) -> Optional[float]:
+    if len(vals) <= period: return None
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(1, len(vals)):
+        ch = vals[i] - vals[i-1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    if len(gains) < period or len(losses) < period:
+        return None
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    # Wilder smoothing
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return float(max(0.0, min(100.0, rsi)))
+
+def _macd(vals: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if len(vals) < max(slow, fast) + signal:
+        return (None, None, None)
+    ema_fast = []
+    ema_slow = []
+
+    def ema_series(x: List[float], period: int) -> List[float]:
+        k = 2.0 / (period + 1.0)
+        if len(x) < period:
+            return []
+        ema0 = sum(x[:period]) / period
+        out = [ema0]
+        for v in x[period:]:
+            out.append(v * k + out[-1] * (1.0 - k))
+        return out
+
+    ef = ema_series(vals, fast)
+    es = ema_series(vals, slow)
+    if not ef or not es:
+        return (None, None, None)
+
+    # align by the tail of the shorter list
+    min_len = min(len(ef), len(es))
+    macd_line_series = [ef[-min_len + i] - es[-min_len + i] for i in range(min_len)]
+
+    sig = _ema(macd_line_series, signal)
+    macd_line = macd_line_series[-1] if macd_line_series else None
+    hist = (macd_line - sig) if (macd_line is not None and sig is not None) else None
+    return (float(macd_line) if macd_line is not None else None,
+            float(sig) if sig is not None else None,
+            float(hist) if hist is not None else None)
+
+async def _polygon_aggs(underlying: str, mult: int, timespan: str, start_iso: str, end_iso: str) -> List[dict]:
+    client = get_http_client()
+    if client is None or not POLYGON_API_KEY:
+        return []
+    url = f"https://api.polygon.io/v2/aggs/ticker/{underlying}/range/{mult}/{timespan}/{start_iso}/{end_iso}"
+    try:
+        r = await client.get(url, params={"adjusted":"true","sort":"asc","limit":5000,"apiKey":POLYGON_API_KEY}, timeout=8.0)
+        if r.status_code != 200:
+            return []
+        js = r.json() or {}
+        res = js.get("results") or []
+        return res if isinstance(res, list) else []
+    except Exception:
+        return []
+
+def _iso(dt: datetime) -> str:
+    return dt.replace(tzinfo=timezone.utc).isoformat()
+
+async def _attach_ta_indicators(underlying: str, f: Dict[str, Any]) -> None:
+    """
+    Populate RSI14/SMA20/EMA20/MACD for the UNDERLYING using multi-tier fallback:
+      1m (≈ 6h) -> 5m (≈ 10d) -> 1d (≈ 300d)
+    Also compute ta_pct_change (last vs prev bar).
+    """
+    if not POLYGON_API_KEY:
+        return
+
+    now = datetime.now(timezone.utc)
+
+    tiers = [
+        # mult, span, lookback window, min bars, tag
+        (1,  "min",  now - timedelta(hours=6),  240, "1m"),
+        (5,  "min",  now - timedelta(days=10),  240, "5m"),
+        (1,  "day",  now - timedelta(days=300), 200, "1d"),
+    ]
+
+    closes: List[float] = []
+    src = None
+
+    for mult, span, start_dt, min_bars, tag in tiers:
+        bars = await _polygon_aggs(underlying, mult, span, _iso(start_dt), _iso(now))
+        cvals = [float(b.get("c")) for b in bars if isinstance(b.get("c"), (int, float))]
+        if len(cvals) >= min_bars:
+            closes = cvals
+            src = tag
+            break
+
+    # If still insufficient, take whatever we have from the last tier
+    if not closes:
+        # Try grab at least whatever daily has
+        bars = await _polygon_aggs(underlying, 1, "day", _iso(now - timedelta(days=365)), _iso(now))
+        closes = [float(b.get("c")) for b in bars if isinstance(b.get("c"), (int, float))]
+        src = src or "1d"
+
+    if not closes or len(closes) < 2:
+        # give at least a delta% if we have mid/last & prev_close at option level
+        if isinstance(f.get("quote_change_pct"), (int, float)):
+            f["ta_pct_change"] = float(f["quote_change_pct"])
+            f["ta_src"] = src
+        return
+
+    rsi14 = _rsi(closes, 14)
+    sma20 = _sma(closes, 20)
+    ema20 = _ema(closes, 20)
+    macd, macd_sig, macd_hist = _macd(closes, 12, 26, 9)
+    last = closes[-1]
+    prev = closes[-2]
+    pct_change = (last - prev) / prev * 100.0 if prev != 0 else None
+
+    # attach
+    f["rsi14"] = rsi14
+    f["sma20"] = sma20
+    f["ema20"] = ema20
+    f["macd"] = macd
+    f["macd_signal"] = macd_sig
+    f["macd_hist"] = macd_hist
+    f["ta_pct_change"] = float(pct_change) if pct_change is not None else None
+    f["ta_src"] = src
+
+
+# =============================================================================
+# Core processing
+# =============================================================================
 async def process_tradingview_job(job: Dict[str, Any]) -> None:
     client = get_http_client()
     if client is None:
@@ -154,6 +285,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         return
 
     side = alert["side"]
+    symbol = alert["symbol"]
     ib_enabled = bool(job["flags"].get("ib_enabled", IBKR_ENABLED))
     force_buy  = bool(job["flags"].get("force_buy", False))
     qty        = int(job["flags"].get("qty", IBKR_DEFAULT_QTY))
@@ -173,7 +305,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         target_expiry_date = swf + timedelta(days=7)
     target_expiry = target_expiry_date.isoformat()
 
-    pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
+    pm = _build_plus_minus_contracts(symbol, ul_px, target_expiry)
     desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
 
     # 3) Chain scan thresholds
@@ -185,8 +317,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     try:
         best_from_scan = await scan_for_best_contract_for_alert(
             client,
-            alert["symbol"],
-            {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+            symbol,
+            {"side": side, "symbol": symbol, "strike": alert.get("strike"), "expiry": alert.get("expiry")},
             min_vol=scan_min_vol, min_oi=scan_min_oi, top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
         )
     except Exception:
@@ -199,8 +331,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         try:
             pool = await scan_top_candidates_for_alert(
                 client,
-                alert["symbol"],
-                {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},  # noqa
+                symbol,
+                {"side": side, "symbol": symbol, "strike": alert.get("strike"), "expiry": alert.get("expiry")},
                 min_vol=scan_min_vol, min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
                 top_overall=6,
@@ -229,7 +361,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     chosen_expiry = selection_debug.get("chosen_expiry", str(orig_expiry or target_expiry))
 
-    # 4) Feature bundle + NBBO
+    # 4) Feature bundle + NBBO + TA indicators
     f: Dict[str, Any] = {}
     try:
         if not POLYGON_API_KEY:
@@ -247,18 +379,18 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 "above_pdh": None, "below_pdl": None, "above_pmh": None, "below_pml": None,
             }
         else:
-            extra = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
+            extra = await poly_option_backfill(client, symbol, option_ticker, datetime.now(timezone.utc).date())
             for k, v in (extra or {}).items():
                 if v is not None:
                     f[k] = v
 
-            snap = await polygon_get_option_snapshot_export(get_http_client(), underlying=alert["symbol"], option_ticker=option_ticker)
-            core = await build_features(get_http_client(), alert={**alert, "strike": desired_strike, "expiry": chosen_expiry}, snapshot=snap)
+            snap = await polygon_get_option_snapshot_export(client, underlying=symbol, option_ticker=option_ticker)
+            core = await build_features(client, alert={**alert, "strike": desired_strike, "expiry": chosen_expiry}, snapshot=snap)
             for k, v in (core or {}).items():
                 if v is not None or k not in f:
                     f[k] = v
 
-            # derive mid/spread if NBBO present
+            # derive mid/spread if we already have NBBO
             try:
                 bid = f.get("bid"); ask = f.get("ask"); mid = f.get("mid")
                 if bid is not None and ask is not None:
@@ -274,7 +406,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             # ensure NBBO (best-effort real)
             try:
                 if f.get("bid") is None or f.get("ask") is None:
-                    nbbo = await ensure_nbbo(get_http_client(), option_ticker, tries=12, delay=0.35)
+                    nbbo = await ensure_nbbo(client, option_ticker, tries=12, delay=0.35)
                     for k, v in (nbbo or {}).items():
                         if v is not None:
                             f[k] = v
@@ -316,6 +448,12 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             if (f.get("option_spread_pct") is None) and (f.get("bid") is None or f.get("ask") is None) and isinstance(f.get("mid"), (int, float)):
                 f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
 
+            # NEW: attach TA indicators for underlying with multi-tier fallback
+            try:
+                await _attach_ta_indicators(symbol, f)
+            except Exception as e:
+                logger.warning("TA attach failed: %r", e)
+
     except Exception as e:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
@@ -324,7 +462,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if REPLACE_IF_NO_NBBO and (f.get("bid") is None or f.get("ask") is None or (f.get("nbbo_http_status") and f.get("nbbo_http_status") != 200)):
         try:
             alt = await _find_nbbo_replacement_same_expiry(
-                symbol=alert["symbol"], side=side, desired_strike=desired_strike,
+                symbol=symbol, side=side, desired_strike=desired_strike,
                 expiry_iso=chosen_expiry, min_vol=scan_min_vol, min_oi=scan_min_oi,
             )
         except Exception:
@@ -336,7 +474,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             occ = _occ_meta(option_ticker)
             chosen_expiry = (occ["expiry"] if occ else str(alt.get("expiry") or chosen_expiry))
             try:
-                extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
+                extra2 = await poly_option_backfill(client, symbol, option_ticker, datetime.now(timezone.utc).date())
                 for k, v in (extra2 or {}).items():
                     if v is not None:
                         f[k] = v
@@ -357,12 +495,12 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     # 5) 404 replacement if contract truly not listed
     if f.get("nbbo_http_status") == 404 and POLYGON_API_KEY:
-        exist = await _poly_reference_contracts_exists(alert["symbol"], chosen_expiry, option_ticker)
+        exist = await _poly_reference_contracts_exists(symbol, chosen_expiry, option_ticker)
         logger.info("NBBO 404 verification: listed=%s snapshot_ok=%s reason=%s",
                     exist.get("listed"), exist.get("snapshot_ok"), exist.get("reason"))
         if exist.get("listed") is False and not exist.get("snapshot_ok"):
             repl = await _rescan_best_replacement(
-                symbol=alert["symbol"], side=side,
+                symbol=symbol, side=side,
                 desired_strike=desired_strike, expiry_iso=chosen_expiry,
                 min_vol=scan_min_vol, min_oi=scan_min_oi,
             )
@@ -373,7 +511,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 try:
                     occ = _occ_meta(option_ticker)
                     chosen_expiry = (occ["expiry"] if occ else str(repl.get("expiry") or chosen_expiry))
-                    extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
+                    extra2 = await poly_option_backfill(client, symbol, option_ticker, datetime.now(timezone.utc).date())
                     for k, v in (extra2 or {}).items():
                         if v is not None:
                             f[k] = v
@@ -396,7 +534,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     logger.warning("Replacement contract fetch failed: %r", e)
                     replacement_note = None
 
-    # 5c) FINAL: Synthetic NBBO pass (only if still missing after all real attempts/replacements)
+    # 5c) FINAL: Synthetic NBBO pass (only if still missing)
     try:
         synth_applied = synthesize_nbbo_if_missing(f, _is_rth_now())
         if synth_applied:
@@ -410,7 +548,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 pre_text = (
                     "🔎 Chain-Scan Pick (from TradingView alert)\n"
-                    f"{side} {alert['symbol']} | Strike {desired_strike} | Exp {chosen_expiry}\n"
+                    f"{side} {symbol} | Strike {desired_strike} | Exp {chosen_expiry}\n"
                     f"Contract: {option_ticker}\n"
                     f"NBBO {f.get('bid')}/{f.get('ask')}  Mark={f.get('mid')}  Last={f.get('last')}\n"
                     f"Spread%={f.get('option_spread_pct')}  QuoteAge(s)={f.get('quote_age_sec')}\n"
@@ -448,6 +586,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         diff_bits.append(f"🗓 Selected expiry {chosen_expiry} (alert was {orig_expiry})")
     diff_note = "\n".join(diff_bits)
 
+    # TA compact line for Telegram
+    def _fmt(x, n=2):
+        return ("None" if x is None else (f"{x:.{n}f}" if isinstance(x, (int, float)) else str(x)))
+    ta_line = f"📈 RSI14={_fmt(f.get('rsi14'))} SMA20≈{_fmt(f.get('sma20'))} EMA20≈{_fmt(f.get('ema20'))} Δ%≈{_fmt(f.get('ta_pct_change'))} src:{_fmt(f.get('ta_src'),0)}"
+
     # 8) Telegram final
     try:
         tg_text = compose_telegram_text(
@@ -455,6 +598,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating,
             diff_note=diff_note,
         )
+        # append TA line
+        tg_text += f"\n{ta_line}"
         if selection_debug.get("selected_by","").startswith("chain_scan"):
             tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
         if replacement_note is not None:
@@ -481,7 +626,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             limit_px = None if use_market else float(mid) if mid is not None else None
 
             ib_result_obj = await place_recommended_option_order(
-                symbol=alert["symbol"], side=side,
+                symbol=symbol, side=side,
                 strike=float(desired_strike), expiry_iso=chosen_expiry,
                 quantity=int(qty),
                 limit_price=limit_px, action="BUY", tif=IBKR_TIF,
@@ -492,7 +637,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     # 10) Decision log
     _DECISIONS_LOG.append({
         "timestamp_local": market_now(),
-        "symbol": alert["symbol"],
+        "symbol": symbol,
         "side": side,
         "option_ticker": option_ticker,
         "decision_final": decision_final,
@@ -516,6 +661,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "vwap": f.get("vwap"), "vwap_dist": f.get("vwap_dist"),
             "above_pdh": f.get("above_pdh"), "below_pdl": f.get("below_pdl"),
             "above_pmh": f.get("above_pmh"), "below_pml": f.get("below_pml"),
+            "rsi14": f.get("rsi14"), "sma20": f.get("sma20"), "ema20": f.get("ema20"),
+            "macd": f.get("macd"), "macd_signal": f.get("macd_signal"), "macd_hist": f.get("macd_hist"),
+            "ta_pct_change": f.get("ta_pct_change"), "ta_src": f.get("ta_src"),
             "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
             "nbbo_synthetic": f.get("nbbo_synthetic", False),
         },
@@ -530,9 +678,10 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "replacement": replacement_note,
     })
 
-# =========================
+
+# =============================================================================
 # Diagnostics
-# =========================
+# =============================================================================
 async def diag_polygon_bundle(underlying: str, contract: str) -> Dict[str, Any]:
     client = get_http_client()
     if client is None:
