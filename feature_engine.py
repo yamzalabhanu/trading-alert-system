@@ -91,11 +91,24 @@ def _vwap_from_bars(prices: np.ndarray, volumes: np.ndarray) -> Optional[float]:
     return float(np.sum(prices * volumes) / np.sum(volumes))
 
 # =========================
-# Multi-tier aggregates
+# Utilities
+# =========================
+def _ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+def _date(dt: datetime) -> str:
+    return dt.date().isoformat()  # YYYY-MM-DD (no tz, no time)
+
+# =========================
+# Multi-tier aggregates (with correct path formats)
 # =========================
 async def _fetch_aggs_multi_tier(symbol: str) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Returns (src, bars) where src in {"1m","5m","1d","none"}.
+
+    Polygon v2 range path requirements:
+      • 1m/5m: use epoch milliseconds in the path
+      • 1d   : use YYYY-MM-DD (simple date) in the path
     """
     if not POLYGON_API_KEY:
         return "none", []
@@ -105,29 +118,38 @@ async def _fetch_aggs_multi_tier(symbol: str) -> Tuple[str, List[Dict[str, Any]]
 
     now_utc = datetime.now(timezone.utc)
 
-    # Try 1m (3 days)
-    frm = now_utc - timedelta(days=3)
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/min/{frm.isoformat()}/{now_utc.isoformat()}"
-    js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
-    bars_1m = (js or {}).get("results") or []
-    if len(bars_1m) >= 120:
-        return "1m", bars_1m
+    # ---- 1m (3 days back) ----
+    try:
+        frm = now_utc - timedelta(days=3)
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/min/{_ms(frm)}/{_ms(now_utc)}"
+        js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
+        bars_1m = (js or {}).get("results") or []
+        if len(bars_1m) >= 120:
+            return "1m", bars_1m
+    except Exception as e:
+        logger.warning("[feature] 1m fetch failed: %r", e)
 
-    # Try 5m (14 days)
-    frm = now_utc - timedelta(days=14)
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/5/min/{frm.isoformat()}/{now_utc.isoformat()}"
-    js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
-    bars_5m = (js or {}).get("results") or []
-    if len(bars_5m) >= 120:
-        return "5m", bars_5m
+    # ---- 5m (14 days back) ----
+    try:
+        frm = now_utc - timedelta(days=14)
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/5/min/{_ms(frm)}/{_ms(now_utc)}"
+        js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
+        bars_5m = (js or {}).get("results") or []
+        if len(bars_5m) >= 120:
+            return "5m", bars_5m
+    except Exception as e:
+        logger.warning("[feature] 5m fetch failed: %r", e)
 
-    # Try daily (2y)
-    frm = now_utc - timedelta(days=365 * 2)
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{frm.isoformat()}/{now_utc.isoformat()}"
-    js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
-    bars_1d = (js or {}).get("results") or []
-    if len(bars_1d) >= 60:
-        return "1d", bars_1d
+    # ---- 1d (2 years back) ----
+    try:
+        frm = now_utc - timedelta(days=365 * 2)
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{_date(frm)}/{_date(now_utc)}"
+        js = await _http_json(client, url, {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY})
+        bars_1d = (js or {}).get("results") or []
+        if len(bars_1d) >= 60:
+            return "1d", bars_1d
+    except Exception as e:
+        logger.warning("[feature] 1d fetch failed: %r", e)
 
     return "none", []
 
@@ -148,7 +170,7 @@ def _orb15_from_intraday(bars: List[Dict[str, Any]]) -> Tuple[Optional[float], O
         if t.date() != today_local:
             continue
         if session_open_local <= t < first_15_end:
-            h = float(b.get("h", np.nan)); l = float(b.get("l", np.nan))
+            h = float(b.get("h", math.nan)); l = float(b.get("l", math.nan))
             if not math.isnan(h):
                 hi = h if hi is None else max(hi, h)
             if not math.isnan(l):
@@ -171,20 +193,20 @@ def _build_ta_from_bars(symbol: str, side: str, ul_price: Optional[float], src: 
     rsi_series = _rsi_wilder(closes, 14)
     rsi14 = float(rsi_series[-1]) if not np.isnan(rsi_series[-1]) else None
 
-    ema20_series = _ema(closes, 20) if closes.size >= 1 else np.array([np.nan])
-    ema50_series = _ema(closes, 50) if closes.size >= 1 else np.array([np.nan])
-    ema200_series = _ema(closes, 200) if closes.size >= 1 else np.array([np.nan])
-    ema20 = float(ema20_series[-1]) if not np.isnan(ema20_series[-1]) else None
-    ema50 = float(ema50_series[-1]) if closes.size >= 50 and not np.isnan(ema50_series[-1]) else None
-    ema200 = float(ema200_series[-1]) if closes.size >= 200 and not np.isnan(ema200_series[-1]) else None
+    ema20_series  = _ema(closes, 20)
+    ema50_series  = _ema(closes, 50)
+    ema200_series = _ema(closes, 200)
+    ema20  = float(ema20_series[-1])  if not np.isnan(ema20_series[-1])  else None
+    ema50  = float(ema50_series[-1])  if not np.isnan(ema50_series[-1])  else None
+    ema200 = float(ema200_series[-1]) if not np.isnan(ema200_series[-1]) else None
 
     sma20_series = _sma(closes, 20)
     sma20 = float(sma20_series[-1]) if not np.isnan(sma20_series[-1]) else None
 
     macd, macd_signal, macd_hist = _macd(closes, 12, 26, 9)
-    macd_v = float(macd[-1]) if not np.isnan(macd[-1]) else None
-    macd_sig_v = float(macd_signal[-1]) if not np.isnan(macd_signal[-1]) else None
-    macd_hist_v = float(macd_hist[-1]) if not np.isnan(macd_hist[-1]) else None
+    macd_v      = float(macd[-1])        if not np.isnan(macd[-1])        else None
+    macd_sig_v  = float(macd_signal[-1]) if not np.isnan(macd_signal[-1]) else None
+    macd_hist_v = float(macd_hist[-1])   if not np.isnan(macd_hist[-1])   else None
 
     std20 = _std(closes, 20)
     if not np.isnan(sma20_series[-1]) and not np.isnan(std20[-1]):
@@ -194,6 +216,7 @@ def _build_ta_from_bars(symbol: str, side: str, ul_price: Optional[float], src: 
     else:
         bb_upper = bb_lower = bb_width = None
 
+    # Session VWAP (today) if intraday bars available; else whole-window VWAP fallback
     vwap = None
     if src in ("1m", "5m"):
         today_local = datetime.now(CDT_TZ).date()
@@ -285,7 +308,7 @@ async def _enrich_reference_and_corp(symbol: str) -> Dict[str, Any]:
     return out
 
 # =========================
-# Synthetic NBBO
+# Synthetic NBBO helpers
 # =========================
 def _convert_poly_ts_to_sec(ts_val: float) -> Optional[float]:
     try:
@@ -298,10 +321,6 @@ def _convert_poly_ts_to_sec(ts_val: float) -> Optional[float]:
         return None
 
 def _extract_last_price_and_ts(snapshot: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Robustly walk the snapshot dict to find a last trade price and timestamp.
-    Looks for keys like 'price', 'p', 'last', 'last_price' and ts keys like 't', 'timestamp', 'sip_timestamp'.
-    """
     last_price: Optional[float] = None
     last_ts_sec: Optional[float] = None
 
@@ -318,7 +337,6 @@ def _extract_last_price_and_ts(snapshot: Dict[str, Any]) -> Tuple[Optional[float
                     break
             if found_price is not None and last_price is None:
                 last_price = found_price
-                # try to grab a sibling timestamp
                 for kt in ts_keys:
                     tv = obj.get(kt)
                     if isinstance(tv, (int, float)):
@@ -338,14 +356,9 @@ def _extract_last_price_and_ts(snapshot: Dict[str, Any]) -> Tuple[Optional[float
 
 def synthesize_nbbo_from_last(last_price: Optional[float], spread_pct: Optional[float] = None,
                               last_ts_sec: Optional[float] = None) -> Dict[str, Any]:
-    """
-    Build a synthetic NBBO envelope around a last price.
-    - spread_pct: total % width (ask-bid)/mid*100 (defaults from env: SYNTH_SPREAD_PCT or FALLBACK_SYNTH_SPREAD_PCT)
-    """
     out: Dict[str, Any] = {}
     if last_price is None or not isinstance(last_price, (int, float)) or last_price <= 0:
         return out
-
     try:
         sp = float(spread_pct) if spread_pct is not None else float(
             os.getenv("SYNTH_SPREAD_PCT", os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "12.0"))
@@ -375,9 +388,6 @@ def synthesize_nbbo_from_last(last_price: Optional[float], spread_pct: Optional[
     return out
 
 def attach_synthetic_nbbo_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Extract last price + ts from Polygon snapshot and return synthetic_* NBBO fields.
-    """
     if not snapshot:
         return {}
     last_price, last_ts = _extract_last_price_and_ts(snapshot)
@@ -406,7 +416,7 @@ async def build_features(
 
     out: Dict[str, Any] = {}
 
-    # --- TA via multi-tier bars ---
+    # --- TA via multi-tier bars (fixed date formats) ---
     try:
         src, bars = await _fetch_aggs_multi_tier(symbol)
         ta = _build_ta_from_bars(symbol, side, ul_price, src, bars)
@@ -436,7 +446,6 @@ async def build_features(
 
 __all__ = [
     "build_features",
-    # optional helpers if you want to use them in the processor:
     "synthesize_nbbo_from_last",
     "attach_synthetic_nbbo_from_snapshot",
 ]
