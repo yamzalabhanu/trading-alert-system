@@ -39,6 +39,12 @@ from market_ops import (
     ensure_nbbo,
 )
 
+# ---- Safe decisions log import ----
+try:
+    from reporting import _DECISIONS_LOG
+except Exception:
+    _DECISIONS_LOG = []
+
 logger = logging.getLogger("trading_engine")
 
 
@@ -62,7 +68,7 @@ def _synth_spread_pct_default() -> float:
 
 def _make_synthetic_nbbo_from_base(base_px: Optional[float], spread_pct: Optional[float] = None) -> Dict[str, Any]:
     """
-    Build synthetic NBBO around base price (last or mid). Returns keys:
+    Build synthetic NBBO around base price. Returns keys:
       synthetic_bid, synthetic_ask, synthetic_mid, synthetic_spread_pct
     """
     if not isinstance(base_px, (int, float)) or base_px <= 0:
@@ -83,33 +89,50 @@ def _make_synthetic_nbbo_from_base(base_px: Optional[float], spread_pct: Optiona
 
 def _adopt_synthetic_nbbo_if_missing(f: Dict[str, Any]) -> None:
     """
-    If real NBBO is missing, adopt synthetic fields built from last/mid.
-    Sets flags so you can show it in Telegram & pass to LLM.
+    If real NBBO is missing, adopt synthetic fields using best available base:
+    mid → last → prev_close → theo_price. Records base source & provider.
     """
     # Already have NBBO? nothing to do
     if isinstance(f.get("bid"), (int, float)) and isinstance(f.get("ask"), (int, float)):
         return
 
-    base = f.get("mid")
-    if not isinstance(base, (int, float)) or base <= 0:
-        base = f.get("last")
+    base = None
+    base_src = None
 
-    if not isinstance(base, (int, float)) or base <= 0:
-        # still no usable base
+    for key in ("mid", "last", "prev_close", "theo_price"):
+        v = f.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            base = float(v)
+            base_src = key
+            break
+
+    if base is None:
+        # No usable base—note attempt and exit gracefully
+        f["synthetic_nbbo_attempted"] = True
+        f.setdefault("nbbo_provider", "unavailable")
         return
 
-    # Build (or rebuild) synthetic around base
+    # Optional minimum base clamp to avoid pennies collapsing spreads
+    try:
+        synth_min = float(os.getenv("SYNTH_MIN_BASE", "0.0"))
+        base = max(base, synth_min)
+    except Exception:
+        pass
+
     synth = _make_synthetic_nbbo_from_base(base)
     for k, v in synth.items():
         f[k] = v
 
-    # Now adopt into NBBO fields if still missing
+    # Adopt into NBBO fields if still missing
     f.setdefault("bid", f.get("synthetic_bid"))
     f.setdefault("ask", f.get("synthetic_ask"))
     f.setdefault("mid", f.get("synthetic_mid"))
     f.setdefault("option_spread_pct", f.get("synthetic_spread_pct"))
+
     f["synthetic_nbbo_used"] = True
     f["synthetic_nbbo_spread_est"] = synth.get("synthetic_spread_pct")
+    f["synthetic_nbbo_base_src"] = base_src
+    f.setdefault("nbbo_provider", f"synthetic(base={base_src})")
 
 
 async def _try_multi_provider_nbbo(option_ticker: str, alert: Dict[str, Any], chosen_strike: float, chosen_expiry: str, f: Dict[str, Any]) -> None:
@@ -144,7 +167,7 @@ async def _try_multi_provider_nbbo(option_ticker: str, alert: Dict[str, Any], ch
         alt = None
 
     if not alt:
-        # As a courtesy, try their synthetic helper if they provide one
+        # Courtesy: try their synthetic helper if available
         try:
             syn = synthetic_from_last(f.get("last"))
         except Exception:
@@ -352,7 +375,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 except Exception:
                     pass
 
-            # G) if NBBO still missing but we have last/mid, adopt synthetic
+            # G) if NBBO still missing adopt synthetic from best base
             _adopt_synthetic_nbbo_if_missing(f)
 
             # H) if still no spread but we have mid, set a soft spread (legacy fallback)
@@ -501,7 +524,10 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if f.get("nbbo_provider") and not f.get("synthetic_nbbo_used"):
         diff_bits.append(f"📡 NBBO via {f.get('nbbo_provider')}")
     if f.get("synthetic_nbbo_used"):
-        diff_bits.append(f"🧪 Synthetic NBBO used ({f.get('synthetic_nbbo_spread_est')}% spread est.)")
+        msg = f"🧪 Synthetic NBBO used ({f.get('synthetic_nbbo_spread_est')}% spread est.)"
+        if f.get("synthetic_nbbo_base_src"):
+            msg += f" [base={f.get('synthetic_nbbo_base_src')}]"
+        diff_bits.append(msg)
     diff_note = "\n".join(diff_bits)
 
     # 8) Telegram final
@@ -545,48 +571,51 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         ib_result_obj = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    # 10) Decision log
-    _DECISIONS_LOG.append({
-        "timestamp_local": market_now(),
-        "symbol": alert["symbol"],
-        "side": side,
-        "option_ticker": option_ticker,
-        "decision_final": decision_final,
-        "decision_path": f"llm.{decision_final}",
-        "prescore": None,
-        "llm": {"ran": True, "decision": llm.get("decision"),
-                "confidence": llm.get("confidence"), "reason": llm.get("reason")},
-        "features": {
-            "reco_expiry": chosen_expiry,
-            "oi": f.get("oi"), "vol": f.get("vol"),
-            "bid": f.get("bid"), "ask": f.get("ask"),
-            "mark": f.get("mid"), "last": f.get("last"),
-            "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
-            "prev_close": f.get("prev_close"), "quote_change_pct": f.get("quote_change_pct"),
-            "delta": f.get("delta"), "gamma": f.get("gamma"), "theta": f.get("theta"), "vega": f.get("vega"),
-            "dte": f.get("dte"), "em_vs_be_ok": f.get("em_vs_be_ok"),
-            "mtf_align": f.get("mtf_align"), "sr_ok": f.get("sr_headroom_ok"), "iv": f.get("iv"),
-            "iv_rank": f.get("iv_rank"), "rv20": f.get("rv20"), "regime": f.get("regime_flag"),
-            "rsi14": f.get("rsi14"), "sma20": f.get("sma20"), "ema20": f.get("ema20"),
-            "ema50": f.get("ema50"), "ema200": f.get("ema200"),
-            "macd_line": f.get("macd_line"), "macd_signal": f.get("macd_signal"), "macd_hist": f.get("macd_hist"),
-            "bb_upper": f.get("bb_upper"), "bb_lower": f.get("bb_lower"), "bb_mid": f.get("bb_mid"),
-            "vwap": f.get("vwap"), "orb15_high": f.get("orb15_high"), "orb15_low": f.get("orb15_low"),
-            "synthetic_nbbo_used": f.get("synthetic_nbbo_used"),
-            "synthetic_nbbo_spread_est": f.get("synthetic_nbbo_spread_est"),
-            "nbbo_provider": f.get("nbbo_provider"),
-            "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
-        },
-        "pm_contracts": {
-            "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
-            "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
-        },
-        "ibkr": {"enabled": ib_enabled, "attempted": ib_attempted, "result": ib_result_obj},
-        "selection_debug": selection_debug,
-        "alert_original": {"strike": orig_strike, "expiry": orig_expiry},
-        "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
-        "replacement": replacement_note,
-    })
+    # 10) Decision log (guarded)
+    try:
+        _DECISIONS_LOG.append({
+            "timestamp_local": market_now(),
+            "symbol": alert["symbol"],
+            "side": side,
+            "option_ticker": option_ticker,
+            "decision_final": decision_final,
+            "decision_path": f"llm.{decision_final}",
+            "prescore": None,
+            "llm": {"ran": True, "decision": llm.get("decision"),
+                    "confidence": llm.get("confidence"), "reason": llm.get("reason")},
+            "features": {
+                "reco_expiry": chosen_expiry,
+                "oi": f.get("oi"), "vol": f.get("vol"),
+                "bid": f.get("bid"), "ask": f.get("ask"),
+                "mark": f.get("mid"), "last": f.get("last"),
+                "spread_pct": f.get("option_spread_pct"), "quote_age_sec": f.get("quote_age_sec"),
+                "prev_close": f.get("prev_close"), "quote_change_pct": f.get("quote_change_pct"),
+                "delta": f.get("delta"), "gamma": f.get("gamma"), "theta": f.get("theta"), "vega": f.get("vega"),
+                "dte": f.get("dte"), "em_vs_be_ok": f.get("em_vs_be_ok"),
+                "mtf_align": f.get("mtf_align"), "sr_ok": f.get("sr_headroom_ok"), "iv": f.get("iv"),
+                "iv_rank": f.get("iv_rank"), "rv20": f.get("rv20"), "regime": f.get("regime_flag"),
+                "rsi14": f.get("rsi14"), "sma20": f.get("sma20"), "ema20": f.get("ema20"),
+                "ema50": f.get("ema50"), "ema200": f.get("ema200"),
+                "macd_line": f.get("macd_line"), "macd_signal": f.get("macd_signal"), "macd_hist": f.get("macd_hist"),
+                "bb_upper": f.get("bb_upper"), "bb_lower": f.get("bb_lower"), "bb_mid": f.get("bb_mid"),
+                "vwap": f.get("vwap"), "orb15_high": f.get("orb15_high"), "orb15_low": f.get("orb15_low"),
+                "synthetic_nbbo_used": f.get("synthetic_nbbo_used"),
+                "synthetic_nbbo_spread_est": f.get("synthetic_nbbo_spread_est"),
+                "nbbo_provider": f.get("nbbo_provider"),
+                "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
+            },
+            "pm_contracts": {
+                "plus5_call": {"strike": pm["strike_call"], "contract": pm["contract_call"]},
+                "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
+            },
+            "ibkr": {"enabled": ib_enabled, "attempted": ib_attempted, "result": ib_result_obj},
+            "selection_debug": selection_debug,
+            "alert_original": {"strike": orig_strike, "expiry": orig_expiry},
+            "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
+            "replacement": replacement_note,
+        })
+    except Exception as e:
+        logger.warning("decision log append failed: %r", e)
 
 
 # =========================
