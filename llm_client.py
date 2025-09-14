@@ -16,10 +16,11 @@ BUY_THRESHOLD = float(os.getenv("LLM_BUY_THRESHOLD", "60"))
 WAIT_THRESHOLD = float(os.getenv("LLM_WAIT_THRESHOLD", "45"))
 
 # primary weights (sum ≈ 100 when fully normalized)
-W_TECH   = float(os.getenv("LLM_W_TECH",   "60"))   # RSI/EMA/MACD/VWAP/Bollinger
-W_STRUCT = float(os.getenv("LLM_W_STRUCT", "15"))   # ORB15 + regime/MTF
-W_OPTION = float(os.getenv("LLM_W_OPTION", "15"))   # Delta + IV + OI/Vol tilt
-W_EXEC   = float(os.getenv("LLM_W_EXEC",   "10"))   # Spread + synthetic NBBO relief
+W_TECH    = float(os.getenv("LLM_W_TECH",    "60"))   # RSI/EMA/MACD/VWAP/Bollinger
+W_STRUCT  = float(os.getenv("LLM_W_STRUCT",  "15"))   # ORB15 + regime/MTF
+W_OPTION  = float(os.getenv("LLM_W_OPTION",  "15"))   # Delta + IV + OI/Vol tilt
+W_EXEC    = float(os.getenv("LLM_W_EXEC",    "10"))   # Spread + synthetic NBBO relief
+W_CONTEXT = float(os.getenv("LLM_W_CONTEXT", "10"))   # Prev-day/5d avg/premarket/short-volume context
 
 # model choice: stronger default (overridable)
 DEFAULT_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1"))
@@ -208,6 +209,58 @@ def _score_dte(dte: Optional[float]) -> Tuple[float, str]:
     elif dte > 45:         pts -= 2.0
     return pts, _mk_reason("DTE", pts, f"{dte} days")
 
+# --- context scoring (prev-day, 5d avg, premarket, short vol) ----------------
+
+def _score_context(side: str, ul_price: Optional[float], f: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """
+    Small, capped influence from recent context features:
+      - quote_change_pct vs prev close
+      - relation to 5-day avg PDH/PDL
+      - relation to premarket H/L
+      - short_volume_ratio (best-effort)
+    Total influence is scaled by W_CONTEXT (defaults to 10).
+    """
+    pts = 0.0
+    notes: List[str] = []
+
+    chg = _f(f.get("quote_change_pct"))
+    if chg is not None:
+        # modest momentum tilt
+        if side == "CALL":
+            pts += _clip(chg * 0.1, -2.0, 2.0)
+        else:
+            pts += _clip(-chg * 0.1, -2.0, 2.0)
+        notes.append(f"Δ% vs prev {chg:.2f}")
+
+    avg_hi = _f(f.get("prev5_avg_high"))
+    avg_lo = _f(f.get("prev5_avg_low"))
+    if ul_price is not None:
+        if avg_hi is not None and ul_price > avg_hi:
+            pts += (1.0 if side == "CALL" else -0.5)
+            notes.append(">5d avg high")
+        if avg_lo is not None and ul_price < avg_lo:
+            pts += (1.0 if side == "PUT" else -0.5)
+            notes.append("<5d avg low")
+
+    pm_hi = _f(f.get("premarket_high"))
+    pm_lo = _f(f.get("premarket_low"))
+    if ul_price is not None:
+        if pm_hi is not None and ul_price > pm_hi:
+            pts += (0.7 if side == "CALL" else -0.3)
+            notes.append(">PM high")
+        if pm_lo is not None and ul_price < pm_lo:
+            pts += (0.7 if side == "PUT" else -0.3)
+            notes.append("<PM low")
+
+    svr = _f(f.get("short_volume_ratio"))
+    if svr is not None:
+        # Heavily shorted: potential squeeze for CALLs; confirmation for PUTs, but small magnitude.
+        if svr >= 0.5:
+            pts += (0.8 if side == "CALL" else 0.5)
+            notes.append(f"short vol ratio {svr:.2f}")
+
+    return pts, ([_mk_reason("Context", pts, ", ".join(notes) if notes else "neutral")])
+
 # --- trade horizon inference (baseline) --------------------------------------
 
 def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float, str]:
@@ -295,32 +348,41 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     side = (alert.get("side") or "").upper()
     ul_price = _f(alert.get("underlying_price_from_alert"))
 
+    # Technical pillar
     rsi_pts,   rsi_note   = _score_rsi(side, _f(f.get("rsi14")))
     ema_pts,   ema_note   = _score_ema_stack(side, ul_price, _f(f.get("ema20")), _f(f.get("ema50")), _f(f.get("ema200")))
     macd_line = _f(f.get("macd_line")) if f.get("macd_line") is not None else _f(f.get("macd"))
     macd_pts,  macd_note  = _score_macd(side, macd_line, _f(f.get("macd_signal")), _f(f.get("macd_hist")))
     vwap_pts,  vwap_note  = _score_vwap(side, ul_price, _f(f.get("vwap")), _f(f.get("vwap_dist")))
     boll_pts,  boll_note  = _score_bollinger(side, ul_price, _f(f.get("bb_upper")), _f(f.get("bb_lower")), _f(f.get("sma20")))
-
     tech_raw    = rsi_pts + ema_pts + macd_pts + vwap_pts + boll_pts
     tech_scaled = _clip(tech_raw / 25.0 * W_TECH, -W_TECH, W_TECH)
 
-    orb_pts,    orb_note  = _score_orb15(side, ul_price, _f(f.get("orb15_high")), _f(f.get("orb15_low")))
-    struct_pts, struct_note = _score_structure(f.get("mtf_align"), f.get("regime_flag"))
+    # Structure (ORB + Regime/MTF)
+    orb_pts,      orb_note    = _score_orb15(side, ul_price, _f(f.get("orb15_high")), _f(f.get("orb15_low")))
+    struct_pts,   struct_note = _score_structure(f.get("mtf_align"), f.get("regime_flag"))
     struct_raw    = orb_pts + struct_pts
     struct_scaled = _clip(struct_raw / 10.0 * W_STRUCT, -W_STRUCT, W_STRUCT)
 
+    # Options (Delta + IV)
     delta_pts,   delta_note = _score_delta(side, _f(f.get("delta")))
     iv_pts,      iv_note    = _score_iv(side, _f(f.get("iv")), _f(f.get("iv_rank")))
     opt_raw    = delta_pts + iv_pts
     opt_scaled = _clip(opt_raw / 10.0 * W_OPTION, -W_OPTION, W_OPTION)
 
+    # Execution (spreads/OI/Vol & synthetic NBBO)
     liq_pts,     liq_note   = _score_liquidity(_f(f.get("option_spread_pct")), _f(f.get("oi")), _f(f.get("vol")), bool(f.get("synthetic_nbbo_used")))
     exec_scaled = _clip(liq_pts / 6.0 * W_EXEC, -W_EXEC, W_EXEC)
 
+    # Context (premarket, prev-day, short vol)
+    ctx_pts, ctx_notes = _score_context(side, ul_price, f)
+    ctx_scaled = _clip(ctx_pts / 4.0 * W_CONTEXT, -W_CONTEXT, W_CONTEXT)
+
+    # DTE soft governor
     dte_pts, dte_note = _score_dte(_f(f.get("dte")))
 
-    score = 50.0 + tech_scaled + struct_scaled + opt_scaled + exec_scaled + dte_pts
+    # Final score
+    score = 50.0 + tech_scaled + struct_scaled + opt_scaled + exec_scaled + ctx_scaled + dte_pts
     score = _clip(score, 0.0, 100.0)
 
     if score >= BUY_THRESHOLD:      decision = "buy"
@@ -330,7 +392,10 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     conf = 0.5 + abs(score - 50.0) / 100.0
     conf = round(_clip(conf, 0.5, 0.95), 2)
 
-    factor_lines = [rsi_note, ema_note, macd_note, vwap_note, boll_note, orb_note, struct_note, delta_note, iv_note, dte_note, liq_note]
+    factor_lines = [
+        rsi_note, ema_note, macd_note, vwap_note, boll_note,
+        orb_note, struct_note, delta_note, iv_note, dte_note, liq_note
+    ] + ctx_notes
 
     positives = [ln for ln in factor_lines if " +" in ln]
     negatives = [ln for ln in factor_lines if " -" in ln]
@@ -363,6 +428,14 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
         "structure": {
             "dte": _f(f.get("dte")), "mtf_align": f.get("mtf_align"), "regime_flag": f.get("regime_flag"),
             "horizon": horizon, "horizon_score": horizon_score, "horizon_reason": horizon_reason,
+        },
+        "context": {
+            "prev_open": _f(f.get("prev_open")), "prev_high": _f(f.get("prev_high")),
+            "prev_low": _f(f.get("prev_low")), "prev_close": _f(f.get("prev_close")),
+            "quote_change_pct": _f(f.get("quote_change_pct")),
+            "prev5_avg_high": _f(f.get("prev5_avg_high")), "prev5_avg_low": _f(f.get("prev5_avg_low")),
+            "premarket_high": _f(f.get("premarket_high")), "premarket_low": _f(f.get("premarket_low")),
+            "short_volume_ratio": _f(f.get("short_volume_ratio")),
         }
     }
 
@@ -382,22 +455,30 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
 
 def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
+        # TA
         "rsi14","sma20","ema20","ema50","ema200",
         "macd_line","macd","macd_signal","macd_hist",
         "vwap","vwap_dist","bb_upper","bb_lower","bb_width",
         "orb15_high","orb15_low","mtf_align","regime_flag","dte",
+        # Options
         "delta","gamma","theta","vega","iv","iv_rank","oi","vol",
         "bid","ask","mid","option_spread_pct",
         "synthetic_nbbo_used","synthetic_nbbo_spread_est",
-        "prev_close","quote_change_pct","nbbo_http_status","nbbo_reason","ta_src"
+        # Context
+        "prev_open","prev_high","prev_low","prev_close",
+        "quote_change_pct","prev5_avg_high","prev5_avg_low",
+        "premarket_high","premarket_low",
+        "short_volume","short_interest","short_volume_total","short_volume_ratio",
+        # Debug
+        "nbbo_http_status","nbbo_reason","ta_src"
     ]
     return {k: f[k] for k in keys if k in f}
 
 async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
     """
     Returns: { decision, confidence, reason, checklist, ev_estimate, horizon, horizon_reason }
-    - Deterministic weighted blend (RSI/EMA(20/50/200)/MACD/VWAP/Bollinger/ORB15 + Greeks/IV + structure + execution).
-    - Stronger default model (gpt-4.1) produces: human 'summary' + factor bullets + 'horizon' ('intraday'|'swing') with rationale.
+    - Deterministic weighted blend (RSI/EMA(20/50/200)/MACD/VWAP/Bollinger/ORB15 + Greeks/IV + structure + execution + context).
+    - Strong default model (gpt-4.1) produces: human 'summary' + factor bullets + 'horizon' ('intraday'|'swing') with rationale.
     - Missing NBBO never auto-skips; synthetic_nbbo_used=true is cautious-but-acceptable.
     """
     baseline = _rule_blend(alert, features)
@@ -420,6 +501,7 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
             "You are an options-trading analyst. Produce a clear, human summary (2–4 sentences) explaining the trade call. "
             "Weigh: RSI(14), EMA(20/50/200) stack, MACD (line/signal/hist), VWAP distance, Bollinger(20,2σ), 15m ORB, "
             "Greeks (Δ/Θ/ν) & IV/IV Rank, plus execution (spread, OI/Vol). "
+            "Include recent context (prev-day OHLC and %Δ, 5-day avg PDH/PDL, premarket H/L, short volume ratio) when informative. "
             "Use the provided baseline weighted score; you may adjust modestly (<= ±10 absolute points) only with strong justification. "
             "Do NOT auto-skip just because NBBO is missing; if synthetic_nbbo_used=true, treat execution as cautious but acceptable. "
             "You MUST classify the trade as 'intraday' or 'swing' and explain why, considering DTE, ORB/VWAP context, EMA structure, IV Rank, RSI, and spreads. "
@@ -495,8 +577,8 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
 
         reason = (
             f"🕒 Suggested trade: {str(horizon).upper()} — {horizon_reason}\n"
-            + (summary.strip() + ("\n" if summary else ""))
-            + factors_block
+            + (summary.strip() + ("\n" if summary else ""))  # 2–4 sentence summary
+            + factors_block                                     # bullet-style factors
         ).strip()
 
         checklist = parsed.get("checklist") or baseline.get("checklist") or {}
