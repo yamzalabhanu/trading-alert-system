@@ -3,6 +3,8 @@ import os
 import re
 import socket
 import logging
+import asyncio
+import random
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -48,6 +50,32 @@ except Exception:
 logger = logging.getLogger("trading_engine")
 
 
+# ---------- Provider gating & rate-limit helpers ----------
+
+def _provider_tokens_present() -> bool:
+    """Return True only if at least one external provider looks properly configured."""
+    has_iex = bool(os.getenv("IEX_TOKEN") or os.getenv("IEX_CLOUD_TOKEN") or os.getenv("IEX_PUB_TOKEN"))
+    has_alpaca = bool(os.getenv("APCA_API_KEY_ID") and (os.getenv("APCA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET")))
+    has_tradier = bool(os.getenv("TRADIER_TOKEN") or os.getenv("TRADIER_ACCESS_TOKEN"))
+    has_ibkr = bool(IBKR_ENABLED)
+    return has_iex or has_alpaca or has_tradier or has_ibkr
+
+def _should_use_multi_providers() -> bool:
+    """
+    Multi-provider NBBO is enabled if:
+      - MULTI_PROVIDER_NBBO != "0" (default "1"), AND
+      - At least one provider credential is present.
+    """
+    flag = os.getenv("MULTI_PROVIDER_NBBO", "1") != "0"
+    return flag and _provider_tokens_present()
+
+def _rl_jitter_seconds() -> float:
+    """Tiny random sleep to de-synchronize retry bursts; overridable via env."""
+    base = float(os.getenv("POLY_RL_BASE_JITTER", "0.05"))
+    spread = float(os.getenv("POLY_RL_SPREAD_JITTER", "0.15"))
+    return max(0.0, base + random.random() * spread)
+
+
 # ---------- Synthetic NBBO helpers ----------
 def _synth_spread_pct_default() -> float:
     """
@@ -68,7 +96,7 @@ def _synth_spread_pct_default() -> float:
 
 def _make_synthetic_nbbo_from_base(base_px: Optional[float], spread_pct: Optional[float] = None) -> Dict[str, Any]:
     """
-    Build synthetic NBBO around base price. Returns keys:
+    Build synthetic NBBO around base price (last or mid). Returns keys:
       synthetic_bid, synthetic_ask, synthetic_mid, synthetic_spread_pct
     """
     if not isinstance(base_px, (int, float)) or base_px <= 0:
@@ -107,12 +135,10 @@ def _adopt_synthetic_nbbo_if_missing(f: Dict[str, Any]) -> None:
             break
 
     if base is None:
-        # No usable base—note attempt and exit gracefully
         f["synthetic_nbbo_attempted"] = True
         f.setdefault("nbbo_provider", "unavailable")
         return
 
-    # Optional minimum base clamp to avoid pennies collapsing spreads
     try:
         synth_min = float(os.getenv("SYNTH_MIN_BASE", "0.0"))
         base = max(base, synth_min)
@@ -123,7 +149,6 @@ def _adopt_synthetic_nbbo_if_missing(f: Dict[str, Any]) -> None:
     for k, v in synth.items():
         f[k] = v
 
-    # Adopt into NBBO fields if still missing
     f.setdefault("bid", f.get("synthetic_bid"))
     f.setdefault("ask", f.get("synthetic_ask"))
     f.setdefault("mid", f.get("synthetic_mid"))
@@ -139,12 +164,15 @@ async def _try_multi_provider_nbbo(option_ticker: str, alert: Dict[str, Any], ch
     """
     Optional multi-provider fallback:
       market_providers.get_nbbo_any -> (Polygon/IBKR/Tradier/Other) -> apply to f
-      If module is not available, return silently.
+      Only invoked if _should_use_multi_providers() is True.
     """
+    if not _should_use_multi_providers():
+        logger.info("multi-provider NBBO skipped (disabled or no provider creds found)")
+        return
+
     try:
         from market_providers import get_nbbo_any, synthetic_from_last  # optional module
     except Exception:
-        # Module not present; nothing to do here.
         return
 
     if isinstance(f.get("bid"), (int, float)) and isinstance(f.get("ask"), (int, float)):
@@ -335,10 +363,14 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # C) aggressively ensure NBBO via Polygon (retry spinner)
+            # C) aggressively ensure NBBO via Polygon (retry spinner + jitter)
             try:
                 if f.get("bid") is None or f.get("ask") is None:
-                    nbbo = await ensure_nbbo(get_http_client(), option_ticker, tries=12, delay=0.35)
+                    # jitter once before spinning
+                    await asyncio.sleep(_rl_jitter_seconds())
+                    tries = int(os.getenv("POLY_NBBO_TRIES", "12"))
+                    delay = float(os.getenv("POLY_NBBO_DELAY", "0.35"))
+                    nbbo = await ensure_nbbo(get_http_client(), option_ticker, tries=tries, delay=delay)
                     for k, v in (nbbo or {}).items():
                         if v is not None:
                             f[k] = v
@@ -354,7 +386,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 except Exception:
                     pass
 
-            # D2) Multi-provider NBBO fallback (IBKR/Tradier/etc) if available
+            # D2) Multi-provider NBBO fallback (IBKR/Tradier/etc) if available & allowed
             if f.get("bid") is None or f.get("ask") is None:
                 await _try_multi_provider_nbbo(option_ticker, alert, desired_strike, chosen_expiry, f)
 
@@ -499,7 +531,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     # 7) LLM
     pf_ok, pf_checks = preflight_ok(f)
     try:
-        # pass richer context for deeper rationale
         llm = await analyze_with_openai(alert, f)
         consume_llm()
     except Exception as e:
