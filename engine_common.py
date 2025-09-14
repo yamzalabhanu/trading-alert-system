@@ -41,7 +41,9 @@ SCAN_MIN_OI_RTH  = int(os.getenv("SCAN_MIN_OI_RTH",  os.getenv("SCAN_MIN_OI",  "
 SCAN_MIN_VOL_AH  = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
 SCAN_MIN_OI_AH   = int(os.getenv("SCAN_MIN_OI_AH",  "100"))
 
-SEND_CHAIN_SCAN_ALERTS      = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "1"))
+# NOTE: pre-LLM chain-scan Telegram messages are disabled in engine_processor.
+# Keep flags for compatibility; default SEND_CHAIN_SCAN_ALERTS to "0".
+SEND_CHAIN_SCAN_ALERTS      = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "0"))
 SEND_CHAIN_SCAN_TOPN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "1"))
 REPLACE_IF_NO_NBBO          = _env_truthy(os.getenv("REPLACE_IF_NO_NBBO", "1"))
 
