@@ -1,4 +1,3 @@
-# engine_common.py
 import os
 import re
 import logging
@@ -198,46 +197,194 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
     return ok, checks
 
 # =========================
-# Telegram composition
+# Telegram composition (compact human-friendly)
 # =========================
+def _fmt_num(n, nd=2, dash="None"):
+    try:
+        if n is None:
+            return dash
+        n = float(n)
+        if abs(n - round(n)) < 1e-9:
+            return str(int(round(n)))
+        return f"{n:.{nd}f}"
+    except Exception:
+        return dash
+
+def _fmt_pct(n, nd=1, dash="None"):
+    try:
+        if n is None:
+            return dash
+        return f"{float(n):.{nd}f}%"
+    except Exception:
+        return dash
+
+def _first_sentence(s: str, max_len: int = 120) -> str:
+    if not s:
+        return ""
+    s = s.replace("\n", " ").strip()
+    for stop in [". ", "! ", "? "]:
+        p = s.find(stop)
+        if 0 < p < max_len:
+            return s[:p + 1]
+    return s[:max_len].rstrip()
+
+def _pick_factor_lines_from_reason(reason: str, wanted=("RSI", "EMA", "MACD", "VWAP", "Bollinger", "ORB")):
+    if not reason:
+        return []
+    lines = [ln.strip() for ln in reason.splitlines() if ln.strip()]
+    body = []
+    for ln in lines:
+        if ln.startswith("🕒 Suggested trade"):
+            continue
+        body.append(ln)
+    picked = []
+    for tag in wanted:
+        for ln in body:
+            if tag.lower() in ln.lower():
+                if ln not in picked:
+                    picked.append(ln)
+                    break
+    return picked[:3]
+
 def compose_telegram_text(
     alert: Dict[str, Any],
-    option_ticker: str,
+    option_ticker: Optional[str],
     f: Dict[str, Any],
     llm: Dict[str, Any],
-    llm_ran: bool,
-    llm_reason: str,
-    score: Optional[float],
-    rating: Optional[str],
+    llm_ran: bool = False,
+    llm_reason: str = "",
+    score: Optional[float] = None,
+    rating: Optional[str] = None,
     diff_note: str = "",
 ) -> str:
-    header = (
-        f"📣 Options Alert\n"
-        f"{alert['side']} {alert['symbol']} | Strike {alert.get('strike')} | Exp {alert.get('expiry')}\n"
-        f"Underlying (alert): {alert.get('underlying_price_from_alert')}"
-    )
-    contract = f"Contract: {option_ticker}"
-    snap = (
-        "Snapshot:\n"
-        f"  NBBO: bid={f.get('bid')} ask={f.get('ask')}  Mark={f.get('mid')}  Last={f.get('last')}\n"
-        f"  Spread%: {f.get('option_spread_pct')}  QuoteAge(s): {f.get('quote_age_sec')}\n"
-        f"  PrevClose: {f.get('prev_close')}  Chg% vs PrevClose: {f.get('quote_change_pct')}\n"
-        f"  OI: {f.get('oi')}  Vol: {f.get('vol')}  IV: {f.get('iv')}  (IV rank: {f.get('iv_rank')})\n"
-        f"  Greeks: Δ={f.get('delta')} Γ={f.get('gamma')} Θ={f.get('theta')} ν={f.get('vega')}\n"
-        f"  EM_vs_BE_ok: {f.get('em_vs_be_ok')}  MTF align: {f.get('mtf_align')}\n"
-        f"  S/R ok: {f.get('sr_headroom_ok')}  Regime: {f.get('regime_flag')}  DTE: {f.get('dte')}\n"
-        f"  NBBO debug: status={f.get('nbbo_http_status')} reason={f.get('nbbo_reason')}\n"
-    )
-    if llm_ran:
-        decision = f"LLM Decision: {llm.get('decision','WAIT').upper()}  (conf: {llm.get('confidence')})"
-        reason = f"Reason: {llm.get('reason','')}"
-        scoreline = f"Score: {score}  Rating: {rating}"
+    """
+    Pretty Telegram formatter (concise summary style).
+    Keeps the old signature so engine_processor doesn't need to change.
+    """
+    side = (alert.get("side") or "").upper()
+    sym = alert.get("symbol") or "?"
+    strike = alert.get("strike")
+    right = "C" if side == "CALL" else "P"
+    expiry = alert.get("expiry") or ""
+
+    # DTE
+    dte = f.get("dte")
+    if dte is None and expiry:
+        try:
+            dte = (datetime.fromisoformat(expiry).date() - datetime.now(timezone.utc).date()).days
+        except Exception:
+            dte = None
+
+    # LLM bits
+    hdr_decision = (llm.get("decision") or "wait").upper() if isinstance(llm, dict) else "WAIT"
+    horizon = (llm.get("horizon") or "").upper() if isinstance(llm, dict) else ""
+    horizon_reason = llm.get("horizon_reason") if isinstance(llm, dict) else None
+    conf = llm.get("confidence")
+    reason_text = (llm.get("reason") or llm_reason or "").strip()
+
+    # Header
+    s_fmt = _fmt_num(strike, 0)
+    header = f"{hdr_decision} – {sym} {s_fmt}{right} ({expiry}, { _fmt_num(dte, 0) } DTE)"
+
+    # Bias / Summary
+    bias_line = ""
+    if horizon:
+        bias_short = _first_sentence(horizon_reason or "", max_len=80)
+        bias_line = f"Bias: {horizon}" + (f" ({bias_short})" if bias_short else "")
+
+    summary_line = ""
+    if reason_text:
+        lines = [ln for ln in reason_text.splitlines() if ln.strip()]
+        narrative = ""
+        for i, ln in enumerate(lines):
+            if ln.startswith("🕒 Suggested trade"):
+                if i + 1 < len(lines):
+                    narrative = lines[i + 1].strip()
+                break
+        if not narrative:
+            narrative = _first_sentence(reason_text, max_len=180)
+        if narrative:
+            summary_line = _first_sentence(narrative, max_len=180)
+
+    # Setup (pick a few key factor lines)
+    setup_bits = _pick_factor_lines_from_reason(reason_text)
+    setup_line = ""
+    if setup_bits:
+        cleaned = []
+        for s in setup_bits:
+            s2 = s
+            if s2.startswith("[") and "] " in s2:
+                s2 = s2.split("] ", 1)[1]
+            cleaned.append(s2)
+        setup_line = "Setup: " + "; ".join(cleaned)
+
+    # Liquidity
+    oi = f.get("oi"); vol = f.get("vol")
+    liq_line = f"Liquidity: OI { _fmt_num(oi, 0, dash='?') } / Vol { _fmt_num(vol, 0, dash='?') }"
+
+    # Context (short-volume ratio)
+    svr = f.get("short_volume_ratio")
+    if svr is None:
+        svr_disp = "—"
     else:
-        decision = "LLM Decision: SKIPPED"
-        reason = f"Note: {llm_reason or 'LLM not executed'}"
-        scoreline = ""
-    parts = [header, contract, "", snap, diff_note.strip(), decision, reason, scoreline]
-    return "\n".join([p for p in parts if p]).strip()
+        try:
+            val = float(svr)
+            if 0 <= val <= 1.0:
+                val *= 100.0
+            svr_disp = _fmt_pct(val, 0)
+        except Exception:
+            svr_disp = "—"
+    ctx_line = f"Context: Short-vol ratio {svr_disp}"
+
+    # Quotes
+    spread_pct = f.get("option_spread_pct")
+    qage = f.get("quote_age_sec")
+    syn = bool(f.get("synthetic_nbbo_used"))
+    quotes_bits = []
+    if qage is not None:
+        label = "stale" if (isinstance(qage, (int, float)) and qage > 90) else "age"
+        try:
+            qage_i = int(float(qage))
+        except Exception:
+            qage_i = None
+        quotes_bits.append(f"NBBO {label}" + (f" (~{qage_i}s)" if qage_i is not None else ""))
+    else:
+        quotes_bits.append("NBBO age n/a")
+    if syn:
+        est = f.get("synthetic_nbbo_spread_est") if f.get("synthetic_nbbo_spread_est") is not None else spread_pct
+        quotes_bits.append(f"synthetic spread est. { _fmt_pct(est, 1, dash='?') }")
+    else:
+        if spread_pct is not None:
+            quotes_bits.append(f"spread { _fmt_pct(spread_pct, 1) }")
+    quotes_line = "Quotes: " + "; ".join(quotes_bits)
+
+    # Confidence & Score/Rating
+    conf_line = f"Confidence: { _fmt_num(conf, 2, dash='—') }"
+    if syn and (qage is None or (isinstance(qage, (int, float)) and qage > 120)):
+        conf_line += " (verify live quote)"
+    sr_line = ""
+    if score is not None or rating is not None:
+        sr_line = f"Score: { _fmt_num(score, 2, dash='—') }"
+        if rating:
+            sr_line += f"  Rating: {rating}"
+
+    appendix = diff_note.strip()
+    if appendix:
+        appendix = "\n" + appendix
+
+    out_lines = [
+        header,
+        bias_line or None,
+        summary_line or None,
+        setup_line or None,
+        liq_line,
+        ctx_line,
+        quotes_line,
+        conf_line,
+        sr_line or None,
+        appendix or None,
+    ]
+    return "\n".join([ln for ln in out_lines if ln])
 
 def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
     if res is None:
