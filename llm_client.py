@@ -22,6 +22,20 @@ W_OPTION  = float(os.getenv("LLM_W_OPTION",  "15"))   # Delta + IV + OI/Vol tilt
 W_EXEC    = float(os.getenv("LLM_W_EXEC",    "10"))   # Spread + synthetic NBBO relief
 W_CONTEXT = float(os.getenv("LLM_W_CONTEXT", "10"))   # Prev-day/5d avg/premarket/short-volume context
 
+# short flow knobs (mild by design; override if needed)
+SHORT_VOL_PUT_BONUS_HI   = float(os.getenv("LLM_SV_PUT_BONUS_HI",   "1.5"))
+SHORT_VOL_PUT_BONUS_MED  = float(os.getenv("LLM_SV_PUT_BONUS_MED",  "1.0"))
+SHORT_VOL_PUT_BONUS_LO   = float(os.getenv("LLM_SV_PUT_BONUS_LO",   "0.5"))
+SHORT_VOL_CALL_PEN_HI    = float(os.getenv("LLM_SV_CALL_PEN_HI",    "-1.0"))
+SHORT_VOL_CALL_PEN_MED   = float(os.getenv("LLM_SV_CALL_PEN_MED",   "-0.6"))
+SHORT_VOL_CALL_PEN_LO    = float(os.getenv("LLM_SV_CALL_PEN_LO",    "-0.3"))
+SHORT_VOL_CALL_BONUS_LOW = float(os.getenv("LLM_SV_CALL_BONUS_LOW", "0.5"))
+SHORT_VOL_PUT_PEN_LOW    = float(os.getenv("LLM_SV_PUT_PEN_LOW",    "-0.3"))
+
+# Optional tiny squeeze tilt from short-interest (very mild)
+SHORT_INT_CALL_BONUS = float(os.getenv("LLM_SI_CALL_BONUS", "0.3"))
+SHORT_INT_PUT_PEN    = float(os.getenv("LLM_SI_PUT_PEN",   "-0.2"))
+
 # model choice: stronger default (overridable)
 DEFAULT_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1"))
 
@@ -209,6 +223,42 @@ def _score_dte(dte: Optional[float]) -> Tuple[float, str]:
     elif dte > 45:         pts -= 2.0
     return pts, _mk_reason("DTE", pts, f"{dte} days")
 
+# --- short flow scoring -------------------------------------------------------
+
+def _score_short_flow(side: str, f: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Teach the model to weigh short-volume & short-interest:
+      - Elevated short-volume ratio => mild credit to PUTs, caution for CALLs.
+      - Very low short-volume ratio => mild credit to CALLs, caution for PUTs.
+      - Short-interest (if present) => tiny squeeze-risk tilt:
+            small bonus to CALLs, small penalty to PUTs.
+    """
+    pts = 0.0
+    notes: List[str] = []
+
+    svr = _f(f.get("short_volume_ratio"))
+    if svr is not None:
+        if svr >= 0.60:
+            pts += (SHORT_VOL_PUT_BONUS_HI if side == "PUT" else SHORT_VOL_CALL_PEN_HI)
+            notes.append(f"SVR high {svr:.2f}")
+        elif svr >= 0.50:
+            pts += (SHORT_VOL_PUT_BONUS_MED if side == "PUT" else SHORT_VOL_CALL_PEN_MED)
+            notes.append(f"SVR med {svr:.2f}")
+        elif svr >= 0.40:
+            pts += (SHORT_VOL_PUT_BONUS_LO if side == "PUT" else SHORT_VOL_CALL_PEN_LO)
+            notes.append(f"SVR mild {svr:.2f}")
+        elif svr <= 0.20:
+            pts += (SHORT_VOL_CALL_BONUS_LOW if side == "CALL" else SHORT_VOL_PUT_PEN_LOW)
+            notes.append(f"SVR low {svr:.2f}")
+
+    # Short interest tiny squeeze-risk tilt (only if provided; magnitude not normalized)
+    si = _f(f.get("short_interest"))
+    if si is not None and si > 0:
+        pts += (SHORT_INT_CALL_BONUS if side == "CALL" else SHORT_INT_PUT_PEN)
+        notes.append("short interest present")
+
+    return pts, _mk_reason("Short Flow", pts, ", ".join(notes) if notes else "neutral")
+
 # --- context scoring (prev-day, 5d avg, premarket, short vol) ----------------
 
 def _score_context(side: str, ul_price: Optional[float], f: Dict[str, Any]) -> Tuple[float, List[str]]:
@@ -217,7 +267,7 @@ def _score_context(side: str, ul_price: Optional[float], f: Dict[str, Any]) -> T
       - quote_change_pct vs prev close
       - relation to 5-day avg PDH/PDL
       - relation to premarket H/L
-      - short_volume_ratio (best-effort)
+      - short-volume ratio & short-interest (via _score_short_flow)
     Total influence is scaled by W_CONTEXT (defaults to 10).
     """
     pts = 0.0
@@ -252,12 +302,10 @@ def _score_context(side: str, ul_price: Optional[float], f: Dict[str, Any]) -> T
             pts += (0.7 if side == "PUT" else -0.3)
             notes.append("<PM low")
 
-    svr = _f(f.get("short_volume_ratio"))
-    if svr is not None:
-        # Heavily shorted: potential squeeze for CALLs; confirmation for PUTs, but small magnitude.
-        if svr >= 0.5:
-            pts += (0.8 if side == "CALL" else 0.5)
-            notes.append(f"short vol ratio {svr:.2f}")
+    # short-flow contribution
+    sf_pts, sf_note = _score_short_flow(side, f)
+    pts += sf_pts
+    notes.append(sf_note)
 
     return pts, ([_mk_reason("Context", pts, ", ".join(notes) if notes else "neutral")])
 
@@ -374,7 +422,7 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     liq_pts,     liq_note   = _score_liquidity(_f(f.get("option_spread_pct")), _f(f.get("oi")), _f(f.get("vol")), bool(f.get("synthetic_nbbo_used")))
     exec_scaled = _clip(liq_pts / 6.0 * W_EXEC, -W_EXEC, W_EXEC)
 
-    # Context (premarket, prev-day, short vol)
+    # Context (premarket, prev-day, short flow)
     ctx_pts, ctx_notes = _score_context(side, ul_price, f)
     ctx_scaled = _clip(ctx_pts / 4.0 * W_CONTEXT, -W_CONTEXT, W_CONTEXT)
 
@@ -436,6 +484,7 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
             "prev5_avg_high": _f(f.get("prev5_avg_high")), "prev5_avg_low": _f(f.get("prev5_avg_low")),
             "premarket_high": _f(f.get("premarket_high")), "premarket_low": _f(f.get("premarket_low")),
             "short_volume_ratio": _f(f.get("short_volume_ratio")),
+            "short_interest": _f(f.get("short_interest")),
         }
     }
 
@@ -501,10 +550,10 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
             "You are an options-trading analyst. Produce a clear, human summary (2–4 sentences) explaining the trade call. "
             "Weigh: RSI(14), EMA(20/50/200) stack, MACD (line/signal/hist), VWAP distance, Bollinger(20,2σ), 15m ORB, "
             "Greeks (Δ/Θ/ν) & IV/IV Rank, plus execution (spread, OI/Vol). "
-            "Include recent context (prev-day OHLC and %Δ, 5-day avg PDH/PDL, premarket H/L, short volume ratio) when informative. "
+            "Include recent context (prev-day OHLC and %Δ, 5-day avg PDH/PDL, premarket H/L, SHORT VOLUME RATIO & SHORT INTEREST) when informative. "
             "Use the provided baseline weighted score; you may adjust modestly (<= ±10 absolute points) only with strong justification. "
             "Do NOT auto-skip just because NBBO is missing; if synthetic_nbbo_used=true, treat execution as cautious but acceptable. "
-            "You MUST classify the trade as 'intraday' or 'swing' and explain why, considering DTE, ORB/VWAP context, EMA structure, IV Rank, RSI, and spreads. "
+            "You MUST classify the trade as 'intraday' or 'swing' and explain why, considering DTE, ORB/VWAP context, EMA structure, IV Rank, RSI, spreads, and short-flow context. "
             "Return JSON with: decision, confidence (0..1), summary (string), factors (array of short bullet strings), "
             "horizon ('intraday'|'swing'), horizon_reason (string), checklist (object), ev_estimate (object)."
         )
