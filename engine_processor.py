@@ -507,27 +507,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     logger.warning("Replacement contract fetch failed: %r", e)
                     replacement_note = None
 
-    # 6) Optional Telegram pre-LLM
-    if SEND_CHAIN_SCAN_ALERTS and selection_debug.get("selected_by", "").startswith("chain_scan"):
-        try:
-            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                pre_text = (
-                    "🔎 Chain-Scan Pick (from TradingView alert)\n"
-                    f"{side} {alert['symbol']} | Strike {desired_strike} | Exp {chosen_expiry}\n"
-                    f"Contract: {option_ticker}\n"
-                    f"NBBO {f.get('bid')}/{f.get('ask')}  Mark={f.get('mid')}  Last={f.get('last')}\n"
-                    f"Spread%={f.get('option_spread_pct')}  QuoteAge(s)={f.get('quote_age_sec')}  "
-                    f"{'Provider='+str(f.get('nbbo_provider')) if f.get('nbbo_provider') else ''}\n"
-                    f"OI={f.get('oi')}  Vol={f.get('vol')}  IV={f.get('iv')}  Δ={f.get('delta')} Γ={f.get('gamma')}\n"
-                    f"DTE={f.get('dte')}  Regime={f.get('regime_flag')}  (pre-LLM)\n"
-                    f"NBBO dbg: status={f.get('nbbo_http_status')} reason={f.get('nbbo_reason')}\n"
-                )
-                if f.get("synthetic_nbbo_used"):
-                    pre_text += f"🧪 Synthetic NBBO used ({f.get('synthetic_nbbo_spread_est')}% spread est.)\n"
-                await send_telegram(pre_text)
-        except Exception as e:
-            logger.exception("[worker] Telegram pre-LLM chainscan error: %s", e)
-
     # 7) LLM
     pf_ok, pf_checks = preflight_ok(f)
     try:
@@ -568,8 +547,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating,
             diff_note=diff_note,
         )
-        if selection_debug.get("selected_by","").startswith("chain_scan"):
-            tg_text += "\n🔎 Note: Contract selected via chain-scan (liquidity + strike/expiry fit)."
+      
         if replacement_note is not None:
             tg_text += f"\n⚠️ Replacement: {replacement_note['old']} → {replacement_note['new']} ({replacement_note['why']})."
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
