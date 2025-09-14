@@ -2,6 +2,7 @@
 import os
 import math
 import time
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -11,7 +12,11 @@ from engine_common import POLYGON_API_KEY, CDT_TZ
 
 logger = logging.getLogger("trading_engine.feature_engine")
 
-# ---------- Small HTTP helper ----------
+# --- knobs --------------------------------------------------------------------
+POLY_ENABLE_SHORTS = os.getenv("ENABLE_SHORTS", "1") == "1"  # enable v1 shorts endpoints by default
+
+
+# ---------- Small HTTP helpers ------------------------------------------------
 async def _http_json(url: str, params: Dict[str, Any], timeout: float = 8.0) -> Optional[Dict[str, Any]]:
     client = get_http_client()
     if client is None:
@@ -25,20 +30,62 @@ async def _http_json(url: str, params: Dict[str, Any], timeout: float = 8.0) -> 
         logger.warning("[feature] _http_json error: %r", e)
         return None
 
-# ---------- Time helpers ----------
+
+async def _rate_limit_json(
+    url: str,
+    params: Dict[str, Any],
+    timeout: float = 10.0,
+    max_retries: int = 3,
+    base_backoff: float = 0.75,
+) -> Optional[Dict[str, Any]]:
+    """
+    Like _http_json, but handles 429s with exponential backoff.
+    """
+    client = get_http_client()
+    if client is None:
+        return None
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            r = await client.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                if attempt > max_retries:
+                    logger.warning("[feature] 429 after %d attempts for %s", attempt - 1, url)
+                    return None
+                wait_for = base_backoff * (2 ** (attempt - 1))
+                logger.warning("[feature] 429 Too Many Requests for %s — backing off %.2fs", url, wait_for)
+                await asyncio.sleep(wait_for)
+                continue
+            r.raise_for_status()
+            js = r.json()
+            return js if isinstance(js, dict) else None
+        except Exception as e:
+            if attempt > max_retries:
+                logger.warning("[feature] _rate_limit_json failed: %r (url=%s)", e, url)
+                return None
+            # backoff on any transient error too
+            wait_for = base_backoff * (2 ** (attempt - 1))
+            await asyncio.sleep(wait_for)
+
+
+# ---------- Time helpers ------------------------------------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _to_ms(dt: datetime) -> int:
-    # Polygon v2/aggs accepts epoch ms or YYYY-MM-DD.
-    # We use epoch ms to get precise intraday windows and avoid 400s.
+    # Polygon v2/aggs accepts epoch ms or YYYY-MM-DD; we use epoch ms for precise intraday windows.
     return int(dt.timestamp() * 1000)
 
-# ---------- Basic TA ----------
+
+# ---------- Basic TA ----------------------------------------------------------
 def _sma(values: List[float], period: int) -> Optional[float]:
     if len(values) < period:
         return None
     return sum(values[-period:]) / period
+
 
 def _ema(values: List[float], period: int) -> Optional[float]:
     if len(values) < period:
@@ -48,6 +95,7 @@ def _ema(values: List[float], period: int) -> Optional[float]:
     for v in values[period:]:
         ema_val = v * k + ema_val * (1 - k)
     return ema_val
+
 
 def _rsi(values: List[float], period: int = 14) -> Optional[float]:
     if len(values) <= period:
@@ -73,6 +121,7 @@ def _rsi(values: List[float], period: int = 14) -> Optional[float]:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+
 def _stddev(values: List[float], period: int) -> Optional[float]:
     if len(values) < period:
         return None
@@ -81,11 +130,12 @@ def _stddev(values: List[float], period: int) -> Optional[float]:
     var = sum((x - mean) ** 2 for x in window) / period
     return math.sqrt(var)
 
-def _macd(values: List[float], f=12, s=26, sig=9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+
+def _macd(values: List[float], f: int = 12, s: int = 26, sig: int = 9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     if len(values) < (s + sig):
         return (None, None, None)
 
-    # Build EMA series so we can generate a proper MACD signal EMA
+    # helper to build EMA series
     def ema_series(vals: List[float], period: int) -> List[Optional[float]]:
         k = 2 / (period + 1)
         out: List[Optional[float]] = []
@@ -109,11 +159,7 @@ def _macd(values: List[float], f=12, s=26, sig=9) -> Tuple[Optional[float], Opti
         else:
             macd_line_series.append(ef - es)
 
-    # signal line EMA on macd_line
-    macd_clean = [m for m in macd_line_series if m is not None]
-    if len(macd_clean) < sig:
-        return (None, None, None)
-
+    # compute signal on the macd line
     def ema_over_series(series: List[Optional[float]], period: int) -> List[Optional[float]]:
         vals = [x for x in series if x is not None]
         if len(vals) < period:
@@ -144,7 +190,8 @@ def _macd(values: List[float], f=12, s=26, sig=9) -> Tuple[Optional[float], Opti
     macd_hist = macd_line - macd_signal
     return (macd_line, macd_signal, macd_hist)
 
-# ---------- Polygon bars fetch ----------
+
+# ---------- Polygon bars fetch ------------------------------------------------
 async def _fetch_aggs_polygon(
     symbol: str,
     multiplier: int,
@@ -159,18 +206,17 @@ async def _fetch_aggs_polygon(
     """
     if not POLYGON_API_KEY:
         return []
+
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{_to_ms(start)}/{_to_ms(end)}"
-    js = await _http_json(url, {"adjusted": "true", "sort": "asc", "limit": str(limit), "apiKey": POLYGON_API_KEY}, timeout=10.0)
+    js = await _http_json(
+        url,
+        {"adjusted": "true", "sort": "asc", "limit": str(limit), "apiKey": POLYGON_API_KEY},
+        timeout=10.0,
+    )
     if not js or not isinstance(js.get("results"), list):
         return []
     return js["results"]
 
-async def _prev_day_bar(symbol: str) -> Optional[Dict[str, Any]]:
-    if not POLYGON_API_KEY:
-        return None
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev"
-    js = await _http_json(url, {"adjusted": "true", "apiKey": POLYGON_API_KEY}, timeout=6.0)
-    return js
 
 def _pick_close_series(bars: List[Dict[str, Any]]) -> List[float]:
     out: List[float] = []
@@ -179,6 +225,7 @@ def _pick_close_series(bars: List[Dict[str, Any]]) -> List[float]:
         if isinstance(c, (int, float)):
             out.append(float(c))
     return out
+
 
 def _intraday_vwap(bars: List[Dict[str, Any]]) -> Optional[float]:
     """
@@ -202,6 +249,7 @@ def _intraday_vwap(bars: List[Dict[str, Any]]) -> Optional[float]:
         tot_v += v
     return (tot_pv / tot_v) if tot_v > 0 else None
 
+
 def _orb_15(bars_today_1m: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
     """
     Opening Range Breakout (first 15 mins) for US equities:
@@ -212,71 +260,25 @@ def _orb_15(bars_today_1m: List[Dict[str, Any]]) -> Tuple[Optional[float], Optio
     open_utc = datetime.combine(datetime.utcnow().date(), datetime.min.time()).replace(tzinfo=timezone.utc) \
                .replace(hour=13, minute=30, second=0, microsecond=0)
     end_utc = open_utc + timedelta(minutes=15)
-    lo = None
-    hi = None
     start_ms = _to_ms(open_utc)
     end_ms = _to_ms(end_utc)
+    lo = None
+    hi = None
     for b in bars_today_1m:
         ts = b.get("t")
         if not isinstance(ts, (int, float)):
             continue
         if start_ms <= ts < end_ms:
-            low = b.get("l"); high = b.get("h")
+            low = b.get("l")
+            high = b.get("h")
             if isinstance(low, (int, float)):
                 lo = low if lo is None else min(lo, low)
             if isinstance(high, (int, float)):
                 hi = high if hi is None else max(hi, high)
     return (hi, lo)
 
-# ---------- Short interest / short volume (best-effort) ----------
-async def _try_short_metrics(symbol: str) -> Dict[str, Any]:
-    """
-    Best-effort short interest / short volume (plan-dependent).
-    Returns empty dict if not available on your plan.
-    """
-    if not POLYGON_API_KEY:
-        return {}
-    out: Dict[str, Any] = {}
-    candidates = [
-        ("v3_shorts", f"https://api.polygon.io/v3/reference/shorts"),
-        ("v2_shorts", f"https://api.polygon.io/v2/reference/shorts/{symbol}"),
-        ("v2_shorts_vol", f"https://api.polygon.io/v2/reference/shorts/{symbol}/volume"),
-    ]
-    for name, url in candidates:
-        js = await _http_json(url, {"ticker": symbol, "apiKey": POLYGON_API_KEY}, timeout=6.0)
-        if js and isinstance(js, dict):
-            out[name] = js
 
-    # Try to normalize
-    def _extract(j: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        sv = ti = tv = None
-        try:
-            rows = j.get("results") or j.get("data") or []
-            if isinstance(rows, dict):
-                rows = [rows]
-            latest = rows[-1] if rows else {}
-            sv = latest.get("short_volume") or latest.get("shortVolume")
-            tv = latest.get("total_volume") or latest.get("totalVolume")
-            ti = latest.get("short_interest") or latest.get("shortInterest")
-            return (float(sv) if sv is not None else None,
-                    float(ti) if ti is not None else None,
-                    float(tv) if tv is not None else None)
-        except Exception:
-            return (None, None, None)
-
-    sv = si = tv = None
-    for _, v in out.items():
-        _sv, _si, _tv = _extract(v)
-        sv = sv or _sv; si = si or _si; tv = tv or _tv
-    ratio = (sv / tv) if (sv and tv and tv > 0) else None
-    return {
-        "short_volume": sv,
-        "short_interest": si,
-        "short_volume_total": tv,
-        "short_volume_ratio": ratio,
-    }
-
-# ---------- TA Orchestrator ----------
+# ---------- TA Orchestrator ---------------------------------------------------
 async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
     """
     Multi-tier fetch: 1m (2-3 days) -> 5m (~2 weeks) -> 1d (~2 years).
@@ -285,7 +287,7 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
     now = _now_utc()
     out: Dict[str, Any] = {"ta_src": None}
 
-    # 1) 1-minute bars (3d) for VWAP/ORB + TA if enough history
+    # 1) 1-minute bars for today (VWAP & ORB) and recent history
     try:
         start_1m_hist = now - timedelta(days=3)
         bars_1m = await _fetch_aggs_polygon(symbol, 1, "minute", start_1m_hist, now, limit=50000)
@@ -316,7 +318,7 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
     ema200_1m = _ema(closes_1m, 200)
     macd_line_1m, macd_signal_1m, macd_hist_1m = _macd(closes_1m)
 
-    # 2) 5-minute bars (~14d) as fallback
+    # 2) 5-minute bars as fallback
     try:
         start_5m = now - timedelta(days=14)
         bars_5m = await _fetch_aggs_polygon(symbol, 5, "minute", start_5m, now, limit=50000)
@@ -331,9 +333,9 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
     ema200_5m = _ema(closes_5m, 200)
     macd_line_5m, macd_signal_5m, macd_hist_5m = _macd(closes_5m)
 
-    # 3) Daily bars (~750d) for long trend + Bollinger
+    # 3) Daily bars for longer trends / Bollinger
     try:
-        start_1d = now - timedelta(days=750)
+        start_1d = now - timedelta(days=750)  # ~3 years to get EMA200 safely
         bars_1d = await _fetch_aggs_polygon(symbol, 1, "day", start_1d, now, limit=50000)
     except Exception as e:
         logger.warning("[feature] 1d fetch failed: %r", e)
@@ -352,7 +354,7 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
     bb_upper_1d = (bb_mid_1d + 2 * bb_std_1d) if (bb_mid_1d is not None and bb_std_1d is not None) else None
     bb_lower_1d = (bb_mid_1d - 2 * bb_std_1d) if (bb_mid_1d is not None and bb_std_1d is not None) else None
 
-    # Choose best available granularity for each TA
+    # Choose best available granularity for each TA (preference: 1m -> 5m -> 1d)
     def _pick(*vals):
         for v in vals:
             if v is not None:
@@ -360,23 +362,23 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
         return None
 
     out.update({
-        "rsi14":       _pick(rsi14_1m, rsi14_5m, rsi14_1d),
-        "sma20":       _pick(sma20_1m, sma20_5m, sma20_1d),
-        "ema20":       _pick(ema20_1m, ema20_5m, ema20_1d),
-        "ema50":       _pick(ema50_1m, ema50_5m, ema50_1d),
-        "ema200":      _pick(ema200_1m, ema200_5m, ema200_1d),
-        "macd_line":   _pick(macd_line_1m, macd_line_5m, macd_line_1d),
+        "rsi14": _pick(rsi14_1m, rsi14_5m, rsi14_1d),
+        "sma20": _pick(sma20_1m, sma20_5m, sma20_1d),
+        "ema20": _pick(ema20_1m, ema20_5m, ema20_1d),
+        "ema50": _pick(ema50_1m, ema50_5m, ema50_1d),
+        "ema200": _pick(ema200_1m, ema200_5m, ema200_1d),
+        "macd_line": _pick(macd_line_1m, macd_line_5m, macd_line_1d),
         "macd_signal": _pick(macd_signal_1m, macd_signal_5m, macd_signal_1d),
-        "macd_hist":   _pick(macd_hist_1m, macd_hist_5m, macd_hist_1d),
+        "macd_hist": _pick(macd_hist_1m, macd_hist_5m, macd_hist_1d),
         "bb_upper": bb_upper_1d,
         "bb_lower": bb_lower_1d,
-        "bb_mid":   bb_mid_1d,
+        "bb_mid": bb_mid_1d,
         "vwap": vwap,
         "orb15_high": orb_hi,
-        "orb15_low":  orb_lo,
+        "orb15_low": orb_lo,
     })
 
-    # Tag TA source
+    # Mark source we ended up using for RSI/EMA20/SMA20 (best effort)
     ta_src = None
     if out["rsi14"] is not None and out["ema20"] is not None and out["sma20"] is not None:
         if rsi14_1m == out["rsi14"] or ema20_1m == out["ema20"] or sma20_1m == out["sma20"]:
@@ -389,45 +391,13 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
         ta_src = "1m" if closes_1m else ("5m" if closes_5m else ("1d" if closes_1d else None))
     out["ta_src"] = ta_src
 
-    # Also map macd_line → macd (for consumers expecting 'macd')
-    if out.get("macd_line") is not None and "macd" not in out:
-        out["macd"] = out["macd_line"]
-
     return out
 
-# ---------- Premarket & previous-5 averages ----------
-async def _prev5_avg_hilo(symbol: str, now_utc: datetime) -> Tuple[Optional[float], Optional[float]]:
-    end = (now_utc - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    start = end - timedelta(days=10)
-    bars = await _fetch_aggs_polygon(symbol, 1, "day", start, end, limit=50000)
-    if not bars:
-        return (None, None)
-    last5 = bars[-5:] if len(bars) >= 5 else bars
-    highs = [b.get("h") for b in last5 if isinstance(b.get("h"), (int, float))]
-    lows  = [b.get("l") for b in last5 if isinstance(b.get("l"), (int, float))]
-    if not highs or not lows:
-        return (None, None)
-    return (sum(highs) / len(highs), sum(lows) / len(lows))
 
-async def _premarket_high_low(symbol: str, today_local_dt: datetime) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Premarket window 4:00–9:30 ET → 3:00–8:30 CT. Use 1m bars.
-    """
-    d = today_local_dt.date()
-    start_ct = datetime(d.year, d.month, d.day, 3, 0, 0, tzinfo=CDT_TZ).astimezone(timezone.utc)
-    end_ct   = datetime(d.year, d.month, d.day, 8, 30, 0, tzinfo=CDT_TZ).astimezone(timezone.utc)
-    bars = await _fetch_aggs_polygon(symbol, 1, "minute", start_ct, end_ct, limit=50000)
-    if not bars:
-        return (None, None)
-    highs = [b.get("h") for b in bars if isinstance(b.get("h"), (int, float))]
-    lows  = [b.get("l") for b in bars if isinstance(b.get("l"), (int, float))]
-    return (max(highs) if highs else None, min(lows) if lows else None)
-
-# ---------- Synthetic NBBO ----------
+# ---------- Synthetic NBBO ----------------------------------------------------
 def _synthetic_nbbo_from_last(last: Optional[float], base_spread_pct: float = None) -> Dict[str, Any]:
     if not isinstance(last, (int, float)) or last <= 0:
         return {}
-    # Wider synthetic after-hours, tighter in RTH via env knob
     spread_pct = float(base_spread_pct if base_spread_pct is not None else os.getenv("SYNTH_SPREAD_PCT", "1.0"))
     half = spread_pct / 200.0
     bid = last * (1 - half / 100.0)
@@ -437,45 +407,104 @@ def _synthetic_nbbo_from_last(last: Optional[float], base_spread_pct: float = No
         "synthetic_bid": round(bid, 4),
         "synthetic_ask": round(ask, 4),
         "synthetic_mid": round(mid, 4),
-        "synthetic_spread_pct": round((ask - bid) / mid * 100.0, 3) if mid > 0 else round(spread_pct, 3),
-        "synthetic_quote_age_sec": None,  # engine may set this if it has a last timestamp
-        "synthetic_nbbo_spread_est": round(spread_pct, 3),
+        "synthetic_spread_pct": round((ask - bid) / mid * 100.0, 3) if mid > 0 else spread_pct,
+        "synthetic_quote_age_sec": None,  # caller can override with a timestamp if they have one
     }
 
-def _extract_option_last_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> Optional[float]:
+
+# ---------- Optional shorts context (Polygon v1) ------------------------------
+async def _fetch_shorts_context(symbol: str) -> Dict[str, Any]:
     """
-    Try hard to find a usable 'last' from Polygon option snapshot.
-    Tolerates various shapes; falls back to mid if bid/ask present.
+    Fetch Short Interest and Short Volume via Polygon v1 endpoints:
+      - /stocks/v1/short-interest
+      - /stocks/v1/short-volume
+    We filter by ticker, take the most recent entry, and expose a compact bundle.
+
+    Returns (best effort):
+      {
+        "short_interest": float|None,
+        "short_interest_date": "YYYY-MM-DD"|None,
+        "short_volume": float|None,
+        "short_volume_total": float|None,
+        "short_volume_ratio": float|None   # short_volume / total_volume
+      }
     """
-    try:
-        if not snapshot or not isinstance(snapshot.get("results"), dict):
+    if not POLY_ENABLE_SHORTS or not POLYGON_API_KEY or not symbol:
+        return {}
+
+    out: Dict[str, Any] = {}
+
+    def _first_record(js: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not js or not isinstance(js, dict):
             return None
-        res = snapshot["results"]
+        for key in ("results", "data"):
+            val = js.get(key)
+            if isinstance(val, list) and val:
+                # exact ticker match preferred
+                for row in val:
+                    if isinstance(row, dict) and str(row.get("ticker", "")).upper() == symbol.upper():
+                        return row
+                return val[0]
+        # fallback: search any list value
+        for v in js.values():
+            if isinstance(v, list) and v:
+                for row in v:
+                    if isinstance(row, dict) and str(row.get("ticker", "")).upper() == symbol.upper():
+                        return row
+                return v[0]
+        return None
 
-        # Common places
-        for key in ("last", "mark", "mid", "price", "p"):
-            v = res.get(key)
-            if isinstance(v, (int, float)) and v > 0:
-                return float(v)
+    # Short Interest
+    try:
+        si = await _rate_limit_json(
+            "https://api.polygon.io/stocks/v1/short-interest",
+            {
+                "ticker": symbol,
+                "limit": "1",
+                "sort": "date.desc",
+                "apiKey": POLYGON_API_KEY,
+            },
+            timeout=10.0,
+        )
+        row = _first_record(si)
+        if isinstance(row, dict):
+            short_interest = row.get("short_interest") or row.get("shortInterest") or row.get("short_shares")
+            si_date = row.get("date") or row.get("settlement_date") or row.get("settlementDate") or row.get("asof")
+            if isinstance(short_interest, (int, float)):
+                out["short_interest"] = float(short_interest)
+            if isinstance(si_date, str):
+                out["short_interest_date"] = si_date
+    except Exception as e:
+        logger.warning("[feature] short-interest fetch failed: %r", e)
 
-        # nested option -> last_trade/last_quote
-        opt = res.get("option") or {}
-        last_trade = opt.get("last_trade") or opt.get("last") or {}
-        for k in ("price", "p", "last", "c"):
-            v = last_trade.get(k)
-            if isinstance(v, (int, float)) and v > 0:
-                return float(v)
+    # Short Volume
+    try:
+        sv = await _rate_limit_json(
+            "https://api.polygon.io/stocks/v1/short-volume",
+            {
+                "ticker": symbol,
+                "limit": "1",
+                "sort": "date.desc",
+                "apiKey": POLYGON_API_KEY,
+            },
+            timeout=10.0,
+        )
+        row = _first_record(sv)
+        if isinstance(row, dict):
+            short_vol = row.get("short_volume") or row.get("shortVolume") or row.get("short")
+            total_vol = row.get("total_volume") or row.get("totalVolume") or row.get("market_volume") or row.get("volume")
+            if isinstance(short_vol, (int, float)):
+                out["short_volume"] = float(short_vol)
+            if isinstance(total_vol, (int, float)) and total_vol > 0:
+                out["short_volume_total"] = float(total_vol)
+                out["short_volume_ratio"] = round(float(short_vol) / float(total_vol), 4) if short_vol else None
+    except Exception as e:
+        logger.warning("[feature] short-volume fetch failed: %r", e)
 
-        # derive from bid/ask
-        bid = res.get("bid")
-        ask = res.get("ask")
-        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid and (ask + bid) > 0:
-            return (float(bid) + float(ask)) / 2.0
-    except Exception:
-        pass
-    return None
+    return out
 
-# ---------- Public builder ----------
+
+# ---------- Public builder ----------------------------------------------------
 async def build_features(
     client,
     alert: Dict[str, Any],
@@ -485,95 +514,55 @@ async def build_features(
     Build a unified feature dict combining:
       - Option snapshot enrichments (when provided)
       - TA on the UNDERLYING (RSI/SMA/EMA/MACD/BBands/VWAP/ORB)
-      - Previous-day OHLC, previous-5 avg high/low, pre-market H/L
-      - Short volume / short interest (best-effort)
-      - Synthetic NBBO fields (if needed) based on option 'last'
-      - Underlying Δ% vs prior close
+      - Synthetic NBBO fields (if needed) based on option 'last' (adopted by engine if NBBO missing)
+      - Short Interest & Short Volume context (Polygon v1)
     """
     symbol = alert.get("symbol")
     out: Dict[str, Any] = {}
 
-    # ---------- Technicals on underlying ----------
+    # carry over some snapshot enrichments if provided
+    if snapshot and isinstance(snapshot.get("results"), dict):
+        res = snapshot["results"]
+        for k in ("day", "underlying_asset", "greeks", "implied_volatility"):
+            if k in res and out.get(k) is None:
+                out[k] = res[k]
+
+    # Technicals on the underlying
     try:
         ta = await _compute_ta_bundle(symbol)
         out.update(ta)
     except Exception as e:
         logger.warning("[feature] TA compute failed: %r", e)
 
-    # ---------- Previous day bar & Δ% vs prior close ----------
+    # % change vs prior close on underlying (use recent daily bars)
     try:
-        prev = await _prev_day_bar(symbol)
-        pr = (prev or {}).get("results") or {}
-        if isinstance(pr, list):
-            pr = pr[-1] if pr else {}
-        if isinstance(pr, dict):
-            out["prev_close"] = pr.get("c")
-            out["prev_open"]  = pr.get("o")
-            out["prev_high"]  = pr.get("h")
-            out["prev_low"]   = pr.get("l")
-
-        # Compute change vs previous close using alert UL price if available; else latest daily close
-        ul_price = alert.get("underlying_price_from_alert")
-        base = out.get("prev_close")
-        ref_price = float(ul_price) if isinstance(ul_price, (int, float)) else None
-        if base is not None and isinstance(base, (int, float)) and base > 0:
-            if ref_price is None:
-                # fallback to most recent daily close
-                now = _now_utc()
-                bars = await _fetch_aggs_polygon(symbol, 1, "day", now - timedelta(days=5), now, limit=50000)
-                if bars:
-                    last_c = bars[-1].get("c")
-                    if isinstance(last_c, (int, float)):
-                        ref_price = float(last_c)
-            if ref_price is not None:
-                out["quote_change_pct"] = round((ref_price - float(base)) / float(base) * 100.0, 3)
+        now = _now_utc()
+        bars_y = await _fetch_aggs_polygon(symbol, 1, "day", now - timedelta(days=5), now)
+        if isinstance(bars_y, list) and len(bars_y) >= 2:
+            last_c = bars_y[-1].get("c")
+            prev_c = bars_y[-2].get("c")
+            if isinstance(last_c, (int, float)) and isinstance(prev_c, (int, float)) and prev_c > 0:
+                out["ul_change_pct"] = round((float(last_c) - float(prev_c)) / float(prev_c) * 100.0, 3)
     except Exception as e:
-        logger.warning("[feature] prev-day & Δ%% failed: %r", e)
+        logger.warning("[feature] UL change pct failed: %r", e)
 
-    # ---------- Previous 5 days avg PDH/PDL ----------
+    # Optional: Short Interest / Short Volume
     try:
-        avg_hi, avg_lo = await _prev5_avg_hilo(symbol, _now_utc())
-        out["prev5_avg_high"] = avg_hi
-        out["prev5_avg_low"]  = avg_lo
+        out.update(await _fetch_shorts_context(symbol))
     except Exception as e:
-        logger.warning("[feature] prev5 avg H/L failed: %r", e)
+        logger.warning("[feature] shorts context failed: %r", e)
 
-    # ---------- Pre-market high/low (today) ----------
-    try:
-        pm_hi, pm_lo = await _premarket_high_low(symbol, datetime.now(CDT_TZ))
-        out["premarket_high"] = pm_hi
-        out["premarket_low"]  = pm_lo
-    except Exception as e:
-        logger.warning("[feature] premarket H/L failed: %r", e)
-
-    # ---------- Short interest / short volume (best-effort) ----------
-    try:
-        out.update(await _try_short_metrics(symbol))
-    except Exception as e:
-        logger.warning("[feature] short metrics failed: %r", e)
-
-    # ---------- VWAP distance vs alert price ----------
-    try:
-        vwap = out.get("vwap")
-        price = float(alert.get("underlying_price_from_alert")) if alert.get("underlying_price_from_alert") is not None else None
-        if vwap is not None and isinstance(price, (int, float)) and vwap != 0:
-            out["vwap_dist"] = (price - vwap) / vwap * 100.0
-    except Exception:
-        pass
-
-    # ---------- Synthetic NBBO seed from LAST if option NBBO is missing ----------
-    try:
-        option_last = _extract_option_last_from_snapshot(snapshot)
-        if option_last is not None and option_last > 0:
-            out.update(_synthetic_nbbo_from_last(option_last, None))
-    except Exception as e:
-        logger.warning("[feature] synthetic NBBO seed failed: %r", e)
-
-    # Tag source if not set
-    out.setdefault("ta_src", out.get("ta_src") or "indicators+aggs")
-
-    # Ensure fields LLM looks for exist (when we only computed daily MACD as macd_line)
-    if out.get("macd_line") is not None and "macd" not in out:
-        out["macd"] = out["macd_line"]
+    # Synthetic NBBO seed from LAST if option NBBO missing downstream
+    # We don't know the option 'last' here reliably (engine merges Polygon snapshot + backfills),
+    # so we only provide an empty template. The engine will call _synthetic_nbbo_from_last()
+    # with the actual f['last'] and adopt synthetic_* fields if NBBO is missing.
+    # Keeping this for API symmetry (engine may still merge any of these if set).
+    out.update({
+        "synthetic_bid": None,
+        "synthetic_ask": None,
+        "synthetic_mid": None,
+        "synthetic_spread_pct": None,
+        "synthetic_quote_age_sec": None,
+    })
 
     return out
