@@ -1,4 +1,4 @@
-# engine_processor_v1.0.py
+# engine_processor_v1.0.py  (updated)
 import os
 import re
 import socket
@@ -31,7 +31,6 @@ from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
-from reporting import _DECISIONS_LOG
 from market_ops import (
     polygon_get_option_snapshot_export,
     poly_option_backfill,
@@ -111,6 +110,65 @@ def _adopt_synthetic_nbbo_if_missing(f: Dict[str, Any]) -> None:
     f.setdefault("option_spread_pct", f.get("synthetic_spread_pct"))
     f["synthetic_nbbo_used"] = True
     f["synthetic_nbbo_spread_est"] = synth.get("synthetic_spread_pct")
+
+
+async def _try_multi_provider_nbbo(option_ticker: str, alert: Dict[str, Any], chosen_strike: float, chosen_expiry: str, f: Dict[str, Any]) -> None:
+    """
+    Optional multi-provider fallback:
+      market_providers.get_nbbo_any -> (Polygon/IBKR/Tradier/Other) -> apply to f
+      If module is not available, return silently.
+    """
+    try:
+        from market_providers import get_nbbo_any, synthetic_from_last  # optional module
+    except Exception:
+        # Module not present; nothing to do here.
+        return
+
+    if isinstance(f.get("bid"), (int, float)) and isinstance(f.get("ask"), (int, float)):
+        return  # already have NBBO
+
+    # Build context for the provider (OCC meta helps)
+    occ = _occ_meta(option_ticker) or {}
+    ctx = {
+        "symbol": alert.get("symbol"),
+        "right": "C" if (alert.get("side") or "").upper() == "CALL" else "P",
+        "strike": float(chosen_strike),
+        "expiry_yyyymmdd": (occ.get("expiry") or chosen_expiry.replace("-", "")),
+        "last": f.get("last"),
+    }
+
+    try:
+        alt = await get_nbbo_any(option_ticker, ctx)
+    except Exception as e:
+        logger.warning("get_nbbo_any failed: %r", e)
+        alt = None
+
+    if not alt:
+        # As a courtesy, try their synthetic helper if they provide one
+        try:
+            syn = synthetic_from_last(f.get("last"))
+        except Exception:
+            syn = None
+        if syn:
+            f["nbbo_provider"] = syn.get("provider", "synthetic")
+            f.setdefault("bid", syn.get("bid"))
+            f.setdefault("ask", syn.get("ask"))
+            f.setdefault("mid", syn.get("mid"))
+            if f.get("option_spread_pct") is None and syn.get("spread_pct") is not None:
+                f["option_spread_pct"] = syn.get("spread_pct")
+            f["synthetic_nbbo_used"] = True
+            f["synthetic_nbbo_spread_est"] = syn.get("synthetic_nbbo_spread_est")
+        return
+
+    # Apply provider NBBO
+    f["nbbo_provider"] = alt.get("provider")
+    if alt.get("bid") is not None: f["bid"] = float(alt["bid"])
+    if alt.get("ask") is not None: f["ask"] = float(alt["ask"])
+    if alt.get("mid") is not None: f["mid"] = float(alt["mid"])
+    if alt.get("spread_pct") is not None: f["option_spread_pct"] = float(alt["spread_pct"])
+    if alt.get("synthetic_nbbo_used"):
+        f["synthetic_nbbo_used"] = True
+        f["synthetic_nbbo_spread_est"] = alt.get("synthetic_nbbo_spread_est")
 
 
 # =========================
@@ -254,7 +312,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # C) aggressively ensure NBBO
+            # C) aggressively ensure NBBO via Polygon (retry spinner)
             try:
                 if f.get("bid") is None or f.get("ask") is None:
                     nbbo = await ensure_nbbo(get_http_client(), option_ticker, tries=12, delay=0.35)
@@ -264,11 +322,18 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # D) direct last-quote probe
+            # D) direct last-quote probe (Polygon)
             if f.get("bid") is None or f.get("ask") is None:
-                for k, v in (await _pull_nbbo_direct(option_ticker)).items():
-                    if v is not None:
-                        f[k] = v
+                try:
+                    for k, v in (await _pull_nbbo_direct(option_ticker)).items():
+                        if v is not None:
+                            f[k] = v
+                except Exception:
+                    pass
+
+            # D2) Multi-provider NBBO fallback (IBKR/Tradier/etc) if available
+            if f.get("bid") is None or f.get("ask") is None:
+                await _try_multi_provider_nbbo(option_ticker, alert, desired_strike, chosen_expiry, f)
 
             # E) ensure DTE
             if f.get("dte") is None:
@@ -277,7 +342,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 except Exception:
                     pass
 
-            # F) change vs prev close
+            # F) change vs prev close (option quote)
             if f.get("quote_change_pct") is None:
                 try:
                     prev_close = f.get("prev_close")
@@ -287,22 +352,25 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 except Exception:
                     pass
 
-            # G) if NBBO still missing but we have last, adopt synthetic around last/mid
+            # G) if NBBO still missing but we have last/mid, adopt synthetic
             _adopt_synthetic_nbbo_if_missing(f)
 
             # H) if still no spread but we have mid, set a soft spread (legacy fallback)
             if (f.get("option_spread_pct") is None) and isinstance(f.get("mid"), (int, float)):
                 f["option_spread_pct"] = float(os.getenv("FALLBACK_SYNTH_SPREAD_PCT", "10.0"))
 
-            # I) attach verbose NBBO status for debugging
+            # I) attach verbose NBBO status for debugging (Polygon probe)
             if f.get("bid") is None or f.get("ask") is None:
-                nbbo_dbg = await _probe_nbbo_verbose(option_ticker)
-                for k in ("bid", "ask", "mid", "option_spread_pct", "quote_age_sec"):
-                    if nbbo_dbg.get(k) is not None:
-                        f[k] = nbbo_dbg[k]
-                f["nbbo_http_status"] = nbbo_dbg.get("nbbo_http_status")
-                f["nbbo_reason"] = nbbo_dbg.get("nbbo_reason")
-                f["nbbo_body_sample"] = nbbo_dbg.get("nbbo_body_sample")
+                try:
+                    nbbo_dbg = await _probe_nbbo_verbose(option_ticker)
+                    for k in ("bid", "ask", "mid", "option_spread_pct", "quote_age_sec"):
+                        if nbbo_dbg.get(k) is not None:
+                            f[k] = nbbo_dbg[k]
+                    f["nbbo_http_status"] = nbbo_dbg.get("nbbo_http_status")
+                    f["nbbo_reason"] = nbbo_dbg.get("nbbo_reason")
+                    f["nbbo_body_sample"] = nbbo_dbg.get("nbbo_body_sample")
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.exception("[worker] Polygon/features error: %s", e)
@@ -393,7 +461,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                     f"{side} {alert['symbol']} | Strike {desired_strike} | Exp {chosen_expiry}\n"
                     f"Contract: {option_ticker}\n"
                     f"NBBO {f.get('bid')}/{f.get('ask')}  Mark={f.get('mid')}  Last={f.get('last')}\n"
-                    f"Spread%={f.get('option_spread_pct')}  QuoteAge(s)={f.get('quote_age_sec')}\n"
+                    f"Spread%={f.get('option_spread_pct')}  QuoteAge(s)={f.get('quote_age_sec')}  "
+                    f"{'Provider='+str(f.get('nbbo_provider')) if f.get('nbbo_provider') else ''}\n"
                     f"OI={f.get('oi')}  Vol={f.get('vol')}  IV={f.get('iv')}  Δ={f.get('delta')} Γ={f.get('gamma')}\n"
                     f"DTE={f.get('dte')}  Regime={f.get('regime_flag')}  (pre-LLM)\n"
                     f"NBBO dbg: status={f.get('nbbo_http_status')} reason={f.get('nbbo_reason')}\n"
@@ -423,12 +492,14 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if force_buy:
         decision_final = "buy"
 
-    # Diff note (strike/expiry changes + synthetic NBBO note)
+    # Diff note (strike/expiry changes + provider + synthetic NBBO note)
     diff_bits = []
     if isinstance(orig_strike, (int, float)) and isinstance(desired_strike, (int, float)) and float(orig_strike) != float(desired_strike):
         diff_bits.append(f"🎯 Selected strike {desired_strike} (alert was {orig_strike})")
     if orig_expiry and chosen_expiry and str(orig_expiry) != str(chosen_expiry):
         diff_bits.append(f"🗓 Selected expiry {chosen_expiry} (alert was {orig_expiry})")
+    if f.get("nbbo_provider") and not f.get("synthetic_nbbo_used"):
+        diff_bits.append(f"📡 NBBO via {f.get('nbbo_provider')}")
     if f.get("synthetic_nbbo_used"):
         diff_bits.append(f"🧪 Synthetic NBBO used ({f.get('synthetic_nbbo_spread_est')}% spread est.)")
     diff_note = "\n".join(diff_bits)
@@ -503,6 +574,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "vwap": f.get("vwap"), "orb15_high": f.get("orb15_high"), "orb15_low": f.get("orb15_low"),
             "synthetic_nbbo_used": f.get("synthetic_nbbo_used"),
             "synthetic_nbbo_spread_est": f.get("synthetic_nbbo_spread_est"),
+            "nbbo_provider": f.get("nbbo_provider"),
             "nbbo_http_status": f.get("nbbo_http_status"), "nbbo_reason": f.get("nbbo_reason"),
         },
         "pm_contracts": {
