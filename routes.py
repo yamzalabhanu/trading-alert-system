@@ -12,9 +12,9 @@ from fastapi.responses import JSONResponse
 
 # Orchestrator (trading engine) module
 import trading_engine as engine
-# Unusual-activity scanner (NEW)
-from volume_scanner import run_scanner_loop  # <-- runs in background
-# Daily reporter (NEW)
+# Unusual-activity scanner (runs in background)
+from volume_scanner import run_scanner_loop, get_state as uvscan_state  # <-- added uvscan_state
+# Daily reporter
 from daily_reporter import build_daily_report, send_daily_report_to_telegram
 
 # Logger
@@ -27,8 +27,8 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
-# Keep a handle to the background scanner task (NEW)
-_scanner_task = None  # type: ignore
+# Keep a handle to the background scanner task
+_scanner_task: Optional[asyncio.Task] = None
 
 # ----- App lifecycle wiring -----
 def bind_lifecycle(app: FastAPI):
@@ -38,7 +38,13 @@ def bind_lifecycle(app: FastAPI):
         await engine.startup()
         # Kick off the unusual-activity scanner (runs forever unless cancelled).
         # It will no-op if POLYGON_API_KEY or UV_SCAN_TICKERS is not set.
-        _scanner_task = asyncio.create_task(run_scanner_loop())
+        if _scanner_task is None or _scanner_task.done():
+            try:
+                _scanner_task = asyncio.create_task(run_scanner_loop(), name="uv-scan")
+            except TypeError:
+                # Fallback if running on older Python without 'name' support
+                _scanner_task = asyncio.create_task(run_scanner_loop())
+            log.info("[routes] uv-scan task started")
 
     @app.on_event("shutdown")
     async def _shutdown():
@@ -51,6 +57,7 @@ def bind_lifecycle(app: FastAPI):
             except Exception:
                 pass
             _scanner_task = None
+            log.info("[routes] uv-scan task stopped")
         await engine.shutdown()
 
 # Optional alternative name
@@ -110,6 +117,37 @@ async def webhook_tradingview(
 ):
     return await webhook(request=request, ib=ib, force=force, qty=qty)
 
+# ----- uv-scan control & status (NEW) -----
+@router.get("/uvscan/status")
+async def uvscan_status():
+    running = bool(_scanner_task and not _scanner_task.done())
+    state = uvscan_state()
+    return {"running": running, "state": state}
+
+@router.post("/uvscan/start")
+async def uvscan_start():
+    global _scanner_task
+    if _scanner_task and not _scanner_task.done():
+        return {"started": False, "reason": "already running"}
+    try:
+        _scanner_task = asyncio.create_task(run_scanner_loop(), name="uv-scan")
+    except TypeError:
+        _scanner_task = asyncio.create_task(run_scanner_loop())
+    return {"started": True}
+
+@router.post("/uvscan/stop")
+async def uvscan_stop():
+    global _scanner_task
+    if not _scanner_task:
+        return {"stopped": False, "reason": "not running"}
+    _scanner_task.cancel()
+    try:
+        await _scanner_task
+    except Exception:
+        pass
+    _scanner_task = None
+    return {"stopped": True}
+
 # ----- Diagnostics -----
 @router.get("/net/debug")
 async def net_debug():
@@ -138,7 +176,7 @@ async def diag_polygon(underlying: str, contract: str):
     async with httpx.AsyncClient(timeout=6.0) as HTTP:
         out["single"] = await _http_json(
             HTTP,
-            f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}",
+            f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}?",
             {"apiKey": POLYGON_API_KEY},
             6.0,
         )
@@ -197,7 +235,7 @@ async def diag_nbbo(ticker: str):
         "body_sample": body_sample,
     }
 
-# ----- Daily EOD Report (NEW) -----
+# ----- Daily EOD Report -----
 @router.get("/reports/daily")
 async def get_daily_report(date: Optional[str] = None):
     """
