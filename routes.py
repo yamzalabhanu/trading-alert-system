@@ -1,5 +1,6 @@
 # routes.py
 import os
+import asyncio
 import logging
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
@@ -10,6 +11,8 @@ from fastapi.responses import JSONResponse
 
 # Orchestrator (trading engine) module
 import trading_engine as engine
+# Unusual-activity scanner (NEW)
+from volume_scanner import run_scanner_loop  # <-- add this import
 
 # Logger
 log = logging.getLogger("trading_engine.routes")
@@ -21,14 +24,30 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
+# Keep a handle to the background scanner task (NEW)
+_scanner_task = None  # type: ignore
+
 # ----- App lifecycle wiring -----
 def bind_lifecycle(app: FastAPI):
     @app.on_event("startup")
     async def _startup():
+        global _scanner_task
         await engine.startup()
+        # Kick off the unusual-activity scanner (runs forever unless cancelled).
+        # It will no-op if POLYGON_API_KEY or UV_SCAN_TICKERS is not set.
+        _scanner_task = asyncio.create_task(run_scanner_loop())
 
     @app.on_event("shutdown")
     async def _shutdown():
+        global _scanner_task
+        # Stop scanner first so it doesn't race engine shutdown
+        if _scanner_task:
+            _scanner_task.cancel()
+            try:
+                await _scanner_task
+            except Exception:
+                pass
+            _scanner_task = None
         await engine.shutdown()
 
 # Optional alternative name
