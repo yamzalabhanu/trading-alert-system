@@ -2,8 +2,9 @@
 import os
 import asyncio
 import logging
+from typing import Optional
 from urllib.parse import quote
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date as dt_date
 
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request
@@ -12,7 +13,9 @@ from fastapi.responses import JSONResponse
 # Orchestrator (trading engine) module
 import trading_engine as engine
 # Unusual-activity scanner (NEW)
-from volume_scanner import run_scanner_loop  # <-- add this import
+from volume_scanner import run_scanner_loop  # <-- runs in background
+# Daily reporter (NEW)
+from daily_reporter import build_daily_report, send_daily_report_to_telegram
 
 # Logger
 log = logging.getLogger("trading_engine.routes")
@@ -193,3 +196,39 @@ async def diag_nbbo(ticker: str):
         "status": res.get("status"),
         "body_sample": body_sample,
     }
+
+# ----- Daily EOD Report (NEW) -----
+@router.get("/reports/daily")
+async def get_daily_report(date: Optional[str] = None):
+    """
+    Returns JSON + a monospace table for the given date (CDT).
+    date format: YYYY-MM-DD (defaults to today in CDT)
+    """
+    if date:
+        try:
+            y, m, d = [int(x) for x in date.split("-")]
+            target = dt_date(y, m, d)
+        except Exception:
+            raise HTTPException(400, "Invalid date; use YYYY-MM-DD")
+    else:
+        target = None
+    rep = await build_daily_report(target)
+    return rep
+
+@router.post("/reports/daily/send")
+async def send_daily_report(date: Optional[str] = None):
+    """
+    Sends the daily report to Telegram.
+    """
+    if date:
+        try:
+            y, m, d = [int(x) for x in date.split("-")]
+            target = dt_date(y, m, d)
+        except Exception:
+            raise HTTPException(400, "Invalid date; use YYYY-MM-DD")
+    else:
+        target = None
+    res = await send_daily_report_to_telegram(target)
+    if not res.get("ok"):
+        raise HTTPException(500, res.get("error", "send failed"))
+    return res
