@@ -217,7 +217,7 @@ def _fmt_int(n):
     except Exception:
         return str(n)
 
-async def _alert_stock_spike(symbol: str, spike: Dict]):
+async def _alert_stock_spike(symbol: str, spike: Dict):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         txt = (
             f"⚡ Unusual Stock Volume\n"
