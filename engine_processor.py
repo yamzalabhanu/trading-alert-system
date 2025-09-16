@@ -1,4 +1,4 @@
-# engine_processor_v1.0.py  (updated)
+# engine_processor.py
 import os
 import re
 import socket
@@ -15,8 +15,8 @@ from engine_runtime import get_http_client
 from engine_common import (
     POLYGON_API_KEY,
     IBKR_ENABLED, IBKR_DEFAULT_QTY, IBKR_TIF, IBKR_ORDER_MODE, IBKR_USE_MID_AS_LIMIT,
-    SCAN_MIN_VOL_RTH, SCAN_MIN_OI_RTH, SCAN_MIN_VOL_AH, SCAN_MIN_OI_AH,
-    SEND_CHAIN_SCAN_ALERTS, SEND_CHAIN_SCAN_TOPN_ALERTS, REPLACE_IF_NO_NBBO,
+    # (removed) SEND_CHAIN_SCAN_ALERTS, SEND_CHAIN_SCAN_TOPN_ALERTS
+    REPLACE_IF_NO_NBBO,
     market_now, consume_llm,
     parse_alert_text,
     _is_rth_now, _occ_meta, _ticker_matches_side, _encode_ticker_path,
@@ -33,6 +33,8 @@ from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from feature_engine import build_features
 from scoring import compute_decision_score, map_score_to_rating
+# Daily report logger (NEW)
+from daily_reporter import log_alert_snapshot
 from market_ops import (
     polygon_get_option_snapshot_export,
     poly_option_backfill,
@@ -269,10 +271,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     # 3) Chain scan thresholds
     rth = _is_rth_now()
-    scan_min_vol = SCAN_MIN_VOL_RTH if rth else SCAN_MIN_VOL_AH
-    scan_min_oi  = SCAN_MIN_OI_RTH  if rth else SCAN_MIN_OI_AH
+    # Keep scan thresholds but DO NOT send any pre-LLM alert
+    scan_min_vol = int(os.getenv("SCAN_MIN_VOL_RTH" if rth else "SCAN_MIN_VOL_AH", "500" if rth else "0"))
+    scan_min_oi  = int(os.getenv("SCAN_MIN_OI_RTH"  if rth else "SCAN_MIN_OI_AH",  "500" if rth else "100"))
 
-    # 3a) Selection via scan (strictly honor side)
+    # 3a) Selection via scan (strictly honor side) — selection only; no Telegram here
     try:
         best_from_scan = await scan_for_best_contract_for_alert(
             client,
@@ -525,7 +528,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     if force_buy:
         decision_final = "buy"
 
-    # Diff note (strike/expiry changes + provider + synthetic NBBO note)
+    # Diff note — NO chain-scan note is added here.
     diff_bits = []
     if isinstance(orig_strike, (int, float)) and isinstance(desired_strike, (int, float)) and float(orig_strike) != float(desired_strike):
         diff_bits.append(f"🎯 Selected strike {desired_strike} (alert was {orig_strike})")
@@ -540,20 +543,28 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         diff_bits.append(msg)
     diff_note = "\n".join(diff_bits)
 
-    # 8) Telegram final
+    # 8) Telegram final (single message only; no pre-LLM chain-scan message anywhere)
     try:
         tg_text = compose_telegram_text(
             alert={**alert, "strike": desired_strike, "expiry": chosen_expiry},
             option_ticker=option_ticker, f=f, llm=llm, llm_ran=True, llm_reason="", score=score, rating=rating,
             diff_note=diff_note,
         )
-      
         if replacement_note is not None:
             tg_text += f"\n⚠️ Replacement: {replacement_note['old']} → {replacement_note['new']} ({replacement_note['why']})."
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             await send_telegram(tg_text)
     except Exception as e:
         logger.exception("[worker] Telegram error: %s", e)
+
+    # 8b) Log for daily report (NEW)
+    try:
+        log_alert_snapshot(
+            {**alert, "strike": desired_strike, "expiry": chosen_expiry},
+            option_ticker, f
+        )
+    except Exception as e:
+        logger.warning("[daily-report] log snapshot failed: %r", e)
 
     # 9) IBKR (optional)
     ib_attempted = False
@@ -618,7 +629,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                 "minus5_put": {"strike": pm["strike_put"],  "contract": pm["contract_put"]},
             },
             "ibkr": {"enabled": ib_enabled, "attempted": ib_attempted, "result": ib_result_obj},
-            "selection_debug": selection_debug,
+            "selection_debug": selection_debug,   # kept for logging only; not shown in Telegram
             "alert_original": {"strike": orig_strike, "expiry": orig_expiry},
             "chosen": {"strike": desired_strike, "expiry": chosen_expiry},
             "replacement": replacement_note,
