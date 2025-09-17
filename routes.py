@@ -10,10 +10,13 @@ import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+# Timezone for trading windows
+from config import CDT_TZ
+
 # Orchestrator (trading engine) module
 import trading_engine as engine
 # Unusual-activity scanner (runs in background)
-from volume_scanner import run_scanner_loop, get_state as uvscan_state  # <-- added uvscan_state
+from volume_scanner import run_scanner_loop, get_state as uvscan_state
 # Daily reporter
 from daily_reporter import build_daily_report, send_daily_report_to_telegram
 
@@ -27,79 +30,44 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
-# Keep handles to background tasks
+# Keep a handle to the background scanner task
 _scanner_task: Optional[asyncio.Task] = None
-_report_task: Optional[asyncio.Task] = None  # <-- NEW
 
-# ----- Daily report scheduler (NEW) -----
-def _seconds_until_next_cdt_time(hour: int, minute: int) -> float:
-    # Import here to avoid circular imports at module load
-    from engine_common import CDT_TZ
-    now = datetime.now(CDT_TZ)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target = target + timedelta(days=1)
-    return (target - now).total_seconds()
-
-async def _report_loop() -> None:
+# -------- TradingView signal window gating --------
+def _in_signal_window_cdt(now: Optional[datetime] = None) -> bool:
     """
-    Auto-send the daily report at a configured CDT time.
-    Env:
-      DAILY_REPORT_ENABLED=1
-      DAILY_REPORT_HOUR=15   # 3:xx pm CDT (after close)
-      DAILY_REPORT_MINUTE=10 # e.g., 10 minutes after
+    Accept signals only during 08:30–10:30 and 14:00–15:00 CDT.
+    By default, restrict to weekdays (Mon–Fri). You can disable weekday restriction
+    by setting ALERT_WINDOW_WEEKDAYS_ONLY=0.
     """
-    enabled = os.getenv("DAILY_REPORT_ENABLED", "1") != "0"
-    if not enabled:
-        return
+    now = now or datetime.now(CDT_TZ)
+    # Optional weekday restriction (default on)
+    if os.getenv("ALERT_WINDOW_WEEKDAYS_ONLY", "1") == "1" and now.weekday() > 4:
+        return False
 
-    try:
-        hour = int(os.getenv("DAILY_REPORT_HOUR", "15"))
-        minute = int(os.getenv("DAILY_REPORT_MINUTE", "10"))
-    except Exception:
-        hour, minute = 15, 10
-
-    while True:
-        try:
-            wait_s = max(1.0, _seconds_until_next_cdt_time(hour, minute))
-            await asyncio.sleep(wait_s)
-            res = await send_daily_report_to_telegram(None)  # today in CDT
-            if not res.get("ok"):
-                log.warning("[routes] daily report send failed: %s", res.get("error"))
-            # Avoid re-triggering within the same minute
-            await asyncio.sleep(65)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.warning("[routes] daily report loop error: %r", e)
-            await asyncio.sleep(5.0)
+    minutes = now.hour * 60 + now.minute
+    windows = [
+        (8 * 60 + 30, 10 * 60 + 30),  # 08:30–10:30
+        (14 * 60, 15 * 60),           # 14:00–15:00
+    ]
+    return any(start <= minutes < end for start, end in windows)
 
 # ----- App lifecycle wiring -----
 def bind_lifecycle(app: FastAPI):
     @app.on_event("startup")
     async def _startup():
-        global _scanner_task, _report_task
+        global _scanner_task
         await engine.startup()
-        # Kick off the unusual-activity scanner (runs forever unless cancelled).
-        # It will no-op if POLYGON_API_KEY or UV_SCAN_TICKERS is not set.
         if _scanner_task is None or _scanner_task.done():
             try:
                 _scanner_task = asyncio.create_task(run_scanner_loop(), name="uv-scan")
             except TypeError:
                 _scanner_task = asyncio.create_task(run_scanner_loop())
             log.info("[routes] uv-scan task started")
-        # Start daily report scheduler
-        if _report_task is None or _report_task.done():
-            try:
-                _report_task = asyncio.create_task(_report_loop(), name="daily-report")
-            except TypeError:
-                _report_task = asyncio.create_task(_report_loop())
-            log.info("[routes] daily-report task started")
 
     @app.on_event("shutdown")
     async def _shutdown():
-        global _scanner_task, _report_task
-        # Stop scanner first so it doesn't race engine shutdown
+        global _scanner_task
         if _scanner_task:
             _scanner_task.cancel()
             try:
@@ -108,15 +76,6 @@ def bind_lifecycle(app: FastAPI):
                 pass
             _scanner_task = None
             log.info("[routes] uv-scan task stopped")
-        # Stop daily report task
-        if _report_task:
-            _report_task.cancel()
-            try:
-                await _report_task
-            except Exception:
-                pass
-            _report_task = None
-            log.info("[routes] daily-report task stopped")
         await engine.shutdown()
 
 # Optional alternative name
@@ -144,11 +103,24 @@ async def engine_quota():
 @router.post("/webhook")
 async def webhook(
     request: Request,
-    ib: bool = False,     # ?ib=1 to allow IBKR order when decision == buy
-    force: bool = False,  # ?force=1 to override to buy
-    qty: int = 1,         # ?qty=1 default
+    ib: bool = False,      # ?ib=1 to allow IBKR order when decision == buy
+    force: bool = False,   # ?force=1 to override to buy
+    qty: int = 1,          # ?qty=1 default
+    bypass_window: bool = False,  # ?bypass_window=1 to ignore signal windows (for tests)
 ):
     log.info("webhook received; ib=%s force=%s qty=%s", ib, force, qty)
+
+    # Enforce TradingView acceptance windows
+    if not bypass_window and not _in_signal_window_cdt():
+        log.info("[webhook] outside signal window; dropping alert")
+        # Return 200 so TradingView doesn't retry, but do not enqueue.
+        return JSONResponse({
+            "queued": False,
+            "reason": "outside_signal_window",
+            "windows_cdt": ["08:30–10:30", "14:00–15:00"],
+            "llm_quota": engine.llm_quota_snapshot(),
+        }, status_code=200)
+
     text = await engine.get_alert_text_from_request(request)
     if not text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
@@ -173,10 +145,11 @@ async def webhook_tradingview(
     ib: bool = False,
     force: bool = False,
     qty: int = 1,
+    bypass_window: bool = False,
 ):
-    return await webhook(request=request, ib=ib, force=force, qty=qty)
+    return await webhook(request=request, ib=ib, force=force, qty=qty, bypass_window=bypass_window)
 
-# ----- uv-scan control & status (NEW) -----
+# ----- uv-scan control & status -----
 @router.get("/uvscan/status")
 async def uvscan_status():
     running = bool(_scanner_task and not _scanner_task.done())
