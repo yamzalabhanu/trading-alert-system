@@ -27,14 +27,58 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
-# Keep a handle to the background scanner task
+# Keep handles to background tasks
 _scanner_task: Optional[asyncio.Task] = None
+_report_task: Optional[asyncio.Task] = None  # <-- NEW
+
+# ----- Daily report scheduler (NEW) -----
+def _seconds_until_next_cdt_time(hour: int, minute: int) -> float:
+    # Import here to avoid circular imports at module load
+    from engine_common import CDT_TZ
+    now = datetime.now(CDT_TZ)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return (target - now).total_seconds()
+
+async def _report_loop() -> None:
+    """
+    Auto-send the daily report at a configured CDT time.
+    Env:
+      DAILY_REPORT_ENABLED=1
+      DAILY_REPORT_HOUR=15   # 3:xx pm CDT (after close)
+      DAILY_REPORT_MINUTE=10 # e.g., 10 minutes after
+    """
+    enabled = os.getenv("DAILY_REPORT_ENABLED", "1") != "0"
+    if not enabled:
+        return
+
+    try:
+        hour = int(os.getenv("DAILY_REPORT_HOUR", "15"))
+        minute = int(os.getenv("DAILY_REPORT_MINUTE", "10"))
+    except Exception:
+        hour, minute = 15, 10
+
+    while True:
+        try:
+            wait_s = max(1.0, _seconds_until_next_cdt_time(hour, minute))
+            await asyncio.sleep(wait_s)
+            res = await send_daily_report_to_telegram(None)  # today in CDT
+            if not res.get("ok"):
+                log.warning("[routes] daily report send failed: %s", res.get("error"))
+            # Avoid re-triggering within the same minute
+            await asyncio.sleep(65)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("[routes] daily report loop error: %r", e)
+            await asyncio.sleep(5.0)
 
 # ----- App lifecycle wiring -----
 def bind_lifecycle(app: FastAPI):
     @app.on_event("startup")
     async def _startup():
-        global _scanner_task
+        global _scanner_task, _report_task
         await engine.startup()
         # Kick off the unusual-activity scanner (runs forever unless cancelled).
         # It will no-op if POLYGON_API_KEY or UV_SCAN_TICKERS is not set.
@@ -42,13 +86,19 @@ def bind_lifecycle(app: FastAPI):
             try:
                 _scanner_task = asyncio.create_task(run_scanner_loop(), name="uv-scan")
             except TypeError:
-                # Fallback if running on older Python without 'name' support
                 _scanner_task = asyncio.create_task(run_scanner_loop())
             log.info("[routes] uv-scan task started")
+        # Start daily report scheduler
+        if _report_task is None or _report_task.done():
+            try:
+                _report_task = asyncio.create_task(_report_loop(), name="daily-report")
+            except TypeError:
+                _report_task = asyncio.create_task(_report_loop())
+            log.info("[routes] daily-report task started")
 
     @app.on_event("shutdown")
     async def _shutdown():
-        global _scanner_task
+        global _scanner_task, _report_task
         # Stop scanner first so it doesn't race engine shutdown
         if _scanner_task:
             _scanner_task.cancel()
@@ -58,6 +108,15 @@ def bind_lifecycle(app: FastAPI):
                 pass
             _scanner_task = None
             log.info("[routes] uv-scan task stopped")
+        # Stop daily report task
+        if _report_task:
+            _report_task.cancel()
+            try:
+                await _report_task
+            except Exception:
+                pass
+            _report_task = None
+            log.info("[routes] daily-report task stopped")
         await engine.shutdown()
 
 # Optional alternative name
