@@ -3,294 +3,295 @@ import os
 import json
 import math
 import asyncio
-import logging
-from typing import Dict, Any, List, Tuple, Optional
-from datetime import datetime, date, timezone, timedelta
-from urllib.parse import quote
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, date as dt_date, timezone, timedelta
 
 import httpx
 
-from config import CDT_TZ
 from engine_runtime import get_http_client
-from telegram_client import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, send_telegram
-from engine_common import POLYGON_API_KEY
+from engine_common import CDT_TZ, market_now, POLYGON_API_KEY
+from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-log = logging.getLogger("trading_engine.daily_reporter")
+# Storage location (simple JSONL). Works on ephemeral fs too.
+DATA_DIR = os.getenv("DATA_DIR", "/tmp")
+ALERTS_PATH = os.path.join(DATA_DIR, "daily_alerts.jsonl")
 
-DATA_DIR = os.getenv("DATA_DIR", "./data")
-ALERTS_DIR = os.path.join(DATA_DIR, "alerts")
-os.makedirs(ALERTS_DIR, exist_ok=True)
+# ------------ Utilities ------------
 
-# -------------- Logging alerts (called at alert time) --------------
-def _safe_float(x):
+def _ensure_dirs() -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+def _to_cdt(d: datetime) -> datetime:
+    return d.astimezone(CDT_TZ)
+
+def _cdt_date_of(dt: datetime) -> dt_date:
+    return _to_cdt(dt).date()
+
+def _fmt(n: Optional[float], nd=2) -> str:
+    try:
+        if n is None or (isinstance(n, float) and (math.isnan(n) or math.isinf(n))):
+            return "-"
+        if abs(float(n) - round(float(n))) < 1e-9:
+            return str(int(round(float(n))))
+        return f"{float(n):.{nd}f}"
+    except Exception:
+        return "-"
+
+def _safe_float(x) -> Optional[float]:
     try:
         if x is None: return None
         return float(x)
     except Exception:
         return None
 
-def _today_cdt() -> date:
-    return datetime.now(CDT_TZ).date()
+# ------------ Public API ------------
 
-def _alerts_path(d: date) -> str:
-    return os.path.join(ALERTS_DIR, f"{d.isoformat()}.jsonl")
-
-def log_alert_snapshot(alert: Dict[str, Any], option_ticker: str, f: Dict[str, Any]) -> None:
+def log_alert_snapshot(alert: Dict[str, Any], option_ticker: Optional[str], f: Dict[str, Any]) -> None:
     """
-    Append a JSONL line with the at-alert snapshot used for daily reporting.
-    This is intentionally sync & tiny (one write) to avoid adding await points in the hot path.
+    Called at alert-time from engine_processor.
+    Stores a one-line JSON record with alert-time prices for later EOD comparison.
     """
+    _ensure_dirs()
+    ts = market_now()
+    record = {
+        "ts": ts.isoformat(),
+        "date_cdt": _cdt_date_of(ts).isoformat(),
+        "symbol": alert.get("symbol"),
+        "side": (alert.get("side") or "").upper(),
+        "option_ticker": option_ticker,
+        "strike": alert.get("strike"),
+        "expiry": alert.get("expiry"),
+        # prices at alert time
+        "bid": _safe_float(f.get("bid")),
+        "ask": _safe_float(f.get("ask")),
+        "mid": _safe_float(f.get("mid")),
+        "last": _safe_float(f.get("last")),
+        # extra context
+        "nbbo_provider": f.get("nbbo_provider"),
+        "synthetic_nbbo_used": bool(f.get("synthetic_nbbo_used")),
+        "spread_pct": _safe_float(f.get("option_spread_pct")),
+    }
     try:
-        d = _today_cdt()
-        path = _alerts_path(d)
-        rec = {
-            "ts_local": datetime.now(CDT_TZ).isoformat(),
-            "date": d.isoformat(),
-            "symbol": alert.get("symbol"),
-            "side": (alert.get("side") or "").upper(),
-            "contract": option_ticker,
-            "strike": _safe_float(alert.get("strike")),
-            "expiry": alert.get("expiry"),
-            "bid_alert": _safe_float(f.get("bid")),
-            "ask_alert": _safe_float(f.get("ask")),
-            "last_alert": _safe_float(f.get("last") if f.get("last") is not None else f.get("mid")),
-        }
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception as e:
-        log.warning("[daily-report] failed to log snapshot: %r", e)
+        with open(ALERTS_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception:
+        # swallow; reporting is best-effort
+        pass
 
-# -------------- EOD fetch helpers --------------
-async def _http_json(url: str, params: Dict[str, Any], timeout: float = 8.0) -> Tuple[int, Any]:
-    client = get_http_client()
-    close_after = False
-    if client is None:
-        client = httpx.AsyncClient(timeout=timeout)
-        close_after = True
+
+async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any], timeout: float = 8.0) -> Dict[str, Any]:
     try:
         r = await client.get(url, params=params, timeout=timeout)
-        status = r.status_code
-        js = None
-        try:
-            js = r.json()
-        except Exception:
-            js = r.text
-        return status, js
-    finally:
-        if close_after:
-            await client.aclose()
+        if r.status_code in (402, 403, 404, 429):
+            return {"status": r.status_code, "body": r.text[:400]}
+        r.raise_for_status()
+        js = r.json()
+        return js if isinstance(js, dict) else {"status": 500, "error": "non-json"}
+    except Exception as e:
+        return {"status": 500, "error": str(e)}
 
-async def _polygon_option_openclose(contract: str, d: date) -> Optional[Dict[str, Any]]:
-    if not POLYGON_API_KEY:
+
+async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Optional[float]:
+    """
+    Get end-of-day 'last' for the option.
+    Priority:
+      1) polygon v1 open-close (close)
+      2) polygon last-quote (if same day after close; best-effort)
+      3) polygon v2 aggs 1-min up to 15:00 CDT (close of last bar)
+    Returns None if all attempts fail or API not configured.
+    """
+    if not POLYGON_API_KEY or not option_ticker:
         return None
-    enc = quote(contract, safe="")
-    url = f"https://api.polygon.io/v1/open-close/options/{enc}/{d.isoformat()}"
-    status, body = await _http_json(url, {"apiKey": POLYGON_API_KEY}, timeout=7.0)
-    if status == 200 and isinstance(body, dict):
-        return body
+
+    client = get_http_client()
+    if client is None:
+        return None
+
+    enc = option_ticker.replace("/", "%2F")  # safe encode (OCC contains ':', digits ok)
+    # 1) open-close
+    oc = await _http_json(
+        client,
+        f"https://api.polygon.io/v1/open-close/options/{enc}/{day.isoformat()}",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=8.0,
+    )
+    close_px = None
+    if isinstance(oc, dict) and oc.get("status") not in (400, 402, 403, 404, 429, 500):
+        # Known shape: { "close": 0.52, ... }
+        close_px = _safe_float(oc.get("close"))
+        if close_px is not None:
+            return close_px
+
+    # 2) last-quote (best-effort; not strictly EOD)
+    lq = await _http_json(
+        client,
+        f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0,
+    )
+    if isinstance(lq, dict) and lq.get("status") not in (400, 402, 403, 404, 429, 500):
+        # Shape: { "results": { "P": { "ask":..., "bid":..., "price":... } } }
+        try:
+            res = lq.get("results") or {}
+            # 'price' may be trade price (if last trade), otherwise we fallback to mid
+            price = None
+            if isinstance(res, dict):
+                # some payloads nest differently; try common keys
+                price = res.get("price") or res.get("p") or res.get("last", {}).get("price")
+            price = _safe_float(price)
+            if price is not None:
+                return price
+        except Exception:
+            pass
+
+    # 3) minute aggs up to market close (15:00 CDT)
+    # Build UTC window that covers CDT day 08:30->15:00
+    start_cdt = datetime(day.year, day.month, day.day, 8, 30, tzinfo=CDT_TZ)
+    end_cdt = datetime(day.year, day.month, day.day, 15, 0, tzinfo=CDT_TZ)
+    frm = start_cdt.astimezone(timezone.utc).isoformat()
+    to = (end_cdt.astimezone(timezone.utc) + timedelta(minutes=1)).isoformat()
+
+    aggs = await _http_json(
+        client,
+        f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/1/minute/{frm}/{to}",
+        {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY},
+        timeout=10.0,
+    )
+    try:
+        arr = aggs.get("results") if isinstance(aggs, dict) else None
+        if isinstance(arr, list) and arr:
+            # last bar close
+            return _safe_float(arr[-1].get("c"))
+    except Exception:
+        pass
+
     return None
 
-async def _polygon_option_aggs_close(contract: str, d: date) -> Optional[float]:
-    """Fallback: get last 'c' from intraday aggs as EOD close."""
-    if not POLYGON_API_KEY:
-        return None
-    enc = quote(contract, safe="")
-    start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
-    end   = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
-    url = f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/5/min/{start}/{end}"
-    status, body = await _http_json(url, {"adjusted": "true", "sort": "asc", "limit": 2000, "apiKey": POLYGON_API_KEY}, timeout=8.5)
-    if status == 200 and isinstance(body, dict) and isinstance(body.get("results"), list) and body["results"]:
-        # Take the last candle close
-        try:
-            return float(body["results"][-1].get("c"))
-        except Exception:
-            return None
-    return None
 
-async def _polygon_option_last_quote(contract: str) -> Tuple[Optional[float], Optional[float]]:
-    """Attempt to fetch a 'bid/ask' snapshot near now; acceptable proxy for EOD for options (no AH)."""
-    if not POLYGON_API_KEY:
-        return None, None
-    enc = quote(contract, safe="")
-    url = f"https://api.polygon.io/v3/quotes/options/{enc}/last"
-    status, body = await _http_json(url, {"apiKey": POLYGON_API_KEY}, timeout=6.0)
-    if status == 200 and isinstance(body, dict):
-        res = body.get("results") or body.get("result")
-        if isinstance(res, dict):
-            # Polygon formats vary; try best-effort keys
-            b = res.get("bidPrice") or res.get("bid_price") or res.get("p") or res.get("bP")
-            a = res.get("askPrice") or res.get("ask_price") or res.get("p") or res.get("aP")
-            try:
-                bid = float(b) if b is not None else None
-            except Exception:
-                bid = None
-            try:
-                ask = float(a) if a is not None else None
-            except Exception:
-                ask = None
-            return bid, ask
-    return None, None
-
-async def fetch_eod_for_contract(contract: str, d: date) -> Dict[str, Optional[float]]:
-    """
-    Returns: {bid_eod, ask_eod, last_eod}
-    Strategy:
-      1) try v1 open-close for options to get 'close'
-      2) fallback to last aggs close
-      3) bid/ask via last-quote (proxy)
-    """
-    last_eod: Optional[float] = None
-    oc = await _polygon_option_openclose(contract, d)
-    if oc is not None:
-        # Try common fields
-        for k in ("close", "closePrice", "close_price", "closing_price"):
-            if oc.get(k) is not None:
-                try:
-                    last_eod = float(oc[k])
-                    break
-                except Exception:
-                    pass
-        # Some payloads embed it in "results"
-        if last_eod is None and isinstance(oc.get("results"), dict):
-            try:
-                last_eod = float(oc["results"].get("close"))
-            except Exception:
-                pass
-
-    if last_eod is None:
-        last_eod = await _polygon_option_aggs_close(contract, d)
-
-    bid_eod, ask_eod = await _polygon_option_last_quote(contract)
-
-    return {"bid_eod": bid_eod, "ask_eod": ask_eod, "last_eod": last_eod}
-
-# -------------- Report builder --------------
-def _load_alerts(d: date) -> List[Dict[str, Any]]:
-    path = _alerts_path(d)
-    if not os.path.exists(path):
+def _load_alerts_for_date(target: Optional[dt_date]) -> List[Dict[str, Any]]:
+    _ensure_dirs()
+    if not os.path.exists(ALERTS_PATH):
         return []
-    out = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
+    out: List[Dict[str, Any]] = []
+    with open(ALERTS_PATH, "r", encoding="utf-8") as fh:
+        for ln in fh:
             try:
-                out.append(json.loads(line))
+                rec = json.loads(ln)
             except Exception:
                 continue
+            if not isinstance(rec, dict):
+                continue
+            if target:
+                if rec.get("date_cdt") == target.isoformat():
+                    out.append(rec)
+            else:
+                # default to today (CDT)
+                if rec.get("date_cdt") == _cdt_date_of(market_now()).isoformat():
+                    out.append(rec)
     return out
 
-def _result_label(last_alert: Optional[float], last_eod: Optional[float]) -> str:
-    if last_alert is None or last_eod is None:
-        return "UNKNOWN"
-    if last_eod > last_alert:
-        return "SUCCESS"
-    if last_eod < last_alert:
-        return "FAILED"
-    return "FLAT"
 
-def _fmt(v: Any, nd: int = 2) -> str:
-    try:
-        if v is None: return "—"
-        x = float(v)
-        if abs(x - round(x)) < 1e-9:
-            return str(int(round(x)))
-        return f"{x:.{nd}f}"
-    except Exception:
-        return "—"
+async def build_daily_report(target_date: Optional[dt_date] = None) -> Dict[str, Any]:
+    """
+    Build the JSON report and a monospace table for Telegram.
+    """
+    rows = _load_alerts_for_date(target_date)
+    target = target_date or _cdt_date_of(market_now())
 
-def _make_table(rows: List[Dict[str, Any]]) -> str:
-    """
-    Build monospaced table suitable for Telegram (<= ~4000 chars per message; chunk if needed by caller).
-    Columns:
-      Contract | Dir | Strike | Exp | Bid/Ask/Last@Alert | Bid/Ask/Last@EOD | Result
-    """
-    headers = ["Contract", "Dir", "Strike", "Exp", "At Alert (B/A/L)", "EOD (B/A/L)", "Result"]
-    data = []
+    # Pre-fetch unique contracts' EOD last (avoid N calls per alert)
+    uniq = sorted({r.get("option_ticker") for r in rows if r.get("option_ticker")})
+    eod_cache: Dict[str, Optional[float]] = {}
+    for tk in uniq:
+        try:
+            eod_cache[tk] = await _fetch_option_eod_last(tk, target)
+        except Exception:
+            eod_cache[tk] = None
+        await asyncio.sleep(0.05)  # tiny jitter to be polite
+
+    # Compose table rows
+    table_rows: List[List[str]] = []
+    header = ["Contract", "Side", "Strike", "Exp", "Alert Last", "EOD Last", "Bid/Ask@Alert", "Result"]
     for r in rows:
-        at_alert = f"{_fmt(r.get('bid_alert'))}/{_fmt(r.get('ask_alert'))}/{_fmt(r.get('last_alert'))}"
-        at_eod   = f"{_fmt(r.get('bid_eod'))}/{_fmt(r.get('ask_eod'))}/{_fmt(r.get('last_eod'))}"
-        data.append([
-            r.get("contract") or "?",
-            (r.get("side") or "?")[0],
-            _fmt(r.get("strike"), 2),
-            r.get("expiry") or "?",
-            at_alert,
-            at_eod,
-            _result_label(r.get('last_alert'), r.get('last_eod')),
+        tk = r.get("option_ticker") or "-"
+        side = r.get("side") or "-"
+        strike = r.get("strike")
+        exp = r.get("expiry") or "-"
+        last_alert = _safe_float(r.get("last")) or _safe_float(r.get("mid"))
+        eod_last = eod_cache.get(tk)
+        if last_alert is None or eod_last is None:
+            result = "UNKNOWN"
+        else:
+            if eod_last > last_alert:
+                result = "SUCCESS"
+            elif eod_last < last_alert:
+                result = "FAIL"
+            else:
+                result = "FLAT"
+        table_rows.append([
+            tk,
+            side,
+            _fmt(strike, 2),
+            str(exp),
+            _fmt(last_alert, 4),
+            _fmt(eod_last, 4),
+            f"{_fmt(r.get('bid'),4)}/{_fmt(r.get('ask'),4)}",
+            result
         ])
-    # calc widths
-    cols = list(zip(*([headers] + data))) if data else [headers]
-    widths = [max(len(str(x)) for x in col) for col in cols]
-    def fmt_row(row):
-        return " | ".join(str(v).ljust(w) for v, w in zip(row, widths))
-    lines = [fmt_row(headers), "-+-".join("-" * w for w in widths)]
-    lines += [fmt_row(r) for r in data]
-    return "```\n" + "\n".join(lines) + "\n```"
 
-async def build_daily_report(d: Optional[date] = None) -> Dict[str, Any]:
-    target = d or _today_cdt()
-    alerts = _load_alerts(target)
-    if not alerts:
-        return {"date": target.isoformat(), "rows": [], "table": "No alerts logged."}
+    # Fit into a monospace table
+    cols = list(zip(*( [header] + table_rows ))) if table_rows else []
+    widths = [max(len(str(x)) for x in col) for col in cols] if cols else [9,4,6,8,10,9,14,6]
 
-    # Cache EOD per contract
-    eod_cache: Dict[str, Dict[str, Optional[float]]] = {}
-    rows: List[Dict[str, Any]] = []
+    def fmt_row(row: List[str]) -> str:
+        parts = []
+        for i, cell in enumerate(row):
+            w = widths[i]
+            parts.append(str(cell).ljust(w))
+        return "  ".join(parts)
 
-    for rec in alerts:
-        ct = rec.get("contract")
-        if not ct:
-            continue
-        if ct not in eod_cache:
-            try:
-                eod_cache[ct] = await fetch_eod_for_contract(ct, target)
-            except Exception as e:
-                log.warning("[daily-report] eod fetch fail for %s: %r", ct, e)
-                eod_cache[ct] = {"bid_eod": None, "ask_eod": None, "last_eod": None}
+    lines = []
+    lines.append(fmt_row(header))
+    lines.append("-" * (sum(widths) + 2 * (len(widths) - 1)))
+    for row in table_rows:
+        lines.append(fmt_row(row))
 
-        out = {
-            "contract": ct,
-            "side": rec.get("side"),
-            "strike": rec.get("strike"),
-            "expiry": rec.get("expiry"),
-            "bid_alert": rec.get("bid_alert"),
-            "ask_alert": rec.get("ask_alert"),
-            "last_alert": rec.get("last_alert"),
-            "bid_eod": eod_cache[ct].get("bid_eod"),
-            "ask_eod": eod_cache[ct].get("ask_eod"),
-            "last_eod": eod_cache[ct].get("last_eod"),
-        }
-        rows.append(out)
+    table_text = "Daily Options Alert Report — " + target.isoformat() + "\n```\n" + ("\n".join(lines) if lines else "(no alerts)") + "\n```"
 
-    table = _make_table(rows)
-    return {"date": target.isoformat(), "rows": rows, "table": table}
+    return {
+        "date": target.isoformat(),
+        "count": len(table_rows),
+        "rows": table_rows,
+        "table": table_text,
+    }
 
-# -------------- Telegram sender --------------
-async def send_daily_report_to_telegram(d: Optional[date] = None) -> Dict[str, Any]:
+
+async def send_daily_report_to_telegram(target_date: Optional[dt_date] = None) -> Dict[str, Any]:
+    rep = await build_daily_report(target_date)
+    ok = False; err = None
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "TELEGRAM not configured"}
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set", "preview": rep.get("table")}
 
-    rep = await build_daily_report(d)
-    text = f"📊 Daily Options Report — {rep['date']}\n{rep['table']}"
-    # Telegram message length guard; split if too long
-    if len(text) <= 3800:
-        await send_telegram(text)
-        return {"ok": True, "count": len(rep["rows"])}
-    # chunk by lines
-    header = f"📊 Daily Options Report — {rep['date']}\n"
-    body = rep["table"]
-    # crude split at code fences if needed
-    chunks: List[str] = []
-    cur = ""
-    for line in body.splitlines(True):
-        if len(header) + len(cur) + len(line) > 3800:
-            chunks.append(cur)
-            cur = ""
-        cur += line
-    if cur:
-        chunks.append(cur)
-    for i, part in enumerate(chunks, 1):
-        await send_telegram(f"{header}```\n{part.strip('`')}\n``` (part {i}/{len(chunks)})")
-    return {"ok": True, "count": len(rep["rows"]), "parts": len(chunks)}
+    msg = rep.get("table") or "(empty report)"
+    try:
+        # Telegram has a 4096 char limit per message; chunk if needed
+        max_len = 4000
+        if len(msg) <= max_len:
+            await send_telegram(msg)
+        else:
+            head = "Daily Options Alert Report (part 1)\n"
+            await send_telegram(head + msg[:max_len])
+            idx = 2
+            p = max_len
+            while p < len(msg):
+                await asyncio.sleep(0.4)
+                await send_telegram(f"(part {idx})\n" + msg[p:p+max_len])
+                p += max_len
+                idx += 1
+        ok = True
+    except Exception as e:
+        ok = False
+        err = str(e)
+    return {"ok": ok, "error": err or "", "count": rep.get("count", 0)}
