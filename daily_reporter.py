@@ -3,8 +3,10 @@ import os
 import json
 import math
 import asyncio
+import logging
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, date as dt_date, timezone, timedelta
+from urllib.parse import quote
 
 import httpx
 
@@ -15,6 +17,14 @@ from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 # Storage location (simple JSONL). Works on ephemeral fs too.
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
 ALERTS_PATH = os.path.join(DATA_DIR, "daily_alerts.jsonl")
+
+log = logging.getLogger("trading_engine.daily_reporter")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
+    log.addHandler(_h)
+log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
 
 # ------------ Utilities ------------
 
@@ -46,6 +56,14 @@ def _safe_float(x) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+def _encode_ticker_path(ticker: str) -> str:
+    """
+    Encode an OCC-style option ticker safely for use in the URL path,
+    e.g. 'O:AAPL250919C00245000' → 'O%3AAAPL250919C00245000'
+    """
+    return quote(ticker or "", safe="")
+
 
 # ------------ Public API ------------
 
@@ -94,38 +112,42 @@ async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]
         return {"status": 500, "error": str(e)}
 
 
-async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Optional[float]:
+async def _fetch_option_eod_last_openclose(client: httpx.AsyncClient, option_ticker: str, day: dt_date) -> Tuple[Optional[float], Optional[str]]:
     """
-    Get end-of-day 'last' for the option.
-    Priority:
-      1) polygon v1 open-close (close)
-      2) polygon last-quote (if same day after close; best-effort)
-      3) polygon v2 aggs 1-min up to 15:00 CDT (close of last bar)
-    Returns None if all attempts fail or API not configured.
+    Primary source: Polygon v1 open-close (close). Retries with backoff.
     """
-    if not POLYGON_API_KEY or not option_ticker:
-        return None
+    if not POLYGON_API_KEY:
+        return None, "missing_polygon_key"
 
-    client = get_http_client()
-    if client is None:
-        return None
+    enc = _encode_ticker_path(option_ticker)
+    url = f"https://api.polygon.io/v1/open-close/options/{enc}/{day.isoformat()}"
 
-    enc = option_ticker.replace("/", "%2F")  # safe encode (OCC contains ':', digits ok)
-    # 1) open-close
-    oc = await _http_json(
-        client,
-        f"https://api.polygon.io/v1/open-close/options/{enc}/{day.isoformat()}",
-        {"apiKey": POLYGON_API_KEY},
-        timeout=8.0,
-    )
-    close_px = None
-    if isinstance(oc, dict) and oc.get("status") not in (400, 402, 403, 404, 429, 500):
-        # Known shape: { "close": 0.52, ... }
-        close_px = _safe_float(oc.get("close"))
-        if close_px is not None:
-            return close_px
+    tries = int(os.getenv("DR_OPEN_CLOSE_TRIES", "3"))
+    delay = float(os.getenv("DR_OPEN_CLOSE_DELAY", "1.2"))
+    for i in range(tries):
+        oc = await _http_json(client, url, {"apiKey": POLYGON_API_KEY}, timeout=8.0)
+        # Successful shape usually includes status:"OK" (string), not numeric
+        if isinstance(oc, dict) and oc.get("status") not in (400, 402, 403, 404, 429, 500):
+            close_px = _safe_float(oc.get("close"))
+            if close_px is not None:
+                return close_px, "polygon_open_close"
+        # 429 or transient -> backoff
+        await asyncio.sleep(delay * (i + 1))
+    return None, "open_close_unavailable"
 
-    # 2) last-quote (best-effort; not strictly EOD)
+
+async def _fetch_option_eod_last_fallbacks(client: httpx.AsyncClient, option_ticker: str, day: dt_date) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Fallbacks:
+      A) v3 last-quote (best-effort, not strictly official EOD)
+      B) v2 minute aggs up to 15:00 CDT (use last bar close)
+    """
+    if not POLYGON_API_KEY:
+        return None, "missing_polygon_key"
+
+    enc = _encode_ticker_path(option_ticker)
+
+    # A) last quote
     lq = await _http_json(
         client,
         f"https://api.polygon.io/v3/quotes/options/{enc}/last",
@@ -133,22 +155,18 @@ async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Optional[f
         timeout=6.0,
     )
     if isinstance(lq, dict) and lq.get("status") not in (400, 402, 403, 404, 429, 500):
-        # Shape: { "results": { "P": { "ask":..., "bid":..., "price":... } } }
         try:
             res = lq.get("results") or {}
-            # 'price' may be trade price (if last trade), otherwise we fallback to mid
             price = None
             if isinstance(res, dict):
-                # some payloads nest differently; try common keys
-                price = res.get("price") or res.get("p") or res.get("last", {}).get("price")
+                price = res.get("price") or res.get("p") or res.get("last", {}).get("price") or res.get("last", {}).get("p")
             price = _safe_float(price)
             if price is not None:
-                return price
+                return price, "polygon_last_fallback"
         except Exception:
             pass
 
-    # 3) minute aggs up to market close (15:00 CDT)
-    # Build UTC window that covers CDT day 08:30->15:00
+    # B) minute aggs up to market close (15:00 CDT)
     start_cdt = datetime(day.year, day.month, day.day, 8, 30, tzinfo=CDT_TZ)
     end_cdt = datetime(day.year, day.month, day.day, 15, 0, tzinfo=CDT_TZ)
     frm = start_cdt.astimezone(timezone.utc).isoformat()
@@ -163,12 +181,36 @@ async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Optional[f
     try:
         arr = aggs.get("results") if isinstance(aggs, dict) else None
         if isinstance(arr, list) and arr:
-            # last bar close
-            return _safe_float(arr[-1].get("c"))
+            # use last bar's close
+            px = _safe_float(arr[-1].get("c"))
+            if px is not None:
+                return px, "polygon_aggs_fallback"
     except Exception:
         pass
 
-    return None
+    return None, "fallbacks_unavailable"
+
+
+async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Tuple[Optional[float], str]:
+    """
+    Get end-of-day last for the option with robust strategy and provenance.
+    """
+    if not POLYGON_API_KEY or not option_ticker:
+        return None, "disabled_or_missing_key"
+
+    client = get_http_client()
+    if client is None:
+        return None, "http_client_not_ready"
+
+    val, prov = await _fetch_option_eod_last_openclose(client, option_ticker, day)
+    if val is not None:
+        return val, prov
+
+    val, prov = await _fetch_option_eod_last_fallbacks(client, option_ticker, day)
+    if val is not None:
+        return val, prov
+
+    return None, "unavailable"
 
 
 def _load_alerts_for_date(target: Optional[dt_date]) -> List[Dict[str, Any]]:
@@ -201,15 +243,22 @@ async def build_daily_report(target_date: Optional[dt_date] = None) -> Dict[str,
     rows = _load_alerts_for_date(target_date)
     target = target_date or _cdt_date_of(market_now())
 
-    # Pre-fetch unique contracts' EOD last (avoid N calls per alert)
+    # Pre-fetch unique contracts' EOD last with gentle concurrency (rate-limit friendly)
     uniq = sorted({r.get("option_ticker") for r in rows if r.get("option_ticker")})
-    eod_cache: Dict[str, Optional[float]] = {}
-    for tk in uniq:
-        try:
-            eod_cache[tk] = await _fetch_option_eod_last(tk, target)
-        except Exception:
-            eod_cache[tk] = None
-        await asyncio.sleep(0.05)  # tiny jitter to be polite
+    eod_cache: Dict[str, Tuple[Optional[float], str]] = {}
+
+    sem = asyncio.Semaphore(int(os.getenv("DR_CONCURRENCY", "4")))
+
+    async def _task(tk: str):
+        async with sem:
+            try:
+                eod_px, source = await _fetch_option_eod_last(tk, target)
+            except Exception as e:
+                eod_px, source = None, f"error:{e}"
+            eod_cache[tk] = (eod_px, source)
+            await asyncio.sleep(float(os.getenv("DR_CALL_JITTER", "0.15")))
+
+    await asyncio.gather(*[_task(tk) for tk in uniq])
 
     # Compose table rows
     table_rows: List[List[str]] = []
@@ -220,16 +269,20 @@ async def build_daily_report(target_date: Optional[dt_date] = None) -> Dict[str,
         strike = r.get("strike")
         exp = r.get("expiry") or "-"
         last_alert = _safe_float(r.get("last")) or _safe_float(r.get("mid"))
-        eod_last = eod_cache.get(tk)
+        eod_last = None
+        if tk in eod_cache:
+            eod_last = eod_cache[tk][0]
+
         if last_alert is None or eod_last is None:
             result = "UNKNOWN"
         else:
             if eod_last > last_alert:
                 result = "SUCCESS"
             elif eod_last < last_alert:
-                result = "FAIL"
+                result = "FAILED"
             else:
-                result = "FLAT"
+                result = "EVEN"
+
         table_rows.append([
             tk,
             side,
@@ -242,7 +295,7 @@ async def build_daily_report(target_date: Optional[dt_date] = None) -> Dict[str,
         ])
 
     # Fit into a monospace table
-    cols = list(zip(*( [header] + table_rows ))) if table_rows else []
+    cols = list(zip(*([header] + table_rows))) if table_rows else []
     widths = [max(len(str(x)) for x in col) for col in cols] if cols else [9,4,6,8,10,9,14,6]
 
     def fmt_row(row: List[str]) -> str:
@@ -270,7 +323,11 @@ async def build_daily_report(target_date: Optional[dt_date] = None) -> Dict[str,
 
 async def send_daily_report_to_telegram(target_date: Optional[dt_date] = None) -> Dict[str, Any]:
     rep = await build_daily_report(target_date)
-    ok = False; err = None
+
+    # Optionally skip sending empty reports
+    if rep.get("count", 0) == 0 and os.getenv("DR_SEND_EMPTY", "1") != "1":
+        return {"ok": True, "skipped": True, "count": 0}
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return {"ok": False, "error": "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set", "preview": rep.get("table")}
 
@@ -290,8 +347,6 @@ async def send_daily_report_to_telegram(target_date: Optional[dt_date] = None) -
                 await send_telegram(f"(part {idx})\n" + msg[p:p+max_len])
                 p += max_len
                 idx += 1
-        ok = True
+        return {"ok": True, "count": rep.get("count", 0)}
     except Exception as e:
-        ok = False
-        err = str(e)
-    return {"ok": ok, "error": err or "", "count": rep.get("count", 0)}
+        return {"ok": False, "error": str(e), "count": rep.get("count", 0)}
