@@ -137,17 +137,29 @@ async def _fetch_option_eod_last_openclose(client: httpx.AsyncClient, option_tic
 
 
 async def _fetch_option_eod_last_fallbacks(client: httpx.AsyncClient, option_ticker: str, day: dt_date) -> Tuple[Optional[float], Optional[str]]:
-    """
-    Fallbacks:
-      A) v3 last-quote (best-effort, not strictly official EOD)
-      B) v2 minute aggs up to 15:00 CDT (use last bar close)
-    """
     if not POLYGON_API_KEY:
         return None, "missing_polygon_key"
 
     enc = _encode_ticker_path(option_ticker)
 
-    # A) last quote
+    # A) last TRADE (better than quote for EOD)
+    lt = await _http_json(
+        client,
+        f"https://api.polygon.io/v3/trades/options/{enc}/last",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=6.0,
+    )
+    if isinstance(lt, dict) and lt.get("status") not in (400, 402, 403, 404, 429, 500):
+        try:
+            res = lt.get("results") or {}
+            price = res.get("price") or res.get("p")
+            price = _safe_float(price)
+            if price is not None:
+                return price, "polygon_trades_last"
+        except Exception:
+            pass
+
+    # B) last QUOTE (best-effort if no trade)
     lq = await _http_json(
         client,
         f"https://api.polygon.io/v3/quotes/options/{enc}/last",
@@ -162,15 +174,15 @@ async def _fetch_option_eod_last_fallbacks(client: httpx.AsyncClient, option_tic
                 price = res.get("price") or res.get("p") or res.get("last", {}).get("price") or res.get("last", {}).get("p")
             price = _safe_float(price)
             if price is not None:
-                return price, "polygon_last_fallback"
+                return price, "polygon_quotes_last"
         except Exception:
             pass
 
-    # B) minute aggs up to market close (15:00 CDT)
+    # C) 1-minute AGGS up to 15:00 CDT
     start_cdt = datetime(day.year, day.month, day.day, 8, 30, tzinfo=CDT_TZ)
-    end_cdt = datetime(day.year, day.month, day.day, 15, 0, tzinfo=CDT_TZ)
+    end_cdt   = datetime(day.year, day.month, day.day, 15, 0, tzinfo=CDT_TZ)
     frm = start_cdt.astimezone(timezone.utc).isoformat()
-    to = (end_cdt.astimezone(timezone.utc) + timedelta(minutes=1)).isoformat()
+    to  = (end_cdt.astimezone(timezone.utc) + timedelta(minutes=1)).isoformat()
 
     aggs = await _http_json(
         client,
@@ -181,7 +193,6 @@ async def _fetch_option_eod_last_fallbacks(client: httpx.AsyncClient, option_tic
     try:
         arr = aggs.get("results") if isinstance(aggs, dict) else None
         if isinstance(arr, list) and arr:
-            # use last bar's close
             px = _safe_float(arr[-1].get("c"))
             if px is not None:
                 return px, "polygon_aggs_fallback"
@@ -189,6 +200,7 @@ async def _fetch_option_eod_last_fallbacks(client: httpx.AsyncClient, option_tic
         pass
 
     return None, "fallbacks_unavailable"
+
 
 
 async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Tuple[Optional[float], str]:
