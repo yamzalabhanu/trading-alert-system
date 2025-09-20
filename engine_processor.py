@@ -17,7 +17,7 @@ from engine_common import (
     IBKR_ENABLED, IBKR_DEFAULT_QTY, IBKR_TIF, IBKR_ORDER_MODE, IBKR_USE_MID_AS_LIMIT,
     # (removed) SEND_CHAIN_SCAN_ALERTS, SEND_CHAIN_SCAN_TOPN_ALERTS
     REPLACE_IF_NO_NBBO,
-    market_now, consume_llm,
+    market_now, consume_llm, CDT_TZ,            # <-- added CDT_TZ
     parse_alert_text,
     _is_rth_now, _occ_meta, _ticker_matches_side, _encode_ticker_path,
     _build_plus_minus_contracts,
@@ -76,6 +76,48 @@ def _rl_jitter_seconds() -> float:
     base = float(os.getenv("POLY_RL_BASE_JITTER", "0.05"))
     spread = float(os.getenv("POLY_RL_SPREAD_JITTER", "0.15"))
     return max(0.0, base + random.random() * spread)
+
+
+# ---------- Helpers for policy (next Friday + same strike) ----------
+
+def _next_friday_iso_cdt(now: Optional[datetime] = None) -> str:
+    """
+    Return next Friday's date (CDT) in YYYY-MM-DD.
+    If today is Friday, returns the Friday of next week (+7d).
+    """
+    now = now or datetime.now(CDT_TZ)
+    d = now.date()
+    days_ahead = (4 - d.weekday()) % 7  # 4 = Friday
+    if days_ahead == 0:
+        days_ahead = 7
+    return (d + timedelta(days=days_ahead)).isoformat()
+
+def _build_occ_ticker(symbol: str, expiry_iso: str, side: str, strike: float) -> str:
+    """
+    Compose OCC option ticker: O:{SYM}{YY}{MM}{DD}{C/P}{strike*1000:08d}
+    e.g., O:AAPL250912C00245000
+    """
+    right = "C" if (side or "").upper() == "CALL" else "P"
+    dt_ = datetime.fromisoformat(expiry_iso).date()
+    yy = dt_.year % 100
+    mm = dt_.month
+    dd = dt_.day
+    strike_int = int(round(float(strike) * 1000))
+    return f"O:{symbol}{yy:02d}{mm:02d}{dd:02d}{right}{strike_int:08d}"
+
+def _eq(a, b, tol: float = 1e-6) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= tol
+    except Exception:
+        return False
+
+def _expiry_iso_from_ticker(ticker: str) -> Optional[str]:
+    # Parse OCC: O:SYMBOL YY MM DD C/P STRIKE*1000
+    m = re.search(r":[A-Z]+(\d{2})(\d{2})(\d{2})[CP]\d{8,9}$", ticker or "")
+    if not m:
+        return None
+    yy, mm, dd = m.group(1), m.group(2), m.group(3)
+    return f"20{yy}-{mm}-{dd}"
 
 
 # ---------- Synthetic NBBO helpers ----------
@@ -255,73 +297,82 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     orig_strike = alert.get("strike")
     orig_expiry = alert.get("expiry")
 
-    # 2) Expiry defaulting
+    # 2) Enforce policy: next Friday expiry + SAME strike as alert (if present)
     ul_px = float(alert["underlying_price_from_alert"])
-    today_utc = datetime.now(timezone.utc).date()
-    def _next_friday(d): return d + timedelta(days=(4 - d.weekday()) % 7)
-    def same_week_friday(d): return (d - timedelta(days=d.weekday())) + timedelta(days=4)
-    target_expiry_date = _next_friday(today_utc) + timedelta(days=7)
-    swf = same_week_friday(today_utc)
-    if (target_expiry_date - timedelta(days=target_expiry_date.weekday())) == (swf - timedelta(days=swf.weekday())):
-        target_expiry_date = swf + timedelta(days=7)
-    target_expiry = target_expiry_date.isoformat()
+    target_expiry = _next_friday_iso_cdt()
+
+    # Strike: use the alert's strike if given; otherwise fall back to our +/- helper ONCE
+    try:
+        desired_strike = float(orig_strike) if (orig_strike is not None) else None
+    except Exception:
+        desired_strike = None
 
     pm = _build_plus_minus_contracts(alert["symbol"], ul_px, target_expiry)
-    desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
+    if desired_strike is None:
+        desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
+
+    chosen_expiry = target_expiry  # always next Friday by policy
 
     # 3) Chain scan thresholds
     rth = _is_rth_now()
-    # Keep scan thresholds but DO NOT send any pre-LLM alert
     scan_min_vol = int(os.getenv("SCAN_MIN_VOL_RTH" if rth else "SCAN_MIN_VOL_AH", "500" if rth else "0"))
     scan_min_oi  = int(os.getenv("SCAN_MIN_OI_RTH"  if rth else "SCAN_MIN_OI_AH",  "500" if rth else "100"))
 
-    # 3a) Selection via scan (strictly honor side) — selection only; no Telegram here
+    # 3a) Selection via scan (strict: same side + same strike + our Friday expiry)
     try:
         best_from_scan = await scan_for_best_contract_for_alert(
             client,
             alert["symbol"],
-            {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+            {"side": side, "symbol": alert["symbol"], "strike": desired_strike, "expiry": chosen_expiry},
             min_vol=scan_min_vol, min_oi=scan_min_oi, top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
         )
     except Exception:
         best_from_scan = None
 
+    def _expiry_matches_ticker(tk: str) -> bool:
+        exp_iso = _expiry_iso_from_ticker(tk or "")
+        return (exp_iso is None) or (exp_iso == chosen_expiry)
+
     candidate = None
-    if best_from_scan and _ticker_matches_side(best_from_scan.get("ticker"), side):
+    if best_from_scan and _ticker_matches_side(best_from_scan.get("ticker"), side) \
+       and _eq(best_from_scan.get("strike"), desired_strike) \
+       and _expiry_matches_ticker(best_from_scan.get("ticker", "")):
         candidate = best_from_scan
     else:
         try:
             pool = await scan_top_candidates_for_alert(
                 client,
                 alert["symbol"],
-                {"side": side, "symbol": alert["symbol"], "strike": alert.get("strike"), "expiry": alert.get("expiry")},
+                {"side": side, "symbol": alert["symbol"], "strike": desired_strike, "expiry": chosen_expiry},
                 min_vol=scan_min_vol, min_oi=scan_min_oi,
                 top_n_each_week=int(os.getenv("SCAN_TOPN_WEEK", "12")),
-                top_overall=6,
+                top_overall=24,
             ) or []
         except Exception:
             pool = []
-        pool = [it for it in pool if _ticker_matches_side(it.get("ticker"), side)]
+        pool = [
+            it for it in pool
+            if _ticker_matches_side(it.get("ticker"), side)
+            and _eq(it.get("strike"), desired_strike)
+            and _expiry_matches_ticker(it.get("ticker", ""))
+        ]
         candidate = pool[0] if pool else None
 
-    if candidate:
+    if candidate and candidate.get("ticker"):
         option_ticker = candidate["ticker"]
-        if isinstance(candidate.get("strike"), (int, float)):
-            desired_strike = float(candidate["strike"])
-        occ = _occ_meta(option_ticker)
-        chosen_expiry = occ["expiry"] if occ and occ.get("expiry") else str(candidate.get("expiry") or orig_expiry or target_expiry)
-        selection_debug = {"selected_by": "chain_scan", "selected_ticker": option_ticker,
-                           "best_item": candidate, "chosen_expiry": chosen_expiry}
-        logger.info("chain_scan selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
+        # chosen_expiry stays as target_expiry by policy
+        selection_debug = {
+            "selected_by": "chain_scan_same_strike_friday",
+            "selected_ticker": option_ticker,
+            "best_item": candidate,
+            "chosen_expiry": chosen_expiry,
+        }
+        logger.info("selected from scan (same strike + Friday): %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
     else:
-        fallback_exp = str(orig_expiry or target_expiry)
-        option_ticker = pm["contract_call"] if side == "CALL" else pm["contract_put"]
-        desired_strike = pm["strike_call"] if side == "CALL" else pm["strike_put"]
-        chosen_expiry = fallback_exp
-        selection_debug = {"selected_by": "fallback_pm", "reason": "scan_empty", "chosen_expiry": fallback_exp}
-        logger.info("fallback selected: %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
-
-    chosen_expiry = selection_debug.get("chosen_expiry", str(orig_expiry or target_expiry))
+        # Compose the exact OCC ticker for SAME strike + Friday expiry (policy fallback)
+        option_ticker = _build_occ_ticker(alert["symbol"], chosen_expiry, side, float(desired_strike))
+        selection_debug = {"selected_by": "occ_fallback_same_strike_friday", "chosen_expiry": chosen_expiry}
+        logger.info("fallback (OCC compose): %s (strike=%s exp=%s)", option_ticker, desired_strike, chosen_expiry)
 
     # 4) Feature bundle + NBBO
     f: Dict[str, Any] = {}
@@ -434,7 +485,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.exception("[worker] Polygon/features error: %s", e)
         f = f or {"dte": (datetime.fromisoformat(chosen_expiry).date() - datetime.now(timezone.utc).date()).days}
 
-    # 4b) NBBO-driven replacement (listed but missing NBBO)
+    # 4b) NBBO-driven replacement (listed but missing NBBO) — keep SAME strike and SAME Friday expiry only
     if REPLACE_IF_NO_NBBO and (f.get("bid") is None or f.get("ask") is None or (f.get("nbbo_http_status") and f.get("nbbo_http_status") != 200)):
         try:
             alt = await _find_nbbo_replacement_same_expiry(
@@ -444,49 +495,14 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception:
             alt = None
         if alt and alt.get("ticker") and alt["ticker"] != option_ticker:
-            old_tk = option_ticker
-            option_ticker = alt["ticker"]
-            desired_strike = float(alt.get("strike") or desired_strike)
-            occ = _occ_meta(option_ticker)
-            chosen_expiry = (occ["expiry"] if occ else str(alt.get("expiry") or chosen_expiry))
-            try:
-                extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
-                for k, v in (extra2 or {}).items():
-                    if v is not None:
-                        f[k] = v
-                for k, v in (await _pull_nbbo_direct(option_ticker)).items():
-                    if v is not None:
-                        f[k] = v
-                if f.get("bid") is None or f.get("ask") is None:
-                    nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker)
-                    for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
-                        if nbbo_dbg2.get(k) is not None:
-                            f[k] = nbbo_dbg2[k]
-                    f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
-                    f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
-                replacement_note = {"old": old_tk, "new": option_ticker, "why": "missing NBBO on initial pick"}
-                logger.info("Replaced due to missing NBBO: %s → %s", old_tk, option_ticker)
-            except Exception as e:
-                logger.warning("NBBO replacement refresh failed: %r", e)
-
-    # 5) 404 replacement if contract truly not listed
-    if f.get("nbbo_http_status") == 404 and POLYGON_API_KEY:
-        exist = await _poly_reference_contracts_exists(alert["symbol"], chosen_expiry, option_ticker)
-        logger.info("NBBO 404 verification: listed=%s snapshot_ok=%s reason=%s",
-                    exist.get("listed"), exist.get("snapshot_ok"), exist.get("reason"))
-        if exist.get("listed") is False and not exist.get("snapshot_ok"):
-            repl = await _rescan_best_replacement(
-                symbol=alert["symbol"], side=side,
-                desired_strike=desired_strike, expiry_iso=chosen_expiry,
-                min_vol=scan_min_vol, min_oi=scan_min_oi,
-            )
-            if repl:
+            alt_strike = alt.get("strike")
+            alt_exp_iso = _expiry_iso_from_ticker(alt.get("ticker", ""))
+            if (alt_strike is not None and _eq(alt_strike, desired_strike)) and (alt_exp_iso == chosen_expiry):
                 old_tk = option_ticker
-                option_ticker = repl["ticker"]
-                desired_strike = float(repl.get("strike") or desired_strike)
+                option_ticker = alt["ticker"]
+                # desired_strike remains the same (policy)
+                # chosen_expiry remains the same (policy)
                 try:
-                    occ = _occ_meta(option_ticker)
-                    chosen_expiry = (occ["expiry"] if occ else str(repl.get("expiry") or chosen_expiry))
                     extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
                     for k, v in (extra2 or {}).items():
                         if v is not None:
@@ -501,14 +517,55 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
                                 f[k] = nbbo_dbg2[k]
                         f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
                         f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
-                    replacement_note = {
-                        "old": old_tk, "new": option_ticker,
-                        "why": "contract not listed in Polygon reference/snapshot",
-                    }
-                    logger.info("Replaced contract due to 404: %s → %s", old_tk, option_ticker)
+                    replacement_note = {"old": old_tk, "new": option_ticker, "why": "missing NBBO on initial pick (same strike+Friday)"}
+                    logger.info("Replaced due to missing NBBO (policy-preserving): %s → %s", old_tk, option_ticker)
                 except Exception as e:
-                    logger.warning("Replacement contract fetch failed: %r", e)
-                    replacement_note = None
+                    logger.warning("NBBO replacement refresh failed: %r", e)
+            else:
+                logger.info("NBBO replacement proposed %s (strike=%s, exp=%s) — rejected (policy requires %s, %s).",
+                            alt.get("ticker"), alt_strike, alt_exp_iso, desired_strike, chosen_expiry)
+
+    # 5) 404 replacement if contract truly not listed — still keep SAME strike+Friday
+    if f.get("nbbo_http_status") == 404 and POLYGON_API_KEY:
+        exist = await _poly_reference_contracts_exists(alert["symbol"], chosen_expiry, option_ticker)
+        logger.info("NBBO 404 verification: listed=%s snapshot_ok=%s reason=%s",
+                    exist.get("listed"), exist.get("snapshot_ok"), exist.get("reason"))
+        if exist.get("listed") is False and not exist.get("snapshot_ok"):
+            repl = await _rescan_best_replacement(
+                symbol=alert["symbol"], side=side,
+                desired_strike=desired_strike, expiry_iso=chosen_expiry,
+                min_vol=scan_min_vol, min_oi=scan_min_oi,
+            )
+            if repl:
+                alt_exp_iso = _expiry_iso_from_ticker(repl.get("ticker", ""))
+                if _eq(repl.get("strike"), desired_strike) and (alt_exp_iso == chosen_expiry):
+                    old_tk = option_ticker
+                    option_ticker = repl["ticker"]
+                    try:
+                        extra2 = await poly_option_backfill(get_http_client(), alert["symbol"], option_ticker, datetime.now(timezone.utc).date())
+                        for k, v in (extra2 or {}).items():
+                            if v is not None:
+                                f[k] = v
+                        for k, v in (await _pull_nbbo_direct(option_ticker)).items():
+                            if v is not None:
+                                f[k] = v
+                        if f.get("bid") is None or f.get("ask") is None:
+                            nbbo_dbg2 = await _probe_nbbo_verbose(option_ticker)
+                            for k in ("bid","ask","mid","option_spread_pct","quote_age_sec"):
+                                if nbbo_dbg2.get(k) is not None:
+                                    f[k] = nbbo_dbg2[k]
+                            f["nbbo_http_status"] = nbbo_dbg2.get("nbbo_http_status")
+                            f["nbbo_reason"] = nbbo_dbg2.get("nbbo_reason")
+                        replacement_note = {
+                            "old": old_tk, "new": option_ticker,
+                            "why": "contract not listed; policy-preserving replacement",
+                        }
+                        logger.info("Replaced contract due to 404 (policy-preserving): %s → %s", old_tk, option_ticker)
+                    except Exception as e:
+                        logger.warning("Replacement contract fetch failed: %r", e)
+                        replacement_note = None
+                else:
+                    logger.info("404 replacement proposed different strike/expiry; rejected by policy.")
 
     # 7) LLM
     pf_ok, pf_checks = preflight_ok(f)
