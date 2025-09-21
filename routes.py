@@ -26,9 +26,41 @@ def _truthy(s: str) -> bool:
 
 # Daily report scheduler knobs (overridable via env)
 ENABLE_DAILY_REPORT_SCHED = _truthy(os.getenv("ENABLE_DAILY_REPORT_SCHED", "1"))
-DAILY_REPORT_HOUR   = int(os.getenv("DAILY_REPORT_HOUR", "14"))    # 3:00 pm CDT
-DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "45"))  # 3:10 pm CDT
+DAILY_REPORT_HOUR   = int(os.getenv("DAILY_REPORT_HOUR", "14"))    # 14:xx = 2:xx pm CDT
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "45"))  # default 2:45 pm CDT
 SEND_EMPTY_REPORT   = _truthy(os.getenv("DR_SEND_EMPTY", "1"))     # send even if no rows
+
+# TradingView alert window knobs (CDT)
+ALERT_ENFORCE_WINDOW = _truthy(os.getenv("ALERT_ENFORCE_WINDOW", "1"))
+ALERT_WEEKDAYS_ONLY  = _truthy(os.getenv("ALERT_WEEKDAYS_ONLY", "1"))
+ALERT_MORNING_START  = os.getenv("ALERT_WINDOW_MORNING_START", "08:30")
+ALERT_MORNING_END    = os.getenv("ALERT_WINDOW_MORNING_END",   "10:30")
+ALERT_PM_START       = os.getenv("ALERT_WINDOW_PM_START",      "14:00")
+ALERT_PM_END         = os.getenv("ALERT_WINDOW_PM_END",        "15:00")
+
+def _hhmm_to_minutes(s: str) -> int:
+    hh, mm = s.split(":")
+    return int(hh) * 60 + int(mm)
+
+_ALERT_M_START_MIN = _hhmm_to_minutes(ALERT_MORNING_START)
+_ALERT_M_END_MIN   = _hhmm_to_minutes(ALERT_MORNING_END)
+_ALERT_P_START_MIN = _hhmm_to_minutes(ALERT_PM_START)
+_ALERT_P_END_MIN   = _hhmm_to_minutes(ALERT_PM_END)
+
+def _in_alert_window_cdt(now: Optional[datetime] = None) -> bool:
+    """
+    Allow TradingView alerts only during:
+      - Morning: 08:30–10:30 CDT
+      - Afternoon: 14:00–15:00 CDT
+    (Weekdays only by default; configurable via env.)
+    """
+    now = now or datetime.now(CDT_TZ)
+    if ALERT_WEEKDAYS_ONLY and now.weekday() > 4:
+        return False
+    minutes = now.hour * 60 + now.minute
+    in_morning = _ALERT_M_START_MIN <= minutes < _ALERT_M_END_MIN
+    in_afternoon = _ALERT_P_START_MIN <= minutes < _ALERT_P_END_MIN
+    return in_morning or in_afternoon
 
 # Logger
 log = logging.getLogger("trading_engine.routes")
@@ -130,10 +162,11 @@ async def _daily_report_dispatcher_loop():
             try:
                 res = await send_daily_report_to_telegram(report_date)
                 ok = bool(res.get("ok"))
-                rows = int(res.get("rows", 0)) if isinstance(res.get("rows", 0), (int, float)) else 0
+                # daily_reporter returns {'ok': bool, 'error': str, 'count': int}
+                count = int(res.get("count", 0)) if isinstance(res.get("count", 0), (int, float)) else 0
                 if not ok:
                     log.warning("[reports] send failed for %s: %s", report_date, res)
-                elif rows == 0 and not SEND_EMPTY_REPORT:
+                elif count == 0 and not SEND_EMPTY_REPORT:
                     log.info("[reports] no rows for %s (SEND_EMPTY_REPORT=0) — skipped", report_date)
                 else:
                     log.info("[reports] sent for %s: %s", report_date, res)
@@ -211,6 +244,8 @@ async def healthz():
         "uvscan_in_window_now_cdt": _in_uvscan_window_cdt(),
         "daily_sched_running": bool(_daily_task and not _daily_task.done()),
         "next_daily_cdt": _next_report_run_from(datetime.now(CDT_TZ)).isoformat() if ENABLE_DAILY_REPORT_SCHED else None,
+        "alerts_in_window_now_cdt": _in_alert_window_cdt(),
+        "alerts_window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
     }
 
 @router.get("/engine/stats")
@@ -221,6 +256,18 @@ async def engine_stats():
 async def engine_quota():
     return engine.llm_quota_snapshot()
 
+# Quick status to check alert window
+@router.get("/alerts/window")
+async def alerts_window_status():
+    now = datetime.now(CDT_TZ)
+    return {
+        "in_window_now_cdt": _in_alert_window_cdt(now),
+        "now_cdt": now.isoformat(),
+        "window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
+        "weekdays_only": ALERT_WEEKDAYS_ONLY,
+        "enforced": ALERT_ENFORCE_WINDOW,
+    }
+
 # ---------- Webhook (TradingView) ----------
 @router.post("/webhook")
 async def webhook(
@@ -230,8 +277,17 @@ async def webhook(
     qty: int = 1,
     bypass_window: bool = False,  # for manual testing of the alert window guard
 ):
-    log.info("webhook received; ib=%s force=%s qty=%s", ib, force, qty)
-    # (Webhook windows handled elsewhere if you already added them)
+    log.info("webhook received; ib=%s force=%s qty=%s bypass=%s", ib, force, qty, bypass_window)
+
+    # Enforce TradingView alert windows unless bypassed
+    if ALERT_ENFORCE_WINDOW and not bypass_window and not _in_alert_window_cdt():
+        return JSONResponse({
+            "queued": False,
+            "reason": "outside_alert_window",
+            "window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
+            "now_cdt": datetime.now(CDT_TZ).isoformat(),
+        }, status_code=200)  # 200 so TradingView doesn't retry
+
     text = await engine.get_alert_text_from_request(request)
     if not text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
