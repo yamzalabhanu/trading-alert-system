@@ -26,8 +26,8 @@ def _truthy(s: str) -> bool:
 
 # Daily report scheduler knobs (overridable via env)
 ENABLE_DAILY_REPORT_SCHED = _truthy(os.getenv("ENABLE_DAILY_REPORT_SCHED", "1"))
-DAILY_REPORT_HOUR   = int(os.getenv("DAILY_REPORT_HOUR", "15"))    # 3:00 pm CDT
-DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "10"))  # 3:10 pm CDT
+DAILY_REPORT_HOUR   = int(os.getenv("DAILY_REPORT_HOUR", "14"))    # 3:00 pm CDT
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "45"))  # 3:10 pm CDT
 SEND_EMPTY_REPORT   = _truthy(os.getenv("DR_SEND_EMPTY", "1"))     # send even if no rows
 
 # Logger
