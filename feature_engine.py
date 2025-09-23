@@ -415,6 +415,42 @@ async def _short_volume_ratio(symbol: str) -> Dict[str, Any]:
 
     return out
 
+async def _fallback_1m(symbol: str) -> List[Dict[str, Any]]:
+    from datetime import timedelta
+    now = _now_utc()
+    start = now - timedelta(days=3)
+    try:
+        return await fetch_1m_bars_any(symbol, start, now)  # signature (symbol, start, end)
+    except TypeError:
+        try:
+            return await fetch_1m_bars_any(symbol)  # signature (symbol)
+        except Exception:
+            return []
+
+async def _fallback_5m(symbol: str) -> List[Dict[str, Any]]:
+    from datetime import timedelta
+    now = _now_utc()
+    start = now - timedelta(days=14)
+    try:
+        return await fetch_5m_bars_any(symbol, start, now)
+    except TypeError:
+        try:
+            return await fetch_5m_bars_any(symbol)
+        except Exception:
+            return []
+
+async def _fallback_1d(symbol: str) -> List[Dict[str, Any]]:
+    from datetime import timedelta
+    now = _now_utc()
+    start = now - timedelta(days=750)
+    try:
+        return await fetch_1d_bars_any(symbol, start, now)
+    except TypeError:
+        try:
+            return await fetch_1d_bars_any(symbol)
+        except Exception:
+            return []
+
 # ---------- Public builder ----------
 async def build_features(client, alert: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     symbol = alert.get("symbol")
