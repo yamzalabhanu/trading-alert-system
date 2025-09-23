@@ -7,9 +7,10 @@ import asyncio
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone, timedelta, date
 from urllib.parse import quote
-from polygon_ops import fetch_option_quote_adv
 
 import httpx
+
+from polygon_ops import fetch_option_quote_adv  # (kept available; optional use)
 
 from polygon_client import (
     list_contracts_for_expiry,
@@ -25,7 +26,7 @@ async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]
     try:
         r = await client.get(url, params=params or {}, timeout=timeout)
         if r.status_code in (402, 403, 404, 429):
-            return None
+            return {"status": r.status_code, "body": (r.json() if "application/json" in (r.headers.get("content-type") or "") else r.text)}
         r.raise_for_status()
         js = r.json()
         return js if isinstance(js, dict) else None
@@ -36,7 +37,7 @@ async def _http_json_url(client: httpx.AsyncClient, url: str, timeout: float = 8
     try:
         r = await client.get(url, timeout=timeout)
         if r.status_code in (402, 403, 404, 429):
-            return None
+            return {"status": r.status_code, "body": (r.json() if "application/json" in (r.headers.get("content-type") or "") else r.text)}
         r.raise_for_status()
         js = r.json()
         return js if isinstance(js, dict) else None
@@ -80,6 +81,23 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     start = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
     return start, now_utc.isoformat()
 
+def _shape_nbbo_from(last_obj: dict) -> dict:
+    bid = last_obj.get("bidPrice")
+    ask = last_obj.get("askPrice")
+    ts  = last_obj.get("t") or last_obj.get("sip_timestamp") or last_obj.get("participant_timestamp") or last_obj.get("timestamp")
+    out: Dict[str, Any] = {}
+    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
+        mid = (bid + ask) / 2.0
+        spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else None
+        out["bid"] = float(bid)
+        out["ask"] = float(ask)
+        out["mid"] = round(mid, 4)
+        out["option_spread_pct"] = round(spread_pct, 3) if spread_pct is not None else None
+    age = _quote_age_from_ts(ts)
+    if age is not None:
+        out["quote_age_sec"] = age
+    return out
+
 # -------------------------
 # Public wrappers
 # -------------------------
@@ -122,7 +140,7 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
             {"apiKey": POLYGON_API_KEY},
             timeout=3.0,
         )
-        if lastq:
+        if lastq and isinstance(lastq, dict) and not lastq.get("error"):
             res = lastq.get("results") or {}
             last = res.get("last") or res
             bid = last.get("bidPrice")
@@ -151,29 +169,25 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
 async def ensure_nbbo(
     client: httpx.AsyncClient,
     option_ticker: str,
-    tries: int = 6,
-    delay: float = 0.6,
+    tries: int = 8,
+    delay: float = 0.35,
 ) -> Dict[str, Any]:
     """
-    Spin on Polygon v3 last-quote for options and return the best (tightest/freshest) NBBO seen.
-    Works with Options Advanced responses:
-      { "results": { "last": { bidPrice, askPrice, t|sip_timestamp|timestamp, ... } } }
-      or occasionally { "results": { bidPrice, askPrice, ... } }
+    Resolve real NBBO using Polygon Options Advanced (no synthetic):
+      1) v3 quotes search (freshest real quote)
+      2) v3 /quotes/options/{ticker}/last (may 404, depending on contract)
+      3) v3 single-contract snapshot -> results.lastQuote (OPRA)
 
     Returns:
-      {
-        bid, ask, mid, option_spread_pct, quote_age_sec,
-        nbbo_provider: "polygon:last",
-        nbbo_http_status: <int>  # when available
-      }
+      { bid, ask, mid, option_spread_pct, quote_age_sec, nbbo_provider="polygon" }
+      or {} if unavailable.
     """
-    if not POLYGON_API_KEY or client is None:
+    if not POLYGON_API_KEY or client is None or not option_ticker:
         return {}
 
     enc_opt = _encode_ticker_path(option_ticker)
     best: Dict[str, Any] = {}
 
-    # Soft acceptance thresholds (fall back to env if engine_common isn’t in scope here)
     try:
         max_spread_ok = float(os.getenv("MAX_SPREAD_PCT", "6.0"))
     except Exception:
@@ -183,85 +197,92 @@ async def ensure_nbbo(
     except Exception:
         max_age_ok = 30.0
 
-    def _norm_age(ts_val) -> Optional[float]:
-        # Use existing helper if present
-        try:
-            return _quote_age_from_ts(ts_val)  # type: ignore
-        except Exception:
-            pass
-        # Inline normalization: accept ns/us/ms/s
-        try:
-            ns = int(ts_val)
-            if   ns >= 10**14: sec = ns / 1e9     # ns
-            elif ns >= 10**11: sec = ns / 1e6     # us
-            elif ns >= 10**8:  sec = ns / 1e3     # ms
-            else:              sec = float(ns)    # s
-            return max(0.0, datetime.now(timezone.utc).timestamp() - sec)
-        except Exception:
-            return None
+    def _is_better(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        sp_a = a.get("option_spread_pct"); ag_a = a.get("quote_age_sec")
+        sp_b = b.get("option_spread_pct"); ag_b = b.get("quote_age_sec")
+        return ((sp_a if isinstance(sp_a, (int, float)) else 1e9),
+                (ag_a if isinstance(ag_a, (int, float)) else 1e9)) < \
+               ((sp_b if isinstance(sp_b, (int, float)) else 1e9),
+                (ag_b if isinstance(ag_b, (int, float)) else 1e9))
+
+    m = re.match(r"^O:([A-Z0-9\.\-]+)\d{6}[CP]\d{8,9}$", option_ticker)
+    underlying = m.group(1) if m else None
 
     for _ in range(max(1, tries)):
-        resp = await _http_json(
-            client,
-            f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
-            {"apiKey": POLYGON_API_KEY},
-            timeout=4.0,
-        )
+        # 1) Quotes search (freshest)
+        try:
+            q = await _http_json(
+                client,
+                "https://api.polygon.io/v3/quotes/options",
+                {
+                    "ticker": option_ticker,  # raw ticker ok for this endpoint
+                    "limit": 1,
+                    "sort": "timestamp",
+                    "order": "desc",
+                    "apiKey": POLYGON_API_KEY,
+                },
+                timeout=4.0,
+            )
+            if q and isinstance(q, dict) and q.get("results"):
+                cand = _shape_nbbo_from(q["results"][0])
+                if "bid" in cand and "ask" in cand:
+                    cand["nbbo_provider"] = "polygon"
+                    if (not best) or _is_better(cand, best):
+                        best = cand
+                    if (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and \
+                       (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok):
+                        return best
+        except Exception:
+            pass
 
-        # Record http status if our helper bubbles it up
-        if isinstance(resp, dict) and "status" in resp and isinstance(resp.get("status"), int):
-            if resp.get("status") in (402, 403, 404, 429):
-                # Hard errors / plan limits / not found / throttled -> no point in spinning forever
-                best.setdefault("nbbo_http_status", resp.get("status"))
-                break
-            best.setdefault("nbbo_http_status", resp.get("status"))
+        # 2) /last endpoint
+        try:
+            lastq = await _http_json(
+                client,
+                f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
+                {"apiKey": POLYGON_API_KEY},
+                timeout=3.0,
+            )
+            if lastq and isinstance(lastq, dict) and not lastq.get("error"):
+                res = lastq.get("results") or {}
+                last = res.get("last") or res
+                cand = _shape_nbbo_from(last)
+                if "bid" in cand and "ask" in cand:
+                    cand["nbbo_provider"] = "polygon"
+                    if (not best) or _is_better(cand, best):
+                        best = cand
+                    if (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and \
+                       (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok):
+                        return best
+        except Exception:
+            pass
 
-        if resp and isinstance(resp, dict):
-            res = resp.get("results") or {}
-            last = res.get("last") if isinstance(res, dict) and isinstance(res.get("last"), dict) else res
-
-            bid = last.get("bidPrice")
-            ask = last.get("askPrice")
-            ts  = last.get("t") or last.get("sip_timestamp") or last.get("participant_timestamp") or last.get("timestamp")
-
-            if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
-                mid = (bid + ask) / 2.0
-                spread_pct = ((ask - bid) / mid * 100.0) if (mid and mid > 0) else None
-                age = _norm_age(ts)
-
-                cand = {
-                    "bid": float(bid),
-                    "ask": float(ask),
-                    "mid": round(float(mid), 4) if mid is not None else None,
-                    "option_spread_pct": round(float(spread_pct), 3) if spread_pct is not None else None,
-                    "quote_age_sec": float(age) if age is not None else None,
-                    "nbbo_provider": "polygon:last",
-                }
-
-                # Keep the better candidate:
-                #   1) tighter spread
-                #   2) fresher age
-                #   3) otherwise keep existing
-                def _score(x: Dict[str, Any]) -> Tuple[float, float]:
-                    sp = x.get("option_spread_pct")
-                    ag = x.get("quote_age_sec")
-                    return ((sp if isinstance(sp, (int, float)) else 1e9),
-                            (ag if isinstance(ag, (int, float)) else 1e9))
-
-                if (not best) or (_score(cand) < _score(best)):
-                    best = cand
-
-                # Early exit if we already have "good enough" quote
-                if (
-                    (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and
-                    (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok)
-                ):
-                    break
+        # 3) Single-contract snapshot (results.lastQuote)
+    # fall through loop
+        if underlying:
+            try:
+                snap = await _http_json(
+                    client,
+                    f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc_opt}",
+                    {"apiKey": POLYGON_API_KEY, "greeks": "true"},
+                    timeout=4.0,
+                )
+                if snap and isinstance(snap, dict) and snap.get("results"):
+                    lastq = (snap["results"].get("lastQuote") or {})
+                    cand = _shape_nbbo_from(lastq)
+                    if "bid" in cand and "ask" in cand:
+                        cand["nbbo_provider"] = "polygon"
+                        if (not best) or _is_better(cand, best):
+                            best = cand
+                        if (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and \
+                           (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok):
+                            return best
+            except Exception:
+                pass
 
         await asyncio.sleep(delay)
 
     return best
-
 
 # -------------------------
 # Backfill bundle
@@ -346,7 +367,7 @@ async def poly_option_backfill(
                 },
                 timeout=8.0
             )
-            if rlist:
+            if rlist and isinstance(rlist.get("results"), list):
                 items = rlist.get("results") or []
                 chosen = None
                 for it in items:
@@ -385,7 +406,7 @@ async def poly_option_backfill(
             {"apiKey": POLYGON_API_KEY},
             timeout=6.0
         )
-        if oc:
+        if oc and isinstance(oc, dict):
             oi = oc.get("open_interest")
             vol = oc.get("volume")
             if out.get("oi") is None and oi is not None:
@@ -420,7 +441,7 @@ async def poly_option_backfill(
                 {"apiKey": POLYGON_API_KEY},
                 timeout=4.0,
             )
-            if t:
+            if t and isinstance(t, dict):
                 res = t.get("results") or {}
                 last_px = res.get("price")
                 ts = res.get("sip_timestamp") or res.get("participant_timestamp") or res.get("t")
@@ -446,7 +467,7 @@ async def poly_option_backfill(
                 {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY},
                 timeout=8.0
             )
-            if aggs:
+            if aggs and isinstance(aggs, dict):
                 results = aggs.get("results") or []
                 if results:
                     vol_sum = 0
@@ -506,7 +527,7 @@ async def choose_best_contract(
         mlist = None
 
     index_by_ticker = {}
-    if mlist:
+    if mlist and isinstance(mlist.get("results"), list):
         for it in (mlist.get("results") or []):
             tk = (it.get("details") or {}).get("ticker") or it.get("ticker")
             if tk:
@@ -541,7 +562,7 @@ async def choose_best_contract(
         q = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
                              {"apiKey": POLYGON_API_KEY}, timeout=3.0)
         spread_pct = None
-        if q:
+        if q and isinstance(q, dict):
             res = q.get("results") or {}
             last = res.get("last") or res
             b, a = last.get("bidPrice"), last.get("askPrice")
@@ -702,7 +723,6 @@ async def scan_for_best_contract_for_alert(
     min_oi: int  = 500,
     top_n_each_week: int = 12,
 ) -> Optional[Dict[str, Any]]:
-    # (same as before, returns best single dict)
     today_utc = datetime.now(timezone.utc).date()
     def _next_friday(d: date) -> date:
         return d + timedelta(days=(4 - d.weekday()) % 7)
