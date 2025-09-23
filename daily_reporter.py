@@ -203,26 +203,93 @@ async def _fetch_option_eod_last_fallbacks(client: httpx.AsyncClient, option_tic
 
 
 
-async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Tuple[Optional[float], str]:
+async def _fetch_option_eod_last(option_ticker: str, day: dt_date) -> Optional[float]:
     """
-    Get end-of-day last for the option with robust strategy and provenance.
+    Robust EOD 'last' for an option on a given CDT date.
+    Priority:
+      1) polygon v1 open-close (close)
+      2) polygon v2 1m aggs up to 15:00 CDT (last bar close)
+      3) polygon v3 last-quote (best-effort, not strictly EOD)
+      4) polygon v2 daily aggs for the date (close), if available
+    Returns None if all fail or API not configured.
     """
     if not POLYGON_API_KEY or not option_ticker:
-        return None, "disabled_or_missing_key"
+        return None
 
     client = get_http_client()
     if client is None:
-        return None, "http_client_not_ready"
+        return None
 
-    val, prov = await _fetch_option_eod_last_openclose(client, option_ticker, day)
-    if val is not None:
-        return val, prov
+    # strict encoding for OCC tickers like "O:XYZ..."
+    enc = option_ticker.replace(":", "%3A").replace("/", "%2F")
 
-    val, prov = await _fetch_option_eod_last_fallbacks(client, option_ticker, day)
-    if val is not None:
-        return val, prov
+    # 1) open-close (true EOD close if present)
+    oc = await _http_json(
+        client,
+        f"https://api.polygon.io/v1/open-close/options/{enc}/{day.isoformat()}",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=10.0,
+    )
+    if isinstance(oc, dict) and oc.get("status") not in (400, 402, 403, 404, 429, 500):
+        px = _safe_float(oc.get("close"))
+        if px is not None:
+            return px
 
-    return None, "unavailable"
+    # 2) minute aggs up to 15:00 CDT → last bar close
+    start_cdt = datetime(day.year, day.month, day.day, 8, 30, tzinfo=CDT_TZ)
+    end_cdt   = datetime(day.year, day.month, day.day, 15, 0, tzinfo=CDT_TZ)
+    frm = start_cdt.astimezone(timezone.utc).isoformat()
+    to  = (end_cdt.astimezone(timezone.utc) + timedelta(minutes=1)).isoformat()
+
+    aggs_1m = await _http_json(
+        client,
+        f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/1/minute/{frm}/{to}",
+        {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY},
+        timeout=12.0,
+    )
+    try:
+        arr = aggs_1m.get("results") if isinstance(aggs_1m, dict) else None
+        if isinstance(arr, list) and arr:
+            return _safe_float(arr[-1].get("c"))
+    except Exception:
+        pass
+
+    # 3) last-quote (best-effort; not strictly EOD)
+    lq = await _http_json(
+        client,
+        f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+        {"apiKey": POLYGON_API_KEY},
+        timeout=8.0,
+    )
+    if isinstance(lq, dict) and lq.get("status") not in (400, 402, 403, 404, 429, 500):
+        try:
+            res = lq.get("results") or {}
+            price = res.get("price") or res.get("p") or (res.get("last", {}) if isinstance(res.get("last"), dict) else {}).get("price")
+            price = _safe_float(price)
+            if price is not None:
+                return price
+        except Exception:
+            pass
+
+    # 4) daily aggs (if Polygon provides them for this option)
+    # Try a one-day window [day, day+1)
+    frm_day = datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc).isoformat()
+    to_day  = (datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc) + timedelta(days=1)).isoformat()
+    dagg = await _http_json(
+        client,
+        f"https://api.polygon.io/v2/aggs/ticker/{enc}/range/1/day/{frm_day}/{to_day}",
+        {"adjusted": "true", "sort": "asc", "limit": 2, "apiKey": POLYGON_API_KEY},
+        timeout=8.0,
+    )
+    try:
+        arr = dagg.get("results") if isinstance(dagg, dict) else None
+        if isinstance(arr, list) and arr:
+            return _safe_float(arr[-1].get("c"))
+    except Exception:
+        pass
+
+    return None
+
 
 
 def _load_alerts_for_date(target: Optional[dt_date]) -> List[Dict[str, Any]]:
