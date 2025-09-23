@@ -98,18 +98,17 @@ async def polygon_get_option_snapshot_export(
     underlying: str,
     option_ticker: str,
 ) -> Dict[str, Any]:
-    """Supports both signatures used in your project."""
+    """
+    Works with either polygon_client.get_option_snapshot(client=..., symbol=..., contract=...)
+    or polygon_client.get_option_snapshot(symbol=..., contract=...).
+    """
     try:
-        return await get_option_snapshot(client, symbol=underlying, contract=option_ticker)
-    except TypeError as e1:
-        try:
-            return await get_option_snapshot(underlying, option_ticker)
-        except TypeError as e2:
-            raise RuntimeError(
-                f"get_option_snapshot signature mismatch: "
-                f"tried (client,symbol,contract): {e1}; "
-                f"tried (symbol,contract): {e2}"
-            )
+        # Always pass by keyword so the first positional doesn't collide with 'symbol'
+        return await get_option_snapshot(client=client, symbol=underlying, contract=option_ticker)
+    except TypeError:
+        # Older signature (no client kw)
+        return await get_option_snapshot(symbol=underlying, contract=option_ticker)
+
 
 # -------------------------
 # Quote samplers / probes
