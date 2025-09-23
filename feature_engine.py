@@ -132,6 +132,61 @@ def _macd(values: List[float], f=12, s=26, sig=9) -> Tuple[Optional[float], Opti
     macd_hist = macd_line - macd_signal
     return (macd_line, macd_signal, macd_hist)
 
+# ---------- RTH VWAP & ORB helpers ----------
+def _today_rth_bounds_utc(now: datetime) -> Tuple[int, int]:
+    """
+    Regular Trading Hours in UTC for US equities:
+    8:30–15:00 CDT => 13:30–20:00 UTC (intraday end capped to 'now').
+    """
+    start = now.replace(hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc)
+    end   = now.replace(hour=20, minute=0,  second=0, microsecond=0, tzinfo=timezone.utc)
+    end = min(end, now)
+    return _to_ms(start), _to_ms(end)
+
+def _slice_bars_by_ms(bars: List[Dict[str, Any]], start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for b in bars:
+        t = b.get("t")
+        if isinstance(t, (int, float)) and start_ms <= t < end_ms:
+            out.append(b)
+    return out
+
+def _rth_vwap(bars_in_window: List[Dict[str, Any]]) -> Optional[float]:
+    """VWAP computed over provided RTH window (uses 'vw' if present, else close)."""
+    tot_pv = 0.0
+    tot_v = 0.0
+    for b in bars_in_window:
+        v = float(b.get("v") or 0.0)
+        if v <= 0:
+            continue
+        price = b.get("vw")
+        if not isinstance(price, (int, float)):
+            c = b.get("c")
+            if not isinstance(c, (int, float)):
+                continue
+            price = float(c)
+        tot_pv += float(price) * v
+        tot_v += v
+    return (tot_pv / tot_v) if tot_v > 0 else None
+
+def _orb_15_from_bars(bars_1m: List[Dict[str, Any]], now: datetime) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Opening 15-minute range is strictly 13:30–13:45 UTC (first 15 minutes of RTH).
+    """
+    start_open = now.replace(hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc)
+    end_open   = now.replace(hour=13, minute=45, second=0, microsecond=0, tzinfo=timezone.utc)
+    start_ms, end_ms = _to_ms(start_open), _to_ms(end_open)
+    hi = None; lo = None
+    for b in bars_1m:
+        t = b.get("t")
+        if not isinstance(t, (int, float)):
+            continue
+        if start_ms <= t < end_ms:
+            h = b.get("h"); l = b.get("l")
+            if isinstance(h, (int, float)): hi = h if hi is None else max(hi, h)
+            if isinstance(l, (int, float)): lo = l if lo is None else min(lo, l)
+    return (hi, lo)
+
 # ---------- Bars fetch (Polygon + fallbacks) ----------
 async def _fetch_aggs_polygon(symbol: str, multiplier: int, timespan: str, start: datetime, end: datetime, limit: int = 50000) -> List[Dict[str, Any]]:
     if not POLYGON_API_KEY:
@@ -150,50 +205,6 @@ def _pick_close_series(bars: List[Dict[str, Any]]) -> List[float]:
             out.append(float(c))
     return out
 
-def _intraday_vwap(bars: List[Dict[str, Any]]) -> Optional[float]:
-    tot_pv = 0.0
-    tot_v = 0.0
-    for b in bars:
-        v = float(b.get("v") or 0.0)
-        if v <= 0:
-            continue
-        price = b.get("vw")
-        if not isinstance(price, (int, float)):
-            c = b.get("c")
-            if not isinstance(c, (int, float)):
-                continue
-            price = float(c)
-        tot_pv += float(price) * v
-        tot_v += v
-    return (tot_pv / tot_v) if tot_v > 0 else None
-
-def _orb_15(bars_1m_today: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
-    """Opening 15-minute range using **CDT RTH** mapped to UTC correctly."""
-    if not bars_1m_today:
-        return (None, None)
-    rth_open_utc, _rth_close_utc = _today_rth_utc_window()
-    start_ms = _to_ms(rth_open_utc)
-    end_ms   = start_ms + 15 * 60 * 1000
-    hi = None; lo = None
-    for b in bars_1m_today:
-        t = b.get("t")
-        if not isinstance(t, (int, float)):
-            continue
-        if start_ms <= t < end_ms:
-            h = b.get("h"); l = b.get("l")
-            if isinstance(h, (int, float)): hi = h if hi is None else max(hi, h)
-            if isinstance(l, (int, float)): lo = l if lo is None else min(lo, l)
-    return (hi, lo)
-
-async def _fallback_1m(symbol: str) -> List[Dict[str, Any]]:
-    return await fetch_1m_bars_any(symbol) or []
-
-async def _fallback_5m(symbol: str) -> List[Dict[str, Any]]:
-    return await fetch_5m_bars_any(symbol) or []
-
-async def _fallback_1d(symbol: str) -> List[Dict[str, Any]]:
-    return await fetch_1d_bars_any(symbol) or []
-
 # ---------- TA Orchestrator ----------
 async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
     now = _now_utc()
@@ -204,26 +215,23 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
         start_1m_hist = now - timedelta(days=3)
         bars_1m = await _fetch_aggs_polygon(symbol, 1, "minute", start_1m_hist, now, limit=50000)
         if not bars_1m:
-            bars_1m = await _fallback_1m(symbol)
+            bars_1m = await fetch_1m_bars_any(symbol) or []
     except Exception as e:
         logger.warning("[feature] 1m fetch failed: %r", e)
-        bars_1m = await _fallback_1m(symbol)
+        bars_1m = await fetch_1m_bars_any(symbol) or []
 
-    # Today subset for VWAP/ORB
-    bars_1m_today: List[Dict[str, Any]] = []
+    # RTH VWAP & ORB (13:30–20:00 UTC; ORB = 13:30–13:45 UTC)
+    vwap_rth: Optional[float] = None
+    orb_hi: Optional[float] = None
+    orb_lo: Optional[float] = None
     if bars_1m:
-        today_date = now.date()
-        for b in bars_1m:
-            ts = b.get("t")
-            if not isinstance(ts, (int, float)):
-                continue
-            dt = datetime.fromtimestamp(ts/1000.0, tz=timezone.utc)
-            if dt.date() == today_date:
-                bars_1m_today.append(b)
+        rth_start_ms, rth_end_ms = _today_rth_bounds_utc(now)
+        bars_1m_rth = _slice_bars_by_ms(bars_1m, rth_start_ms, rth_end_ms)
+        if bars_1m_rth:
+            vwap_rth = _rth_vwap(bars_1m_rth)
+        orb_hi, orb_lo = _orb_15_from_bars(bars_1m, now)
 
-    vwap = _intraday_vwap(bars_1m_today) if bars_1m_today else None
-    orb_hi, orb_lo = _orb_15(bars_1m_today) if bars_1m_today else (None, None)
-
+    # Intraday TA using full 1m history we fetched
     closes_1m = _pick_close_series(bars_1m)
     rsi14_1m = _rsi(closes_1m, 14) if len(closes_1m) >= 50 else None
     sma20_1m = _sma(closes_1m, 20)
@@ -237,10 +245,10 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
         start_5m = now - timedelta(days=14)
         bars_5m = await _fetch_aggs_polygon(symbol, 5, "minute", start_5m, now, limit=50000)
         if not bars_5m:
-            bars_5m = await _fallback_5m(symbol)
+            bars_5m = await fetch_5m_bars_any(symbol) or []
     except Exception as e:
         logger.warning("[feature] 5m fetch failed: %r", e)
-        bars_5m = await _fallback_5m(symbol)
+        bars_5m = await fetch_5m_bars_any(symbol) or []
 
     closes_5m = _pick_close_series(bars_5m)
     rsi14_5m = _rsi(closes_5m, 14) if len(closes_5m) >= 50 else None
@@ -255,10 +263,10 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
         start_1d = now - timedelta(days=750)
         bars_1d = await _fetch_aggs_polygon(symbol, 1, "day", start_1d, now, limit=50000)
         if not bars_1d:
-            bars_1d = await _fallback_1d(symbol)
+            bars_1d = await fetch_1d_bars_any(symbol) or []
     except Exception as e:
         logger.warning("[feature] 1d fetch failed: %r", e)
-        bars_1d = await _fallback_1d(symbol)
+        bars_1d = await fetch_1d_bars_any(symbol) or []
 
     closes_1d = _pick_close_series(bars_1d)
     rsi14_1d = _rsi(closes_1d, 14) if len(closes_1d) >= 30 else None
@@ -280,18 +288,19 @@ async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
         return None
 
     out.update({
-        "rsi14":    _pick(rsi14_1m, rsi14_5m, rsi14_1d),
-        "sma20":    _pick(sma20_1m, sma20_5m, sma20_1d),
-        "ema20":    _pick(ema20_1m, ema20_5m, ema20_1d),
-        "ema50":    _pick(ema50_1m, ema50_5m, ema50_1d),
-        "ema200":   _pick(ema200_1m, ema200_5m, ema200_1d),
+        "rsi14":       _pick(rsi14_1m, rsi14_5m, rsi14_1d),
+        "sma20":       _pick(sma20_1m, sma20_5m, sma20_1d),
+        "ema20":       _pick(ema20_1m, ema20_5m, ema20_1d),
+        "ema50":       _pick(ema50_1m, ema50_5m, ema50_1d),
+        "ema200":      _pick(ema200_1m, ema200_5m, ema200_1d),
         "macd_line":   _pick(macd_line_1m, macd_line_5m, macd_line_1d),
         "macd_signal": _pick(macd_signal_1m, macd_signal_5m, macd_signal_1d),
         "macd_hist":   _pick(macd_hist_1m, macd_hist_5m, macd_hist_1d),
         "bb_upper": bb_upper_1d,
         "bb_lower": bb_lower_1d,
         "bb_mid":   bb_mid_1d,
-        "vwap": vwap,
+        "vwap_rth": vwap_rth,
+        "vwap":     vwap_rth,   # backward-compat
         "orb15_high": orb_hi,
         "orb15_low":  orb_lo,
         "ta_src": "1m" if rsi14_1m is not None else ("5m" if rsi14_5m is not None else ("1d" if rsi14_1d is not None else None)),
@@ -337,7 +346,7 @@ async def _prev5_avg_hilo(symbol: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     try:
         now = _now_utc()
-        bars = await _fetch_aggs_polygon(symbol, 1, "day", now - timedelta(days=10), now) or await _fallback_1d(symbol)
+        bars = await _fetch_aggs_polygon(symbol, 1, "day", now - timedelta(days=10), now) or await fetch_1d_bars_any(symbol) or []
         highs, lows = [], []
         for b in bars[-5:]:
             if isinstance(b.get("h"), (int,float)): highs.append(float(b["h"]))
@@ -354,7 +363,7 @@ async def _premarket_hilo(symbol: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     try:
         now = _now_utc()
-        bars_1m = await _fetch_aggs_polygon(symbol, 1, "minute", now - timedelta(days=1), now) or await _fallback_1m(symbol)
+        bars_1m = await _fetch_aggs_polygon(symbol, 1, "minute", now - timedelta(days=1), now) or await fetch_1m_bars_any(symbol) or []
         pm_hi = None; pm_lo = None
         rth_open_utc, _ = _today_rth_utc_window()
         cutoff_ms = _to_ms(rth_open_utc)
