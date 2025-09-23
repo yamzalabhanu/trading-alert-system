@@ -266,6 +266,20 @@ def _compact_adjustments(diff_note: str) -> str:
         parts.append(s)
     return "Adj: " + " • ".join(parts)
 
+def _first_sentence(text: str, max_len: int = 160) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # Cut on first hard stop; then trim length gently
+    for sep in [". ", " — ", " – ", "\n"]:
+        if sep in s:
+            s = s.split(sep, 1)[0]
+            break
+    if len(s) > max_len:
+        s = s[:max_len - 1].rstrip() + "…"
+    return s
+
+
 def compose_telegram_text(
     alert: Dict[str, Any],
     option_ticker: Optional[str],
