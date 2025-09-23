@@ -1,7 +1,6 @@
-# feature_engine.py (UPDATED)
+# feature_engine.py
 import os
 import math
-import time
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -9,10 +8,8 @@ from datetime import datetime, timezone, timedelta
 from engine_runtime import get_http_client
 from engine_common import POLYGON_API_KEY, CDT_TZ
 
-# NEW: extra providers (IEX/Alpaca) as fallbacks
-from market_providers import (
-    fetch_1m_bars_any, fetch_5m_bars_any, fetch_1d_bars_any,
-)
+# Extra providers (IEX/Alpaca) as fallbacks
+from market_providers import fetch_1m_bars_any, fetch_5m_bars_any, fetch_1d_bars_any
 
 logger = logging.getLogger("trading_engine.feature_engine")
 
@@ -37,6 +34,13 @@ def _now_utc() -> datetime:
 def _to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
+def _today_rth_utc_window() -> Tuple[datetime, datetime]:
+    """Return today's RTH open/close in UTC using the configured CDT_TZ."""
+    now_cdt = datetime.now(CDT_TZ)
+    open_cdt = now_cdt.replace(hour=8, minute=30, second=0, microsecond=0)
+    close_cdt = now_cdt.replace(hour=15, minute=0, second=0, microsecond=0)
+    return open_cdt.astimezone(timezone.utc), close_cdt.astimezone(timezone.utc)
+
 # ---------- Basic TA ----------
 def _sma(values: List[float], period: int) -> Optional[float]:
     if len(values) < period:
@@ -55,8 +59,7 @@ def _ema(values: List[float], period: int) -> Optional[float]:
 def _rsi(values: List[float], period: int = 14) -> Optional[float]:
     if len(values) <= period:
         return None
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, len(values)):
         chg = values[i] - values[i - 1]
         gains.append(max(chg, 0.0))
@@ -83,7 +86,7 @@ def _stddev(values: List[float], period: int) -> Optional[float]:
 def _macd(values: List[float], f=12, s=26, sig=9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     if len(values) < (s + sig):
         return (None, None, None)
-    # Build EMA series to get signal properly
+
     def ema_series(vals: List[float], period: int) -> List[Optional[float]]:
         if len(vals) < period:
             return [None] * len(vals)
@@ -102,7 +105,6 @@ def _macd(values: List[float], f=12, s=26, sig=9) -> Tuple[Optional[float], Opti
     if len(macd_vals) < sig:
         return (None, None, None)
 
-    # signal
     def ema_over_series(series: List[Optional[float]], period: int) -> List[Optional[float]]:
         vals = [x for x in series if x is not None]
         if len(vals) < period:
@@ -166,17 +168,12 @@ def _intraday_vwap(bars: List[Dict[str, Any]]) -> Optional[float]:
     return (tot_pv / tot_v) if tot_v > 0 else None
 
 def _orb_15(bars_1m_today: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    """Opening 15-minute range using **CDT RTH** mapped to UTC correctly."""
     if not bars_1m_today:
         return (None, None)
-    # RTH 13:30–13:45 UTC
-    # bars have epoch ms 't'
-    from_ts = None
-    to_ts = None
-    # Compute today's 13:30→13:45 UTC
-    now = _now_utc()
-    open_utc = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    end_utc  = now.replace(hour=13, minute=45, second=0, microsecond=0)
-    start_ms, end_ms = _to_ms(open_utc), _to_ms(end_utc)
+    rth_open_utc, _rth_close_utc = _today_rth_utc_window()
+    start_ms = _to_ms(rth_open_utc)
+    end_ms   = start_ms + 15 * 60 * 1000
     hi = None; lo = None
     for b in bars_1m_today:
         t = b.get("t")
@@ -184,29 +181,25 @@ def _orb_15(bars_1m_today: List[Dict[str, Any]]) -> Tuple[Optional[float], Optio
             continue
         if start_ms <= t < end_ms:
             h = b.get("h"); l = b.get("l")
-            if isinstance(h, (int, float)):
-                hi = h if hi is None else max(hi, h)
-            if isinstance(l, (int, float)):
-                lo = l if lo is None else min(lo, l)
+            if isinstance(h, (int, float)): hi = h if hi is None else max(hi, h)
+            if isinstance(l, (int, float)): lo = l if lo is None else min(lo, l)
     return (hi, lo)
 
 async def _fallback_1m(symbol: str) -> List[Dict[str, Any]]:
-    # IEX → Alpaca
-    bars = await fetch_1m_bars_any(symbol)
-    return bars or []
+    return await fetch_1m_bars_any(symbol) or []
 
 async def _fallback_5m(symbol: str) -> List[Dict[str, Any]]:
-    return await fetch_5m_bars_any(symbol)
+    return await fetch_5m_bars_any(symbol) or []
 
 async def _fallback_1d(symbol: str) -> List[Dict[str, Any]]:
-    return await fetch_1d_bars_any(symbol)
+    return await fetch_1d_bars_any(symbol) or []
 
 # ---------- TA Orchestrator ----------
 async def _compute_ta_bundle(symbol: str) -> Dict[str, Any]:
     now = _now_utc()
     out: Dict[str, Any] = {"ta_src": None}
 
-    # 1) 1-minute (try Polygon → fallbacks)
+    # 1) 1-minute (Polygon → fallbacks)
     try:
         start_1m_hist = now - timedelta(days=3)
         bars_1m = await _fetch_aggs_polygon(symbol, 1, "minute", start_1m_hist, now, limit=50000)
@@ -345,7 +338,7 @@ async def _prev5_avg_hilo(symbol: str) -> Dict[str, Any]:
     try:
         now = _now_utc()
         bars = await _fetch_aggs_polygon(symbol, 1, "day", now - timedelta(days=10), now) or await _fallback_1d(symbol)
-        highs = []; lows = []
+        highs, lows = [], []
         for b in bars[-5:]:
             if isinstance(b.get("h"), (int,float)): highs.append(float(b["h"]))
             if isinstance(b.get("l"), (int,float)): lows.append(float(b["l"]))
@@ -357,17 +350,14 @@ async def _prev5_avg_hilo(symbol: str) -> Dict[str, Any]:
     return out
 
 async def _premarket_hilo(symbol: str) -> Dict[str, Any]:
-    """
-    Best-effort: use today's minute bars before 13:30 UTC as 'premarket'
-    """
+    """Best-effort: use today's minute bars before CDT RTH open as 'premarket'."""
     out: Dict[str, Any] = {}
     try:
         now = _now_utc()
         bars_1m = await _fetch_aggs_polygon(symbol, 1, "minute", now - timedelta(days=1), now) or await _fallback_1m(symbol)
-        pm_hi = None; pm_lo=None
-        # premarket cutoff 13:30 UTC
-        cutoff = now.replace(hour=13, minute=30, second=0, microsecond=0)
-        cutoff_ms = _to_ms(cutoff)
+        pm_hi = None; pm_lo = None
+        rth_open_utc, _ = _today_rth_utc_window()
+        cutoff_ms = _to_ms(rth_open_utc)
         for b in bars_1m:
             t = b.get("t")
             if not isinstance(t, (int, float)):
@@ -383,12 +373,10 @@ async def _premarket_hilo(symbol: str) -> Dict[str, Any]:
     return out
 
 async def _short_volume_ratio(symbol: str) -> Dict[str, Any]:
-    """
-    Use v1 endpoints provided (may be delayed/limited).
-    """
+    """Use v1 endpoints (may be delayed/limited)."""
     out: Dict[str, Any] = {}
     base_qs = {"ticker": symbol, "limit": "1", "sort": "date.desc", "apiKey": os.getenv("POLYGON_API_KEY","")}
-    # Short volume (v1)
+    # Short volume
     try:
         url_sv = "https://api.polygon.io/stocks/v1/short-volume"
         js_sv = await _http_json(url_sv, base_qs)
@@ -408,11 +396,10 @@ async def _short_volume_ratio(symbol: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("[feature] short volume fail: %r", e)
 
-    # Short interest (v1)
+    # Short interest (coverage varies)
     try:
         url_si = "https://api.polygon.io/stocks/v1/short-interest"
         js_si = await _http_json(url_si, base_qs)
-        # We don't force fields here — vendor coverage varies
         out["short_interest"] = ((js_si or {}).get("results") or [{}])[0] if (js_si and js_si.get("results")) else None
     except Exception as e:
         logger.warning("[feature] short interest fail: %r", e)
@@ -424,7 +411,7 @@ async def build_features(client, alert: Dict[str, Any], snapshot: Optional[Dict[
     symbol = alert.get("symbol")
     out: Dict[str, Any] = {}
 
-    # Carry over snapshot extras if any
+    # Carry snapshot extras if any (Options Advanced snapshot often includes greeks/iv)
     if snapshot and isinstance(snapshot.get("results"), dict):
         res = snapshot["results"]
         for k in ("day", "underlying_asset", "greeks", "implied_volatility"):
@@ -438,14 +425,12 @@ async def build_features(client, alert: Dict[str, Any], snapshot: Optional[Dict[
     except Exception as e:
         logger.warning("[feature] TA compute failed: %r", e)
 
-    # Prev day OHLC + change %
+    # Prev day OHLC + change%
     try:
         prev = await _prev_day_ohlc(symbol)
         out.update(prev)
-        if isinstance(out.get("prev_close"), (int, float)):
-            # compare with last daily close; if we also have an intraday last in future you can refine
-            # Here we use prev vs prev (0%) unless caller overlays a more recent mark later.
-            out.setdefault("quote_change_pct", None)
+        # Leave quote_change_pct for downstream to compute from live mark vs prev_close
+        out.setdefault("quote_change_pct", None)
     except Exception as e:
         logger.warning("[feature] prev day bundle fail: %r", e)
 
@@ -458,7 +443,7 @@ async def build_features(client, alert: Dict[str, Any], snapshot: Optional[Dict[
     # Short volume/interest
     out.update(await _short_volume_ratio(symbol))
 
-    # Provide synthetic NBBO scaffold if downstream wants to adopt it
-    synth = _synthetic_nbbo_from_last(None, None)
-    out.update(synth)
+    # Provide synthetic NBBO scaffold (downstream can adopt if needed)
+    out.update(_synthetic_nbbo_from_last(None, None))
+
     return out
