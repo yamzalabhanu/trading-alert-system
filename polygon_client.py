@@ -2,6 +2,8 @@
 import os
 import asyncio
 from typing import Dict, Any, List, Optional
+from urllib.parse import quote
+from datetime import datetime, timezone
 import httpx
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
@@ -112,67 +114,110 @@ async def list_contracts_for_expiry(
 
     return out[:limit]
 
+def _encode_ticker_path(t: str) -> str:
+    return quote(t or "", safe="")
+
+def _age_sec(ts_val: Any) -> Optional[float]:
+    if ts_val is None:
+        return None
+    try:
+        ns = int(ts_val)
+        if   ns >= 10**14: sec = ns / 1e9
+        elif ns >= 10**11: sec = ns / 1e6
+        elif ns >= 10**8:  sec = ns / 1e3
+        else:              sec = float(ns)
+        return max(0.0, datetime.now(timezone.utc).timestamp() - sec)
+    except Exception:
+        return None
+
 async def get_option_snapshot(
     symbol: str,
     contract: str,
     client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
     """
-    Snapshot with normalized fields. Signature kept backward-compatible:
-    you can call with (symbol, contract) OR pass a shared client.
-    Returns keys: iv, oi, volume, bid, ask, mid, quote_age_sec, delta, gamma, theta, vega, _raw
+    Fetch polygon v3 snapshot for one option and normalize:
+      - NBBO (bid/ask/mid), spread%, quote age, timeframe
+      - day volume (vol), open_interest (oi)
+      - greeks + iv if present
+    Accepts flat or nested last_quote structures.
     """
-    owned_client = False
+    close_client = False
     if client is None:
-        client = get_shared_client()
-        owned_client = True
-
+        client = httpx.AsyncClient(timeout=8.0)
+        close_client = True
     try:
-        js = await _poly_get(client, f"/v3/snapshot/options/{symbol}/{contract}", {})
-        res = (js or {}).get("results") or {}
+        enc = _encode_ticker_path(contract)
+        url = f"https://api.polygon.io/v3/snapshot/options/{symbol}/{enc}"
+        r = await client.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=8.0)
+        r.raise_for_status()
+        js = r.json() if "application/json" in (r.headers.get("content-type","")) else {}
+        res = js.get("results") or {}
 
+        # Day + OI
+        day = res.get("day") or {}
+        vol = day.get("volume") or day.get("v")
+        oi = res.get("open_interest")
+
+        # Greeks / IV (varies by entitlement)
         greeks = res.get("greeks") or {}
-        last_quote = res.get("last_quote") or {}
-        bid = (last_quote.get("bid") or {}).get("price")
-        ask = (last_quote.get("ask") or {}).get("price")
-        mid = round((bid + ask) / 2, 4) if (bid is not None and ask is not None) else None
+        iv = res.get("implied_volatility") or greeks.get("iv")
 
-        iv = _coalesce(res.get("implied_volatility"), res.get("iv"), default=None)
-        oi = _coalesce(res.get("open_interest"), res.get("oi"), default=None)
-        vol = _coalesce((res.get("day") or {}).get("volume"), res.get("volume"), default=None)
-        quote_age = _coalesce(last_quote.get("last_updated"), last_quote.get("sip_timestamp"), default=None)
+        # Last quote: flat or nested
+        lq = res.get("last_quote") or res.get("lastQuote") or {}
+        # Try flat first
+        bid = lq.get("bid")
+        ask = lq.get("ask")
+        last_updated = lq.get("last_updated")
+        timeframe = lq.get("timeframe") or res.get("timeframe")
 
-        quote_age_sec = None
-        if isinstance(quote_age, (int, float)):
-            q = float(quote_age)
-            if q > 1e14:
-                quote_age_sec = round(q / 1e9, 3)   # ns -> s
-            elif q > 1e11:
-                quote_age_sec = round(q / 1e6, 3)   # us -> s
-            elif q > 1e8:
-                quote_age_sec = round(q / 1e3, 3)   # ms -> s
-            else:
-                quote_age_sec = q
+        # Fallback to nested shapes
+        if bid is None:
+            bid = (lq.get("bid_price") if isinstance(lq.get("bid_price"), (int,float)) else None)
+        if ask is None:
+            ask = (lq.get("ask_price") if isinstance(lq.get("ask_price"), (int,float)) else None)
+        if bid is None and isinstance(lq.get("bid"), dict):
+            bid = lq.get("bid", {}).get("price")
+        if ask is None and isinstance(lq.get("ask"), dict):
+            ask = lq.get("ask", {}).get("price")
+        if last_updated is None:
+            last_updated = lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("t")
 
-        return {
-            "iv": iv,
-            "oi": oi,
-            "volume": vol,
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "bid_size": (last_quote.get("bid") or {}).get("size"),
-            "ask_size": (last_quote.get("ask") or {}).get("size"),
-            "quote_age_sec": quote_age_sec,
-            "delta": greeks.get("delta"),
-            "gamma": greeks.get("gamma"),
-            "theta": greeks.get("theta"),
-            "vega": greeks.get("vega"),
-            "_raw": res,
+        # Derive mid/spread/age
+        mid = None
+        spread_pct = None
+        if isinstance(bid, (int,float)) and isinstance(ask, (int,float)) and ask >= 0 and bid >= 0:
+            mid = (bid + ask) / 2.0
+            if mid and mid > 0:
+                spread_pct = (ask - bid) / mid * 100.0
+        age = _age_sec(last_updated)
+
+        out = {
+            "results": res,  # keep raw for callers that expect it
+            # normalized fields your engine expects
+            "bid": float(bid) if isinstance(bid, (int,float)) else None,
+            "ask": float(ask) if isinstance(ask, (int,float)) else None,
+            "mid": round(float(mid), 4) if isinstance(mid, (int,float)) else None,
+            "option_spread_pct": round(float(spread_pct), 3) if isinstance(spread_pct, (int,float)) else None,
+            "quote_age_sec": float(age) if isinstance(age, (int,float)) else None,
+            "nbbo_provider": "polygon:snapshot",
+            "timeframe": timeframe or "UNKNOWN",
+            "vol": int(vol) if isinstance(vol, (int,float)) else None,
+            "oi": int(oi) if isinstance(oi, (int,float)) else None,
         }
+
+        # Attach greeks/iv if present
+        for k in ("delta","gamma","theta","vega"):
+            if isinstance(greeks.get(k), (int,float)):
+                out[k] = greeks[k]
+        if isinstance(iv, (int,float)):
+            out["iv"] = iv
+
+        return out
     finally:
-        if owned_client:
+        if close_client:
             await client.aclose()
+
 
 async def get_aggs(
     client: httpx.AsyncClient,
