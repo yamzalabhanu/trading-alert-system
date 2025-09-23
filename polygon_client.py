@@ -131,28 +131,27 @@ def _age_sec(ts_val: Any) -> Optional[float]:
         return None
 
 async def get_option_snapshot(
+    client: httpx.AsyncClient,
     symbol: str,
     contract: str,
-    client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
     """
-    Fetch polygon v3 snapshot for one option and normalize:
-      - NBBO (bid/ask/mid), spread%, quote age, timeframe
-      - day volume (vol), open_interest (oi)
-      - greeks + iv if present
-    Accepts flat or nested last_quote structures.
+    Return the raw Polygon Options Advanced snapshot payload for a single contract.
+    Do NOT reshape fields here; callers should read `results.last_quote`, `results.day`,
+    `results.open_interest`, `results.greeks`, etc., as provided by Polygon.
+
+    Endpoint:
+      /v3/snapshot/options/{underlying}/{contract}
     """
-    close_client = False
-    if client is None:
-        client = httpx.AsyncClient(timeout=8.0)
-        close_client = True
-    try:
-        enc = _encode_ticker_path(contract)
-        url = f"https://api.polygon.io/v3/snapshot/options/{symbol}/{enc}"
-        r = await client.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=8.0)
-        r.raise_for_status()
-        js = r.json() if "application/json" in (r.headers.get("content-type","")) else {}
-        res = js.get("results") or {}
+    if client is None or not POLYGON_API_KEY:
+        return {}
+
+    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}/{contract}"
+    r = await client.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=8.0)
+    # Let 4xx/5xx raise; upstream will catch and handle
+    r.raise_for_status()
+    js = r.json()
+    return js if isinstance(js, dict) else {}
 
         # Day + OI
         day = res.get("day") or {}
