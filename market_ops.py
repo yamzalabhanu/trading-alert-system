@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import httpx
 
-from polygon_ops import fetch_option_quote_adv  # (kept available; optional use)
+from polygon_ops import fetch_option_quote_adv  # optional (kept if you use it elsewhere)
 
 from polygon_client import (
     list_contracts_for_expiry,
@@ -26,7 +26,7 @@ async def _http_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]
     try:
         r = await client.get(url, params=params or {}, timeout=timeout)
         if r.status_code in (402, 403, 404, 429):
-            return {"status": r.status_code, "body": (r.json() if "application/json" in (r.headers.get("content-type") or "") else r.text)}
+            return {"status": r.status_code, "body": (r.text or "")[:400]}
         r.raise_for_status()
         js = r.json()
         return js if isinstance(js, dict) else None
@@ -37,7 +37,7 @@ async def _http_json_url(client: httpx.AsyncClient, url: str, timeout: float = 8
     try:
         r = await client.get(url, timeout=timeout)
         if r.status_code in (402, 403, 404, 429):
-            return {"status": r.status_code, "body": (r.json() if "application/json" in (r.headers.get("content-type") or "") else r.text)}
+            return {"status": r.status_code, "body": (r.text or "")[:400]}
         r.raise_for_status()
         js = r.json()
         return js if isinstance(js, dict) else None
@@ -81,23 +81,6 @@ def _today_utc_range_for_aggs(now_utc: datetime) -> Tuple[str, str]:
     start = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
     return start, now_utc.isoformat()
 
-def _shape_nbbo_from(last_obj: dict) -> dict:
-    bid = last_obj.get("bidPrice")
-    ask = last_obj.get("askPrice")
-    ts  = last_obj.get("t") or last_obj.get("sip_timestamp") or last_obj.get("participant_timestamp") or last_obj.get("timestamp")
-    out: Dict[str, Any] = {}
-    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
-        mid = (bid + ask) / 2.0
-        spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else None
-        out["bid"] = float(bid)
-        out["ask"] = float(ask)
-        out["mid"] = round(mid, 4)
-        out["option_spread_pct"] = round(spread_pct, 3) if spread_pct is not None else None
-    age = _quote_age_from_ts(ts)
-    if age is not None:
-        out["quote_age_sec"] = age
-    return out
-
 # -------------------------
 # Public wrappers
 # -------------------------
@@ -140,7 +123,7 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
             {"apiKey": POLYGON_API_KEY},
             timeout=3.0,
         )
-        if lastq and isinstance(lastq, dict) and not lastq.get("error"):
+        if lastq and not isinstance(lastq.get("status"), int):
             res = lastq.get("results") or {}
             last = res.get("last") or res
             bid = last.get("bidPrice")
@@ -156,6 +139,7 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
                     "mid": float(mid) if mid is not None else None,
                     "quote_age_sec": age,
                     "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
+                    "nbbo_provider": "polygon:last",
                 }
                 if (
                     not best
@@ -169,120 +153,90 @@ async def _sample_best_quote(client, enc_opt, tries=5, delay=0.6) -> Optional[Di
 async def ensure_nbbo(
     client: httpx.AsyncClient,
     option_ticker: str,
-    tries: int = 8,
-    delay: float = 0.35,
+    tries: int = 6,
+    delay: float = 0.6,
 ) -> Dict[str, Any]:
     """
-    Resolve real NBBO using Polygon Options Advanced (no synthetic):
-      1) v3 quotes search (freshest real quote)
-      2) v3 /quotes/options/{ticker}/last (may 404, depending on contract)
-      3) v3 single-contract snapshot -> results.lastQuote (OPRA)
+    Prefer NBBO from the *snapshot* endpoint (Options Advanced):
+      - bid/ask + last_updated + timeframe
+      - compute mid, spread%, quote_age_sec
+    Fall back to /v3/quotes/options/{ticker}/last if snapshot is missing NBBO.
+    Finally, fall back to last trade for a 'mid'/last + age only.
 
     Returns:
-      { bid, ask, mid, option_spread_pct, quote_age_sec, nbbo_provider="polygon" }
-      or {} if unavailable.
+      {
+        bid, ask, mid, option_spread_pct, quote_age_sec,
+        nbbo_provider: "polygon:snapshot" | "polygon:last" | "polygon:last_trade",
+        nbbo_timeframe: "DELAYED" | "REALTIME" | "UNKNOWN" (if snapshot path used)
+      }
     """
-    if not POLYGON_API_KEY or client is None or not option_ticker:
-        return {}
+    out: Dict[str, Any] = {}
+    if not POLYGON_API_KEY or client is None:
+        return out
 
-    enc_opt = _encode_ticker_path(option_ticker)
-    best: Dict[str, Any] = {}
-
-    try:
-        max_spread_ok = float(os.getenv("MAX_SPREAD_PCT", "6.0"))
-    except Exception:
-        max_spread_ok = 6.0
-    try:
-        max_age_ok = float(os.getenv("MAX_QUOTE_AGE_S", "30"))
-    except Exception:
-        max_age_ok = 30.0
-
-    def _is_better(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-        sp_a = a.get("option_spread_pct"); ag_a = a.get("quote_age_sec")
-        sp_b = b.get("option_spread_pct"); ag_b = b.get("quote_age_sec")
-        return ((sp_a if isinstance(sp_a, (int, float)) else 1e9),
-                (ag_a if isinstance(ag_a, (int, float)) else 1e9)) < \
-               ((sp_b if isinstance(sp_b, (int, float)) else 1e9),
-                (ag_b if isinstance(ag_b, (int, float)) else 1e9))
-
-    m = re.match(r"^O:([A-Z0-9\.\-]+)\d{6}[CP]\d{8,9}$", option_ticker)
+    # Try snapshot first: it works on your plan even if quotes API is unauthorized.
+    # We need the underlying symbol to call the snapshot endpoint; infer from OCC ticker.
+    # OCC: O:SYMBOL YYMMDD C/P STRIKE (8–9 digits)
+    m = re.search(r"^O:([A-Z0-9\.\-]+)\d{6}[CP]\d{8,9}$", option_ticker or "")
     underlying = m.group(1) if m else None
+    enc_opt = _encode_ticker_path(option_ticker)
 
-    for _ in range(max(1, tries)):
-        # 1) Quotes search (freshest)
-        try:
-            q = await _http_json(
-                client,
-                "https://api.polygon.io/v3/quotes/options",
-                {
-                    "ticker": option_ticker,  # raw ticker ok for this endpoint
-                    "limit": 1,
-                    "sort": "timestamp",
-                    "order": "desc",
-                    "apiKey": POLYGON_API_KEY,
-                },
-                timeout=4.0,
-            )
-            if q and isinstance(q, dict) and q.get("results"):
-                cand = _shape_nbbo_from(q["results"][0])
-                if "bid" in cand and "ask" in cand:
-                    cand["nbbo_provider"] = "polygon"
-                    if (not best) or _is_better(cand, best):
-                        best = cand
-                    if (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and \
-                       (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok):
-                        return best
-        except Exception:
-            pass
+    if underlying:
+        snap = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc_opt}",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=6.0
+        )
+        if snap and not isinstance(snap.get("status"), int):
+            res = snap.get("results") or {}
+            lq = res.get("last_quote") or res.get("lastQuote") or {}
+            bid = lq.get("bid") or lq.get("bid_price") or lq.get("bidPrice")
+            ask = lq.get("ask") or lq.get("ask_price") or lq.get("askPrice")
+            ts  = lq.get("last_updated") or lq.get("sip_timestamp") or lq.get("participant_timestamp") or lq.get("trf_timestamp") or lq.get("t")
+            timeframe = lq.get("timeframe") or res.get("timeframe") or "UNKNOWN"
 
-        # 2) /last endpoint
-        try:
-            lastq = await _http_json(
-                client,
-                f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
-                {"apiKey": POLYGON_API_KEY},
-                timeout=3.0,
-            )
-            if lastq and isinstance(lastq, dict) and not lastq.get("error"):
-                res = lastq.get("results") or {}
-                last = res.get("last") or res
-                cand = _shape_nbbo_from(last)
-                if "bid" in cand and "ask" in cand:
-                    cand["nbbo_provider"] = "polygon"
-                    if (not best) or _is_better(cand, best):
-                        best = cand
-                    if (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and \
-                       (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok):
-                        return best
-        except Exception:
-            pass
+            if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
+                mid = (bid + ask) / 2.0
+                spread_pct = ((ask - bid) / mid * 100.0) if (mid and mid > 0) else None
+                age = _quote_age_from_ts(ts)
+                out.update({
+                    "bid": float(bid),
+                    "ask": float(ask),
+                    "mid": round(float(mid), 4) if mid is not None else None,
+                    "option_spread_pct": round(float(spread_pct), 3) if spread_pct is not None else None,
+                    "quote_age_sec": float(age) if age is not None else None,
+                    "nbbo_provider": "polygon:snapshot",
+                    "nbbo_timeframe": str(timeframe),
+                })
 
-        # 3) Single-contract snapshot (results.lastQuote)
-    # fall through loop
-        if underlying:
-            try:
-                snap = await _http_json(
-                    client,
-                    f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc_opt}",
-                    {"apiKey": POLYGON_API_KEY, "greeks": "true"},
-                    timeout=4.0,
-                )
-                if snap and isinstance(snap, dict) and snap.get("results"):
-                    lastq = (snap["results"].get("lastQuote") or {})
-                    cand = _shape_nbbo_from(lastq)
-                    if "bid" in cand and "ask" in cand:
-                        cand["nbbo_provider"] = "polygon"
-                        if (not best) or _is_better(cand, best):
-                            best = cand
-                        if (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and \
-                           (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok):
-                            return best
-            except Exception:
-                pass
+    # If snapshot didn’t give us a proper NBBO, try quotes/last (may be unauthorized on some plans)
+    if out.get("bid") is None or out.get("ask") is None:
+        best = await _sample_best_quote(client, enc_opt, tries=max(1, tries), delay=delay)
+        if best:
+            out.update(best)
 
-        await asyncio.sleep(delay)
+    # Last-trade fallback for a mark + age (still useful when there’s no NBBO)
+    if out.get("bid") is None and out.get("ask") is None:
+        t = await _http_json(
+            client,
+            f"https://api.polygon.io/v3/trades/options/{enc_opt}/last",
+            {"apiKey": POLYGON_API_KEY},
+            timeout=4.0,
+        )
+        if t and not isinstance(t.get("status"), int):
+            res = t.get("results") or {}
+            last_px = res.get("price")
+            ts = res.get("sip_timestamp") or res.get("participant_timestamp") or res.get("t")
+            if isinstance(last_px, (int, float)):
+                out["last"] = float(last_px)
+                out["mid"] = float(last_px)
+            age = _quote_age_from_ts(ts)
+            if age is not None:
+                out["quote_age_sec"] = age
+            out.setdefault("nbbo_provider", "polygon:last_trade")
 
-    return best
+    return out
 
 # -------------------------
 # Backfill bundle
@@ -300,6 +254,8 @@ async def poly_option_backfill(
     def _apply_from_results(res: Dict[str, Any], out_dict: Dict[str, Any]) -> None:
         if not isinstance(res, dict):
             return
+
+        # OI / Vol (from snapshot)
         oi = res.get("open_interest")
         if oi is not None:
             out_dict["oi"] = oi
@@ -308,36 +264,47 @@ async def poly_option_backfill(
         if vol is not None:
             out_dict["vol"] = vol
 
-        lq = res.get("last_quote") or {}
-        bid_px = lq.get("bid_price")
-        ask_px = lq.get("ask_price")
+        # Snapshot NBBO + timeframe
+        lq = res.get("last_quote") or res.get("lastQuote") or {}
+        bid_px = lq.get("bid") or lq.get("bid_price") or lq.get("bidPrice")
+        ask_px = lq.get("ask") or lq.get("ask_price") or lq.get("askPrice")
+        timeframe = lq.get("timeframe") or res.get("timeframe") or "UNKNOWN"
         if bid_px is not None:
             out_dict["bid"] = float(bid_px)
         if ask_px is not None:
             out_dict["ask"] = float(ask_px)
+        if bid_px is not None or ask_px is not None:
+            out_dict["nbbo_provider"] = "polygon:snapshot"
+            out_dict["nbbo_timeframe"] = str(timeframe)
 
-        lt = res.get("last_trade") or {}
-        lt_px = lt.get("price")
-        if isinstance(lt_px, (int, float)):
-            out_dict["last"] = float(lt_px)
-
+        # Derive mid/spread from snapshot if possible
         if out_dict.get("mid") is None and out_dict.get("bid") is not None and out_dict.get("ask") is not None:
             out_dict["mid"] = round((out_dict["bid"] + out_dict["ask"]) / 2.0, 4)
+        if out_dict.get("option_spread_pct") is None and out_dict.get("mid") not in (None, 0):
+            try:
+                out_dict["option_spread_pct"] = round((out_dict["ask"] - out_dict["bid"]) / out_dict["mid"] * 100.0, 3)
+            except Exception:
+                pass
 
+        # Quote timestamp → age
         ts = (
-            lq.get("sip_timestamp")
+            lq.get("last_updated")
+            or lq.get("sip_timestamp")
             or lq.get("participant_timestamp")
             or lq.get("trf_timestamp")
             or lq.get("t")
-            or lt.get("sip_timestamp")
-            or lt.get("participant_timestamp")
-            or lt.get("trf_timestamp")
-            or lt.get("t")
         )
         age = _quote_age_from_ts(ts)
         if age is not None:
             out_dict["quote_age_sec"] = age
 
+        # Last trade (for 'last')
+        lt = res.get("last_trade") or res.get("lastTrade") or {}
+        lt_px = lt.get("price")
+        if isinstance(lt_px, (int, float)):
+            out_dict["last"] = float(lt_px)
+
+        # Greeks & IV
         greeks = res.get("greeks") or {}
         for k_src in ("delta", "gamma", "theta", "vega"):
             v = greeks.get(k_src)
@@ -367,7 +334,7 @@ async def poly_option_backfill(
                 },
                 timeout=8.0
             )
-            if rlist and isinstance(rlist.get("results"), list):
+            if rlist and not isinstance(rlist.get("status"), int):
                 items = rlist.get("results") or []
                 chosen = None
                 for it in items:
@@ -390,13 +357,12 @@ async def poly_option_backfill(
                 {"apiKey": POLYGON_API_KEY},
                 timeout=8.0
             )
-            if snap:
+            if snap and not isinstance(snap.get("status"), int):
                 _apply_from_results(snap.get("results") or {}, out)
         except Exception:
             pass
 
     # 3) previous-day open/close
-    prev_close = None
     try:
         yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
         enc_opt = _encode_ticker_path(option_ticker)
@@ -406,7 +372,7 @@ async def poly_option_backfill(
             {"apiKey": POLYGON_API_KEY},
             timeout=6.0
         )
-        if oc and isinstance(oc, dict):
+        if oc and not isinstance(oc.get("status"), int):
             oi = oc.get("open_interest")
             vol = oc.get("volume")
             if out.get("oi") is None and oi is not None:
@@ -415,19 +381,19 @@ async def poly_option_backfill(
                 out["vol"] = vol
             pc = oc.get("close")
             if isinstance(pc, (int, float)):
-                prev_close = float(pc)
-                out["prev_close"] = prev_close
+                out["prev_close"] = float(pc)
     except Exception:
         pass
 
-    # 4) sample best quote (NBBO)
+    # 4) If still no NBBO, sample quotes/last
     try:
-        enc_opt = _encode_ticker_path(option_ticker)
-        sampled = await _sample_best_quote(client, enc_opt, tries=5, delay=0.6)
-        if sampled:
-            for k, v in sampled.items():
-                if v is not None:
-                    out[k] = v
+        if out.get("bid") is None or out.get("ask") is None:
+            enc_opt = _encode_ticker_path(option_ticker)
+            sampled = await _sample_best_quote(client, enc_opt, tries=5, delay=0.6)
+            if sampled:
+                for k, v in sampled.items():
+                    if v is not None:
+                        out[k] = v
     except Exception:
         pass
 
@@ -441,17 +407,17 @@ async def poly_option_backfill(
                 {"apiKey": POLYGON_API_KEY},
                 timeout=4.0,
             )
-            if t and isinstance(t, dict):
+            if t and not isinstance(t.get("status"), int):
                 res = t.get("results") or {}
                 last_px = res.get("price")
                 ts = res.get("sip_timestamp") or res.get("participant_timestamp") or res.get("t")
                 if isinstance(last_px, (int, float)):
                     out["last"] = float(last_px)
+                    out.setdefault("mid", float(last_px))
                 age = _quote_age_from_ts(ts)
                 if age is not None and out.get("quote_age_sec") is None:
                     out["quote_age_sec"] = age
-                if out.get("mid") is None and isinstance(last_px, (int, float)):
-                    out["mid"] = float(last_px)
+                out.setdefault("nbbo_provider", "polygon:last_trade")
     except Exception:
         pass
 
@@ -467,7 +433,7 @@ async def poly_option_backfill(
                 {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY},
                 timeout=8.0
             )
-            if aggs and isinstance(aggs, dict):
+            if aggs and not isinstance(aggs.get("status"), int):
                 results = aggs.get("results") or []
                 if results:
                     vol_sum = 0
@@ -527,7 +493,7 @@ async def choose_best_contract(
         mlist = None
 
     index_by_ticker = {}
-    if mlist and isinstance(mlist.get("results"), list):
+    if mlist and not isinstance(mlist.get("status"), int):
         for it in (mlist.get("results") or []):
             tk = (it.get("details") or {}).get("ticker") or it.get("ticker")
             if tk:
@@ -559,17 +525,28 @@ async def choose_best_contract(
         day_block = det.get("day") or {}
         vol = day_block.get("volume")
         enc = _encode_ticker_path(tk)
-        q = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
-                             {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+
         spread_pct = None
-        if q and isinstance(q, dict):
-            res = q.get("results") or {}
-            last = res.get("last") or res
-            b, a = last.get("bidPrice"), last.get("askPrice")
-            if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0 and b >= 0:
-                mid = (a + b)/2.0
-                if mid > 0:
-                    spread_pct = (a - b)/mid*100.0
+        # Try snapshot NBBO
+        lq = det.get("last_quote") or {}
+        b = lq.get("bid") or lq.get("bid_price") or lq.get("bidPrice")
+        a = lq.get("ask") or lq.get("ask_price") or lq.get("askPrice")
+        if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0:
+            mid = (a + b) / 2.0
+            if mid > 0:
+                spread_pct = (a - b)/mid*100.0
+        else:
+            # Fallback to quotes/last
+            q = await _http_json(client, f"https://api.polygon.io/v3/quotes/options/{enc}/last",
+                                 {"apiKey": POLYGON_API_KEY}, timeout=3.0)
+            if q and not isinstance(q.get("status"), int):
+                res = q.get("results") or {}
+                last = res.get("last") or res
+                b2, a2 = last.get("bidPrice"), last.get("askPrice")
+                if isinstance(b2, (int, float)) and isinstance(a2, (int, float)) and a2 >= b2 and a2 > 0:
+                    mid = (a2 + b2)/2.0
+                    if mid > 0:
+                        spread_pct = (a2 - b2)/mid*100.0
 
         tgt = TARGET_DELTA_CALL if side == "CALL" else TARGET_DELTA_PUT
         delta_miss = abs((delta if isinstance(delta, (int, float)) else tgt) - tgt)
@@ -771,7 +748,8 @@ async def scan_for_best_contract_for_alert(
                 continue
 
             lq = r.get("last_quote") or {}
-            b = lq.get("bid_price"); a = lq.get("ask_price")
+            b = lq.get("bid") or lq.get("bid_price") or lq.get("bidPrice")
+            a = lq.get("ask") or lq.get("ask_price") or lq.get("askPrice")
             mid = None; spread_pct = None
             if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0:
                 mid = (a + b) / 2.0
@@ -856,7 +834,8 @@ async def scan_top_candidates_for_alert(
                 continue
 
             lq = r.get("last_quote") or {}
-            b = lq.get("bid_price"); a = lq.get("ask_price")
+            b = lq.get("bid") or lq.get("bid_price") or lq.get("bidPrice")
+            a = lq.get("ask") or lq.get("ask_price") or lq.get("askPrice")
             mid = None; spread_pct = None
             if isinstance(b, (int, float)) and isinstance(a, (int, float)) and a >= b and a > 0:
                 mid = (a + b) / 2.0
