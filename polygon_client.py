@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 from datetime import datetime, timezone
 import httpx
+from __future__ import annotations
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
@@ -12,7 +13,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 __all__ = [
     "list_contracts_for_expiry",
     "get_option_snapshot",
-    "build_option_contract",
+    "",
     "get_aggs",
     "get_shared_client",
 ]
@@ -54,19 +55,31 @@ async def _poly_get(
 
 # ---------- option helpers ----------
 
-def build_option_contract(ticker: str, expiry_yyyy_mm_dd: str, side: str, strike: float) -> str:
+def build_option_contract(
+    symbol: str,
+    expiry_iso: str,   # "YYYY-MM-DD"
+    side: str,         # "CALL" | "PUT" or "C" | "P"
+    strike: float,
+) -> str:
     """
-    OCC format with Polygon 'O:' prefix:
-      O:<TICKER><YYMMDD><C/P><STRIKE*1000, zero-padded 8>
-    Example: 12.5 -> 00012500
+    Build OCC-style ticker used by Polygon:
+      O:{SYMBOL}{YY}{MM}{DD}{C|P}{strike*1000:08d}
+    Example: O:AAPL250926C00255000
     """
-    yy = expiry_yyyy_mm_dd[2:4]
-    mm = expiry_yyyy_mm_dd[5:7]
-    dd = expiry_yyyy_mm_dd[8:10]
-    cp = "C" if side.upper().startswith("C") else "P"
-    strike_int = int(round(float(strike) * 1000))
-    strike_part = f"{strike_int:08d}"
-    return f"O:{ticker.upper()}{yy}{mm}{dd}{cp}{strike_part}"
+    symbol = (symbol or "").upper().strip()
+    side   = (side or "").upper().strip()
+    cpor   = "C" if side.startswith("C") else "P"
+
+    # expiry -> YYMMDD
+    y, m, d = expiry_iso.split("-")
+    yy = y[-2:]
+    yymmdd = f"{yy}{m}{d}"
+
+    # strike -> *1000, zero-padded width 8
+    k1000 = int(round(float(strike) * 1000))
+    strike_part = f"{k1000:08d}"
+
+    return f"O:{symbol}{yymmdd}{cpor}{strike_part}"
 
 def _coalesce(*vals, default=None):
     for v in vals:
@@ -136,19 +149,21 @@ async def get_option_snapshot(
     contract: str,
 ) -> Dict[str, Any]:
     """
-    Return the raw Polygon Options Advanced snapshot payload for a single contract.
-    Do NOT reshape fields here; callers should read `results.last_quote`, `results.day`,
-    `results.open_interest`, `results.greeks`, etc., as provided by Polygon.
+    Return the RAW Polygon Options snapshot JSON:
+      /v3/snapshot/options/{symbol}/{contract}
 
-    Endpoint:
-      /v3/snapshot/options/{underlying}/{contract}
+    We DO NOT reshape anything here. Callers should read:
+      results.last_quote.bid / ask / last_updated / timeframe
+      results.open_interest
+      results.day.volume
+      results.greeks (if present)
+      results.underlying_asset (if present)
     """
     if client is None or not POLYGON_API_KEY:
         return {}
 
     url = f"https://api.polygon.io/v3/snapshot/options/{symbol}/{contract}"
     r = await client.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=8.0)
-    # Let 4xx/5xx raise; upstream will catch and handle
     r.raise_for_status()
     js = r.json()
     return js if isinstance(js, dict) else {}
