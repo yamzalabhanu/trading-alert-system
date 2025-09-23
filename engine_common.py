@@ -2,6 +2,7 @@
 import os
 import re
 import math
+from typing import List
 import logging
 from urllib.parse import quote
 from typing import Dict, Any, Optional, Tuple
@@ -266,18 +267,60 @@ def _compact_adjustments(diff_note: str) -> str:
         parts.append(s)
     return "Adj: " + " • ".join(parts)
 
-def _first_sentence(text: str, max_len: int = 160) -> str:
+
+def _first_sentence(text: str, max_len: int = 80) -> str:
+    """
+    Return the first sentence-ish fragment (up to max_len).
+    Falls back to truncation with ellipsis.
+    """
     s = (text or "").strip()
     if not s:
         return ""
-    # Cut on first hard stop; then trim length gently
-    for sep in [". ", " — ", " – ", "\n"]:
+    # Try to cut at period/question/exclamation
+    for sep in [". ", "? ", "! "]:
         if sep in s:
             s = s.split(sep, 1)[0]
             break
     if len(s) > max_len:
-        s = s[:max_len - 1].rstrip() + "…"
+        return s[: max_len - 1].rstrip() + "…"
     return s
+
+def _pick_factor_lines_from_reason(reason_text: str, max_lines: int = 3) -> List[str]:
+    """
+    Extract up to N short bullet lines from a multi-line reason/analysis blob.
+    Looks for dash/emoji bullets first; otherwise splits by sentences.
+    """
+    s = (reason_text or "").strip()
+    if not s:
+        return []
+    lines: List[str] = []
+
+    # Prefer existing bullet-like lines
+    for line in s.splitlines():
+        t = line.strip(" •-—*·\t")
+        if not t:
+            continue
+        if line.lstrip().startswith(("•", "-", "—", "*", "·")):
+            lines.append(t)
+        if len(lines) >= max_lines:
+            break
+
+    if not lines:
+        # Fall back to sentences
+        tmp = s.replace("! ", ". ").replace("? ", ". ").split(". ")
+        for frag in tmp:
+            frag = frag.strip()
+            if frag:
+                lines.append(frag)
+            if len(lines) >= max_lines:
+                break
+
+    # Trim each to a reasonable length
+    out: List[str] = []
+    for l in lines[:max_lines]:
+        out.append(l if len(l) <= 96 else (l[:95].rstrip() + "…"))
+    return out
+
 
 
 def compose_telegram_text(
