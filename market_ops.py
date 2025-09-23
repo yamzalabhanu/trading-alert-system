@@ -7,6 +7,7 @@ import asyncio
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone, timedelta, date
 from urllib.parse import quote
+from polygon_ops import fetch_option_quote_adv
 
 import httpx
 
@@ -153,40 +154,114 @@ async def ensure_nbbo(
     tries: int = 6,
     delay: float = 0.6,
 ) -> Dict[str, Any]:
+    """
+    Spin on Polygon v3 last-quote for options and return the best (tightest/freshest) NBBO seen.
+    Works with Options Advanced responses:
+      { "results": { "last": { bidPrice, askPrice, t|sip_timestamp|timestamp, ... } } }
+      or occasionally { "results": { bidPrice, askPrice, ... } }
+
+    Returns:
+      {
+        bid, ask, mid, option_spread_pct, quote_age_sec,
+        nbbo_provider: "polygon:last",
+        nbbo_http_status: <int>  # when available
+      }
+    """
+    if not POLYGON_API_KEY or client is None:
+        return {}
+
     enc_opt = _encode_ticker_path(option_ticker)
     best: Dict[str, Any] = {}
+
+    # Soft acceptance thresholds (fall back to env if engine_common isn’t in scope here)
+    try:
+        max_spread_ok = float(os.getenv("MAX_SPREAD_PCT", "6.0"))
+    except Exception:
+        max_spread_ok = 6.0
+    try:
+        max_age_ok = float(os.getenv("MAX_QUOTE_AGE_S", "30"))
+    except Exception:
+        max_age_ok = 30.0
+
+    def _norm_age(ts_val) -> Optional[float]:
+        # Use existing helper if present
+        try:
+            return _quote_age_from_ts(ts_val)  # type: ignore
+        except Exception:
+            pass
+        # Inline normalization: accept ns/us/ms/s
+        try:
+            ns = int(ts_val)
+            if   ns >= 10**14: sec = ns / 1e9     # ns
+            elif ns >= 10**11: sec = ns / 1e6     # us
+            elif ns >= 10**8:  sec = ns / 1e3     # ms
+            else:              sec = float(ns)    # s
+            return max(0.0, datetime.now(timezone.utc).timestamp() - sec)
+        except Exception:
+            return None
+
     for _ in range(max(1, tries)):
-        lastq = await _http_json(
+        resp = await _http_json(
             client,
             f"https://api.polygon.io/v3/quotes/options/{enc_opt}/last",
             {"apiKey": POLYGON_API_KEY},
-            timeout=3.0,
+            timeout=4.0,
         )
-        if lastq:
-            res = lastq.get("results") or {}
-            last = res.get("last") or res
+
+        # Record http status if our helper bubbles it up
+        if isinstance(resp, dict) and "status" in resp and isinstance(resp.get("status"), int):
+            if resp.get("status") in (402, 403, 404, 429):
+                # Hard errors / plan limits / not found / throttled -> no point in spinning forever
+                best.setdefault("nbbo_http_status", resp.get("status"))
+                break
+            best.setdefault("nbbo_http_status", resp.get("status"))
+
+        if resp and isinstance(resp, dict):
+            res = resp.get("results") or {}
+            last = res.get("last") if isinstance(res, dict) and isinstance(res.get("last"), dict) else res
+
             bid = last.get("bidPrice")
             ask = last.get("askPrice")
-            ts  = last.get("t") or last.get("sip_timestamp") or last.get("timestamp")
+            ts  = last.get("t") or last.get("sip_timestamp") or last.get("participant_timestamp") or last.get("timestamp")
+
             if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask >= bid:
-                mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
+                mid = (bid + ask) / 2.0
                 spread_pct = ((ask - bid) / mid * 100.0) if (mid and mid > 0) else None
-                age = _quote_age_from_ts(ts)
+                age = _norm_age(ts)
+
                 cand = {
-                    "bid": float(bid) if bid is not None else None,
-                    "ask": float(ask) if ask is not None else None,
-                    "mid": float(mid) if mid is not None else None,
-                    "option_spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
-                    "quote_age_sec": age,
+                    "bid": float(bid),
+                    "ask": float(ask),
+                    "mid": round(float(mid), 4) if mid is not None else None,
+                    "option_spread_pct": round(float(spread_pct), 3) if spread_pct is not None else None,
+                    "quote_age_sec": float(age) if age is not None else None,
+                    "nbbo_provider": "polygon:last",
                 }
-                if (
-                    not best
-                    or (cand.get("option_spread_pct") or 1e9) < (best.get("option_spread_pct") or 1e9)
-                    or (cand.get("quote_age_sec") or 1e9) < (best.get("quote_age_sec") or 1e9)
-                ):
+
+                # Keep the better candidate:
+                #   1) tighter spread
+                #   2) fresher age
+                #   3) otherwise keep existing
+                def _score(x: Dict[str, Any]) -> Tuple[float, float]:
+                    sp = x.get("option_spread_pct")
+                    ag = x.get("quote_age_sec")
+                    return ((sp if isinstance(sp, (int, float)) else 1e9),
+                            (ag if isinstance(ag, (int, float)) else 1e9))
+
+                if (not best) or (_score(cand) < _score(best)):
                     best = cand
+
+                # Early exit if we already have "good enough" quote
+                if (
+                    (best.get("option_spread_pct") is not None and best["option_spread_pct"] <= max_spread_ok) and
+                    (best.get("quote_age_sec") is not None and best["quote_age_sec"] <= max_age_ok)
+                ):
+                    break
+
         await asyncio.sleep(delay)
+
     return best
+
 
 # -------------------------
 # Backfill bundle
