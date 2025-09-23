@@ -271,104 +271,153 @@ def compose_telegram_text(
     option_ticker: Optional[str],
     f: Dict[str, Any],
     llm: Dict[str, Any],
-    llm_ran: bool = True,
+    llm_ran: bool = False,
     llm_reason: str = "",
     score: Optional[float] = None,
     rating: Optional[str] = None,
     diff_note: str = "",
 ) -> str:
-    """
-    Compact, skimmable Telegram message.
-    """
-    sym = alert.get("symbol") or "-"
     side = (alert.get("side") or "").upper()
+    sym = alert.get("symbol") or "?"
     strike = alert.get("strike")
-    exp = alert.get("expiry") or "-"
-    dte_lbl = _dte_label(exp)
-    sideL = _side_letter(side)
+    right = "C" if side == "CALL" else "P"
+    expiry = alert.get("expiry") or ""
 
-    decision = (llm.get("decision") or "wait").upper()
-    conf_s = _fmt_num(llm.get("confidence"), 2)
-    score_s = _fmt_num(score, 2) if score is not None else "-"
-    rating_s = rating or "-"
+    # DTE
+    dte = f.get("dte")
+    if dte is None and expiry:
+        try:
+            dte = (datetime.fromisoformat(expiry).date() - datetime.now(timezone.utc).date()).days
+        except Exception:
+            dte = None
 
-    # Liquidity
-    oi_s = _fmt_int(f.get("oi"))
-    vol_s = _fmt_int(f.get("vol"))
+    # LLM bits
+    hdr_decision = (llm.get("decision") or "wait").upper() if isinstance(llm, dict) else "WAIT"
+    horizon = (llm.get("horizon") or "").upper() if isinstance(llm, dict) else ""
+    horizon_reason = llm.get("horizon_reason") if isinstance(llm, dict) else None
+    conf = llm.get("confidence")
+    reason_text = (llm.get("reason") or llm_reason or "").strip()
 
-    # Tech snapshot
-    rsi = _fmt_num(f.get("rsi14"), 1)
+    s_fmt = _fmt_num(strike, 0)
+    header = f"{hdr_decision} – {sym} {s_fmt}{right} ({_fmt_num(dte, 0)} DTE, {expiry})"
+
+    bias_line = ""
+    if horizon:
+        bias_short = _first_sentence(horizon_reason or "", max_len=80)
+        bias_line = f"Bias: {horizon}" + (f" ({bias_short})" if bias_short else "")
+
+    summary_line = ""
+    if reason_text:
+        lines = [ln for ln in reason_text.splitlines() if ln.strip()]
+        narrative = ""
+        for i, ln in enumerate(lines):
+            if ln.startswith("🕒 Suggested trade"):
+                if i + 1 < len(lines):
+                    narrative = lines[i + 1].strip()
+                break
+        if not narrative:
+            narrative = _first_sentence(reason_text, max_len=180)
+        if narrative:
+            summary_line = _first_sentence(narrative, max_len=180)
+
+    setup_bits = _pick_factor_lines_from_reason(reason_text)
+    setup_line = ""
+    if setup_bits:
+        cleaned = []
+        for s in setup_bits:
+            s2 = s
+            if s2.startswith("[") and "] " in s2:
+                s2 = s2.split("] ", 1)[1]
+            cleaned.append(s2)
+        setup_line = "Setup: " + "; ".join(cleaned)
+
+    # ===== NEW: Technicals line (RSI, MACD, EMAs, VWAP, ORB) =====
+    def _fmt_opt(n, nd=2):
+        return _fmt_num(n, nd=nd, dash="—")
+
+    rsi = f.get("rsi14")
     ema20 = f.get("ema20"); ema50 = f.get("ema50"); ema200 = f.get("ema200")
-    ema_stack = None
-    try:
-        if all(isinstance(x, (int, float)) for x in (ema20, ema50, ema200)):
-            if ema20 > ema50 > ema200:
-                ema_stack = "EMA20>50>200 (bullish)"
-            elif ema20 < ema50 < ema200:
-                ema_stack = "EMA20<50<200 (bearish)"
-    except Exception:
-        pass
-    macd_hist = f.get("macd_hist")
-    macd_tag = "MACD hist +" if isinstance(macd_hist, (int,float)) and macd_hist > 0 else ("MACD hist -" if isinstance(macd_hist, (int,float)) else None)
+    macd_l = f.get("macd_line"); macd_s = f.get("macd_signal"); macd_h = f.get("macd_hist")
+    vwap_val = f.get("vwap_rth") if f.get("vwap_rth") is not None else f.get("vwap")
+    orb_hi = f.get("orb15_high"); orb_lo = f.get("orb15_low")
 
-    # Context
-    svr = llm.get("short_vol_ratio") or f.get("short_vol_ratio") or None
-    svr_s = _fmt_pct(float(svr)*100 if (isinstance(svr,(int,float)) and svr<=1) else svr, 0) if svr is not None else "-"
+    tech_chunks = []
+    if isinstance(rsi, (int, float)):
+        tech_chunks.append(f"RSI {round(rsi):d}")
+    if isinstance(macd_l, (int, float)) and isinstance(macd_s, (int, float)):
+        cross = "L>S" if macd_l > macd_s else ("L<S" if macd_l < macd_s else "L=S")
+        hist_tag = None
+        if isinstance(macd_h, (int, float)):
+            hist_tag = f"{'+' if macd_h>0 else ''}{_fmt_opt(macd_h, 2)}"
+        tech_chunks.append(f"MACD {cross}" + (f" ({hist_tag})" if hist_tag is not None else ""))
+    # Compact EMA triple if present
+    if any(isinstance(x, (int,float)) for x in (ema20, ema50, ema200)):
+        tech_chunks.append(f"EMA20/50/200 {_fmt_opt(ema20,2)}/{_fmt_opt(ema50,2)}/{_fmt_opt(ema200,2)}")
+    if isinstance(vwap_val, (int, float)):
+        tech_chunks.append(f"VWAP {_fmt_opt(vwap_val,2)}")
+    if isinstance(orb_hi, (int,float)) or isinstance(orb_lo, (int,float)):
+        tech_chunks.append(f"ORB {_fmt_opt(orb_hi,2)}/{_fmt_opt(orb_lo,2)}")
 
-    # NBBO line
-    bid = _fmt_num(f.get("bid"), 4)
-    ask = _fmt_num(f.get("ask"), 4)
-    mid = _fmt_num(f.get("mid"), 4)
-    spread = _fmt_pct(f.get("option_spread_pct"), 2)
+    tech_line = "Tech: " + (" • ".join(tech_chunks) if tech_chunks else "—")
+
+    # Liquidity & context
+    oi = f.get("oi"); vol = f.get("vol")
+    liq_line = f"Liquidity: OI { _fmt_num(oi, 0, dash='?') } / Vol { _fmt_num(vol, 0, dash='?') }"
+
+    svr = f.get("short_volume_ratio")
+    if svr is None:
+        svr_disp = "—"
+    else:
+        try:
+            val = float(svr)
+            if 0 <= val <= 1.0:
+                val *= 100.0
+            svr_disp = _fmt_pct(val, 0)
+        except Exception:
+            svr_disp = "—"
+    ctx_line = f"Context: SVR {svr_disp}"
+
+    # Quotes (NBBO)
+    spread_pct = f.get("option_spread_pct")
     qage = f.get("quote_age_sec")
-    age_s = (f"{int(qage)}s" if isinstance(qage, (int, float)) and qage >= 0 else "n/a")
-    provider = f.get("nbbo_provider")
-    synth = bool(f.get("synthetic_nbbo_used"))
-    if synth and not provider:
-        provider = "synthetic"
-    nbbo_hdr = f"NBBO: {bid}/{ask} mid {mid} • spread {spread} • age {age_s}"
+    provider = f.get("nbbo_provider") or ("polygon:snapshot" if f.get("bid") is not None or f.get("ask") is not None else None)
+    quotes_bits = []
+    if f.get("bid") is not None and f.get("ask") is not None:
+        quotes_bits.append(f"{_fmt_num(f.get('bid'))}/{_fmt_num(f.get('ask'))} mid {_fmt_num(f.get('mid'))}")
+    else:
+        quotes_bits.append("-/- mid " + _fmt_num(f.get('mid')))
+    if spread_pct is not None:
+        quotes_bits.append(f"spread {_fmt_pct(spread_pct, 2)}")
+    if isinstance(qage, (int, float)):
+        quotes_bits.append(f"age {int(qage)}s")
     if provider:
-        nbbo_hdr += f" • {provider}"
+        quotes_bits.append(provider)
+    quotes_line = "NBBO: " + " • ".join(quotes_bits)
 
-    # Bias
-    bias = (llm.get("bias") or ("INTRADAY" if isinstance(f.get("dte"), (int,float)) and f.get("dte") <= 5 else "SWING")).upper()
+    conf_line = f"Confidence: { _fmt_num(conf, 2, dash='—') }"
+    sr_line = ""
+    if score is not None or rating is not None:
+        sr_line = f"Score: { _fmt_num(score, 2, dash='—') }"
+        if rating:
+            sr_line += f" | Rating: {rating}"
 
-    tech_bits = []
-    if ema_stack: tech_bits.append(ema_stack)
-    if rsi != "-": tech_bits.append(f"RSI {rsi}")
-    if macd_tag: tech_bits.append(macd_tag)
-    tech_line = " | ".join(tech_bits) if tech_bits else "—"
+    appendix = diff_note.strip()
+    if appendix:
+        appendix = "\n" + appendix
 
-    # VWAP / ORB hints (only show if present)
-    vwap_s = _fmt_num(f.get("vwap"), 2)
-    orb_hi = _fmt_num(f.get("orb15_high"), 2)
-    orb_lo = _fmt_num(f.get("orb15_low"), 2)
-    vwap_part = f"VWAP {vwap_s}" if vwap_s != "-" else "VWAP —"
-    orb_part = f"ORB {orb_lo}-{orb_hi}" if (orb_lo != "-" and orb_hi != "-") else "ORB —"
-
-    # Adjustments
-    adj_line = _compact_adjustments(diff_note)
-
-    # Header
-    header = f"{decision} – {sym} {_fmt_num(strike, 2)}{sideL} ({dte_lbl}, {exp})"
-
-    # Shortened reason
-    reason = (llm.get("reason") or llm_reason or "").strip().replace("\n", " ")
-    if len(reason) > 220:
-        reason = reason[:217] + "…"
-
-    lines = [
+    out_lines = [
         header,
-        f"Bias: {bias}" + (" • ⚠️ 0DTE" if dte_lbl == "0DTE" else ""),
-        (reason if reason else None),
-        f"Tech: {tech_line}",
-        f"Context: SVR {svr_s} • {vwap_part} • {orb_part}",
-        f"Liquidity: OI {oi_s} / Vol {vol_s}",
-        f"{nbbo_hdr}",
-        f"Confidence: {conf_s} | Score: {score_s} | Rating: {rating_s}",
-        (adj_line if adj_line else None),
+        bias_line or None,
+        "🕒 Suggested trade: " + (horizon or "—") + (f" — {summary_line}" if summary_line else ""),
+        tech_line,            # <— NEW
+        liq_line,
+        ctx_line,
+        quotes_line,
+        conf_line + ((" | " + sr_line) if sr_line else ""),
+        appendix or None,
     ]
-    return "\n".join([ln for ln in lines if ln and ln.strip()])
+    return "\n".join([ln for ln in out_lines if ln])
+
 
 def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
     if res is None:
