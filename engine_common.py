@@ -203,32 +203,38 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
 # =========================
 # Telegram composition (compact)
 # =========================
-def _fmt_num(x, nd=2):
+def _fmt_num(x, nd: int = 2, dash: str = "-"):
+    """
+    Format number with nd decimals. If x is None/NaN/inf, return `dash`.
+    Accepts a custom dash to support typographic '—' or '?' placeholders.
+    """
     try:
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return "-"
+        if x is None:
+            return dash
         v = float(x)
-        if abs(v - round(v)) < 1e-9:
+        if math.isnan(v) or math.isinf(v):
+            return dash
+        if abs(v - round(v)) < 1e-9 and nd == 0:
             return str(int(round(v)))
         return f"{v:.{nd}f}"
     except Exception:
-        return "-"
+        return dash
 
-def _fmt_int(x):
+def _fmt_int(x, dash: str = "-"):
     try:
         if x is None:
-            return "-"
+            return dash
         return f"{int(x):,}"
     except Exception:
-        return "-"
+        return dash
 
-def _fmt_pct(x, nd=2):
+def _fmt_pct(x, nd=2, dash: str = "-"):
     try:
         if x is None:
-            return "-"
+            return dash
         return f"{float(x):.{nd}f}%"
     except Exception:
-        return "-"
+        return dash
 
 def _dte_label(expiry_iso: str, now_dt: Optional[datetime] = None) -> str:
     now_dt = now_dt or market_now()
@@ -267,7 +273,6 @@ def _compact_adjustments(diff_note: str) -> str:
         parts.append(s)
     return "Adj: " + " • ".join(parts)
 
-
 def _first_sentence(text: str, max_len: int = 80) -> str:
     """
     Return the first sentence-ish fragment (up to max_len).
@@ -276,7 +281,6 @@ def _first_sentence(text: str, max_len: int = 80) -> str:
     s = (text or "").strip()
     if not s:
         return ""
-    # Try to cut at period/question/exclamation
     for sep in [". ", "? ", "! "]:
         if sep in s:
             s = s.split(sep, 1)[0]
@@ -320,8 +324,6 @@ def _pick_factor_lines_from_reason(reason_text: str, max_lines: int = 3) -> List
     for l in lines[:max_lines]:
         out.append(l if len(l) <= 96 else (l[:95].rstrip() + "…"))
     return out
-
-
 
 def compose_telegram_text(
     alert: Dict[str, Any],
@@ -388,7 +390,7 @@ def compose_telegram_text(
             cleaned.append(s2)
         setup_line = "Setup: " + "; ".join(cleaned)
 
-    # ===== NEW: Technicals line (RSI, MACD, EMAs, VWAP, ORB) =====
+    # ===== Technicals line (RSI, MACD, EMAs, VWAP, ORB) =====
     def _fmt_opt(n, nd=2):
         return _fmt_num(n, nd=nd, dash="—")
 
@@ -407,7 +409,6 @@ def compose_telegram_text(
         if isinstance(macd_h, (int, float)):
             hist_tag = f"{'+' if macd_h>0 else ''}{_fmt_opt(macd_h, 2)}"
         tech_chunks.append(f"MACD {cross}" + (f" ({hist_tag})" if hist_tag is not None else ""))
-    # Compact EMA triple if present
     if any(isinstance(x, (int,float)) for x in (ema20, ema50, ema200)):
         tech_chunks.append(f"EMA20/50/200 {_fmt_opt(ema20,2)}/{_fmt_opt(ema50,2)}/{_fmt_opt(ema200,2)}")
     if isinstance(vwap_val, (int, float)):
@@ -466,7 +467,7 @@ def compose_telegram_text(
         header,
         bias_line or None,
         "🕒 Suggested trade: " + (horizon or "—") + (f" — {summary_line}" if summary_line else ""),
-        tech_line,            # <— NEW
+        tech_line,
         liq_line,
         ctx_line,
         quotes_line,
