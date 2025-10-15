@@ -1,8 +1,7 @@
-# telegram_client.py
 from __future__ import annotations
 
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import httpx
 
@@ -24,7 +23,7 @@ async def send_telegram(text: str) -> Optional[Dict[str, Any]]:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
+        "parse_mode": "HTML",  # safe markup for bold/links
         "disable_web_page_preview": True,
     }
 
@@ -35,3 +34,47 @@ async def send_telegram(text: str) -> Optional[Dict[str, Any]]:
             return resp.json()
     except Exception as e:
         return {"error": str(e)}
+
+
+# ==========================
+# Perplexity-aware formatter
+# ==========================
+
+def append_perplexity_context(base_text: str, px_ctx: Optional[Dict[str, Any]]) -> str:
+    """
+    Append Perplexity (Sonar/Search) insights to a Telegram alert body.
+    - px_ctx["sonar_iv_verdict"]: True/False/None
+    - px_ctx["sonar_iv_view"]: short text answer
+    - px_ctx["sonar_citations"]: list of URLs
+    - px_ctx["news_catalysts"]: list of dicts with title/url
+    """
+    if not px_ctx:
+        return base_text
+
+    verdict = px_ctx.get("sonar_iv_verdict")
+    if verdict is True:
+        iv_txt = "IV↑ likely"
+    elif verdict is False:
+        iv_txt = "IV↓ likely"
+    else:
+        iv_txt = "IV neutral/unclear"
+
+    cite = None
+    if isinstance(px_ctx.get("sonar_citations"), list) and px_ctx["sonar_citations"]:
+        cite = px_ctx["sonar_citations"][0]
+    src = f' <a href="{cite}">[src]</a>' if cite else ""
+
+    body = base_text + f"\nNews: {iv_txt} (Sonar){src}"
+
+    catalysts: List[Dict[str, Any]] = px_ctx.get("news_catalysts") or []
+    if catalysts:
+        top = catalysts[0]
+        title = top.get("title") or ""
+        url = top.get("url") or ""
+        if title:
+            if url:
+                body += f'\nTop catalyst: <a href="{url}">{title}</a>'
+            else:
+                body += f"\nTop catalyst: {title}"
+
+    return body
