@@ -38,3 +38,19 @@ class WebhookResponse(BaseModel):
     quota: Dict[str, Any]
     telegram: Dict[str, Any]
     notes: str
+class DecisionScores(BaseModel):
+buy: float
+sell: float
+ news_catalyst: float = 0.0
+
+class CatalystEvidence(BaseModel):
+ title: str
+ url: str
+ published: Optional[str] = None
+ snippet: Optional[str] = None
+
+class PerplexitySignalContext(BaseModel):
+ news_catalysts: List[CatalystEvidence] = []
+ sonar_iv_view: Optional[str] = None
+ sonar_iv_verdict: Optional[bool] = None
+ sonar_citations: List[str] = []
