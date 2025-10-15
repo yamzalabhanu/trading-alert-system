@@ -1,8 +1,11 @@
-# scoring.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
+
+# ==========
+# Utilities
+# ==========
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
@@ -36,6 +39,10 @@ def _dte_band_ok(dte: Optional[float]) -> Optional[bool]:
         return None
     return 7.0 <= dte <= 21.0
 
+
+# ===============================================
+# Core score (unchanged behavior; 0..1 BUY score)
+# ===============================================
 
 def compute_decision_score(features: Dict[str, Any], llm: Dict[str, Any]) -> float:
     """
@@ -94,6 +101,58 @@ def compute_decision_score(features: Dict[str, Any], llm: Dict[str, Any]) -> flo
 
     return _clamp01(score)
 
+
+# =======================================================
+# News / Sonar boost (from Perplexity integration patch)
+# =======================================================
+
+def compute_news_catalyst_boost(
+    *,
+    sonar_verdict: Optional[bool],
+    catalysts: Optional[List[Any]],
+    max_total_boost: float = 0.10,
+) -> float:
+    """
+    Returns an additive boost in [0..max_total_boost].
+    - +0.05 if Sonar says IV is likely to rise (sonar_verdict=True).
+    - +0.01 per catalyst headline found, capped at +0.05.
+    Overall boost capped by max_total_boost (default 0.10).
+    """
+    boost = 0.0
+
+    # Sonar IV view: True => likely IV↑
+    if sonar_verdict is True:
+        boost += 0.05
+
+    # Number of credible catalysts (titles/urls from Search API)
+    n = len(catalysts or [])
+    if n > 0:
+        boost += min(0.05, 0.01 * n)
+
+    return min(max_total_boost, max(0.0, boost))
+
+
+def apply_news_boost(
+    base_score: float,
+    *,
+    sonar_verdict: Optional[bool],
+    catalysts: Optional[List[Any]],
+    max_total_boost: float = 0.10,
+) -> float:
+    """
+    Apply the news-catalyst boost (light-touch) to the base score and clamp to [0..1].
+    """
+    boost = compute_news_catalyst_boost(
+        sonar_verdict=sonar_verdict,
+        catalysts=catalysts,
+        max_total_boost=max_total_boost,
+    )
+    return _clamp01(base_score + boost)
+
+
+# ==========================================
+# Rating mapping (unchanged semantics)
+# ==========================================
 
 def map_score_to_rating(score: Optional[float], decision: Optional[str]) -> Optional[str]:
     """
