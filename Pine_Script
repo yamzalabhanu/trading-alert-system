@@ -1,0 +1,510 @@
+//@version=6
+indicator("Ultimate Options Alert System v7.8 [Webhook+JSON+Backend Overlay+ORB15]", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ===== INPUTS =====
+// Webhook (info only; set actual URL in the alert dialog)
+webhookUrl = input.string("https://trading-alert-system.onrender.com/webhook", "Webhook URL (info only)")
+
+// Core Settings
+emaFastLen      = input.int(9,  "Fast EMA Length", minval=1)
+emaSlowLen      = input.int(21, "Slow EMA Length", minval=1)
+rsiLen          = input.int(14, "RSI Length", minval=1)
+adxLen          = input.int(14, "ADX Length", minval=1)
+volMult         = input.float(3, "Unusual Volume Multiplier", minval=1.0, maxval=3.0)
+atrPeriod       = input.int(14, "ATR Period", minval=1)
+retestLookback  = input.int(5,  "Retest Lookback Bars", minval=1, maxval=5)
+
+// Multi-Timeframe Settings
+mtfRes1 = input.timeframe("15", "Primary MTF Resolution")
+mtfRes2 = input.timeframe("60", "Secondary MTF Resolution")
+confirmOnClose  = input.bool(true, "Confirm on bar close (reduces repaint)")
+
+// Market Regime
+marketTicker = input.symbol("SPY", "Market Proxy (plan-safe)")
+regimeTF     = input.timeframe("60", "Regime TF")
+
+// Advanced Filters
+useVwmacd       = input.bool(true,  "Use VW-MACD (on VWAP)")
+useObv          = input.bool(true,  "Use OBV Breakouts")
+useSqueeze      = input.bool(true,  "Use Bollinger Squeeze")
+useKeltner      = input.bool(true,  "Use Keltner Fades")
+usePOC          = input.bool(false, "Use Volume POC")
+useMLfilter     = input.bool(true,  "Use Smart Confirmation (score gate)")
+useUOF          = input.bool(true,  "Simulate UOF Filter")
+useMTF          = input.bool(true,  "Use Multi-Timeframe Confirmation")
+requireMTF      = input.bool(false, "Require MTF Confirmation")
+useTrendline    = input.bool(true,  "Use Trendline Patterns")
+trendFilter     = input.bool(true,  "Gate by Market Regime")
+
+// Alert & Risk Settings
+minScore        = input.int(5, "Minimum Confirmation Score", minval=1, maxval=9)
+minScoreDiff    = input.int(5, "Minimum Score Difference", minval=1, maxval=9)
+requireVolume   = input.bool(true, "Require Unusual Volume")
+baseAdxThresh   = input.int(25, "Base ADX Strength", minval=0, maxval=50)
+signalCooldown  = input.int(50, "Cooldown (bars) between signals", minval=0, maxval=200)
+riskATR         = input.float(1.5, "Stop ATR", step=0.1)
+rr              = input.float(2.0, "RR target", step=0.1)
+
+// Display Settings
+showSignals     = input.bool(true,  "Show Signals")
+showSupertrend  = input.bool(false, "Show Supertrend")
+showORBLevels   = input.bool(true,  "Show ORB 45m Levels")
+showORB15       = input.bool(true,  "Show ORB 15m Levels")
+showPrevDay     = input.bool(true,  "Show Prev Day Levels")
+showPremarket   = input.bool(true,  "Show Premarket Levels")
+showFiveDay     = input.bool(true,  "Show 5-Day Levels")
+showStats       = input.bool(true,  "Show Stats Box")
+debugQA         = input.bool(false, "Show Debug JSON in Data Window")
+
+// Preset profile (knob remaps)
+profile = input.string("Stock", "Preset", options=["Stock","ETF","SmallCap"])
+volMultAdj = profile == "SmallCap" ? volMult * 1.3 : profile == "ETF" ? volMult * 0.8 : volMult
+
+// ===== BACKEND FEEDBACK OVERLAY (optional, manual paste from backend) =====
+bk_enabled      = input.bool(true,  "Backend Feedback Overlay")
+bk_nbbo_ok      = input.bool(false, "BK NBBO OK")
+bk_spread_pct   = input.float(0.0,  "BK Spread %", step=0.01)
+bk_oi           = input.int(0,      "BK Open Interest")
+bk_iv           = input.float(0.0,  "BK IV", step=0.001)
+bk_delta        = input.float(0.0,  "BK Δ",  step=0.001)
+bk_gamma        = input.float(0.0,  "BK Γ",  step=0.001)
+bk_theta        = input.float(0.0,  "BK Θ",  step=0.001)
+bk_vega         = input.float(0.0,  "BK ν",  step=0.001)
+bk_quote_age_s  = input.int(0,      "BK Quote age (s)")
+// Gate thresholds for visual verdict
+gate_spread_max = input.float(10.0, "Gate: max spread %", step=0.1)
+gate_oi_min     = input.int(100,    "Gate: min OI")
+gate_age_max_s  = input.int(10,     "Gate: max quote age (s)")
+
+bk_spread_ok = not bk_enabled or (bk_spread_pct <= gate_spread_max)
+bk_oi_ok     = not bk_enabled or (bk_oi >= gate_oi_min)
+bk_age_ok    = not bk_enabled or (bk_quote_age_s == 0 or bk_quote_age_s <= gate_age_max_s)
+bk_gates_ok  = (not bk_enabled) or (bk_nbbo_ok and bk_spread_ok and bk_oi_ok and bk_age_ok)
+
+// ===== CORE SERIES =====
+vwap    = ta.vwap(hlc3)
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+atr     = ta.atr(atrPeriod)
+vol20   = ta.sma(volume, 20)
+unusualVol = volume > vol20 * volMultAdj
+atrPct  = atr / close
+
+// DMI (symbol)
+[plusDI, minusDI, adxValue] = ta.dmi(adxLen, adxLen)
+
+// Supertrend
+[supertrend, dir] = ta.supertrend(3, atrPeriod)
+
+// ===== IMPROVED VW-MACD (on VWAP) =====
+vw     = vwap
+vwFast = ta.ema(vw, 12)
+vwSlow = ta.ema(vw, 26)
+vwmacd = vwFast - vwSlow
+vwmacdSignal = ta.ema(vwmacd, 9)
+vwmacdCrossUp = ta.crossover(vwmacd, vwmacdSignal)
+vwmacdCrossDn = ta.crossunder(vwmacd, vwmacdSignal)
+vwmacdBullish = useVwmacd and vwmacdCrossUp
+vwmacdBearish = useVwmacd and vwmacdCrossDn
+
+// ===== OBV Breakouts =====
+obvSeries   = ta.cum(close > close[1] ? volume : close < close[1] ? -volume : 0)
+obvHigh     = ta.highest(obvSeries, 20)
+obvLow      = ta.lowest(obvSeries, 20)
+obvCrossHi  = ta.crossover(obvSeries, obvHigh) or ta.crossover(obvSeries, obvHigh[1])
+obvCrossLo  = ta.crossunder(obvSeries, obvLow) or ta.crossunder(obvSeries, obvLow[1])
+obvBreakout  = useObv and obvCrossHi
+obvBreakdown = useObv and obvCrossLo
+
+// ===== Bollinger Squeeze =====
+basis   = ta.sma(close, 20)
+dev     = ta.stdev(close, 20)
+upperBB = basis + 2 * dev
+lowerBB = basis - 2 * dev
+rangeBB = upperBB - lowerBB
+squeeze = rangeBB < ta.atr(14) * 1.2
+rsiValue    = ta.rsi(close, rsiLen)
+squeezeBuy  = useSqueeze and squeeze and rsiValue < 40
+squeezeSell = useSqueeze and squeeze and rsiValue > 60
+
+// ===== Keltner =====
+keltnerMiddle = ta.ema(close, 20)
+keltnerUpper  = keltnerMiddle + 1.5 * ta.atr(14)
+keltnerLower  = keltnerMiddle - 1.5 * ta.atr(14)
+rsiCross30    = ta.crossover(rsiValue, 30)
+rsiCross70dn  = ta.crossunder(rsiValue, 70)
+keltnerBuy    = useKeltner and (close < keltnerLower or close[1] < keltnerLower[1]) and (rsiCross30 or rsiValue > 25)
+keltnerSell   = useKeltner and (close > keltnerUpper or close[1] > keltnerUpper[1]) and (rsiCross70dn or rsiValue < 75)
+
+// ===== UOF (proxy) =====
+uofBullish = useUOF ? ((volume > vol20 * 2.0 and close > open * 1.01) or (volume > vol20 * 1.5)) : true
+uofBearish = useUOF ? ((volume > vol20 * 2.0 and close < open * 0.99) or (volume > vol20 * 1.5)) : true
+
+// ===== Trendline Patterns (lightweight) =====
+linreg     = ta.linreg(close, 20, 0)
+trendUp    = close > linreg and linreg >= linreg[1]
+trendDown  = close < linreg and linreg <= linreg[1]
+highs20  = ta.highest(high, 20)
+lows20   = ta.lowest(low, 20)
+middle20 = math.avg(highs20, lows20)
+
+var bool wedgeUp   = false
+var bool wedgeDown = false
+if bar_index > 40
+    hlPattern  = (low > low[2] or low > low[3]) and (low[2] > low[4] or low[2] > low[5])
+    lhPattern  = (high < high[2] or high < high[3]) and (high[2] < high[4] or high[2] < high[5])
+    wedgeUp   := useTrendline and hlPattern and not lhPattern and close > middle20
+    wedgeDown := useTrendline and lhPattern and not hlPattern and close < middle20
+
+// ===== Volume POC (rough) =====
+var float[] dailyPOCs   = array.new_float()
+var float[] dailyDeltas = array.new_float()
+newDay = ta.change(time("D")) != 0
+if newDay
+    pocPrice = 0.0
+    maxVol   = 0.0
+    delta    = 0.0
+    for idx = 0 to 100
+        bi = bar_index - idx
+        if bi < 0
+            break
+        v = volume[idx]
+        c = close[idx]
+        o = open[idx]
+        if v > maxVol
+            maxVol := v
+            pocPrice := hl2[idx]
+        delta += c > o ? v : c < o ? -v : 0
+    array.unshift(dailyPOCs, pocPrice)
+    array.unshift(dailyDeltas, delta)
+    if array.size(dailyPOCs) > 5
+        array.pop(dailyPOCs)
+        array.pop(dailyDeltas)
+
+currentPOC   = array.size(dailyPOCs) > 0 ? array.get(dailyPOCs, 0) : na
+currentDelta = array.size(dailyDeltas) > 0 ? array.get(dailyDeltas, 0) : na
+pocBullish   = usePOC and not na(currentPOC) and close > currentPOC and nz(currentDelta, 0) > 0
+pocBearish   = usePOC and not na(currentPOC) and close < currentPOC and nz(currentDelta, 0) < 0
+
+// ===== ORB (session-aware) =====
+sess = input.session("0930-1600", "RTH Session")
+inRTH = not na(time(timeframe.period, sess))
+
+// ORB 45m (legacy)
+var float orbHigh = na
+var float orbLow  = na
+var bool  orbEstablished = false
+isFirst45 = hour == 9 and minute >= 30 or (hour == 10 and minute < 15)
+
+// ORB 15m (new)
+var float orb15High = na
+var float orb15Low  = na
+var bool  orb15Established = false
+isFirst15 = hour == 9 and minute >= 30 and minute < 45
+
+if newDay
+    orbHigh := high, orbLow := low, orbEstablished := false
+    orb15High := na, orb15Low := na, orb15Established := false
+else
+    // Build ORB 45m
+    if not orbEstablished and inRTH and isFirst45
+        orbHigh := math.max(nz(orbHigh, high), high)
+        orbLow  := math.min(nz(orbLow, low),   low)
+        if hour == 10 and minute >= 14
+            orbEstablished := true
+    // Build ORB 15m
+    if inRTH and isFirst15
+        orb15High := na(orb15High) ? high : math.max(orb15High, high)
+        orb15Low  := na(orb15Low)  ? low  : math.min(orb15Low,  low)
+    if not orb15Established and inRTH and (hour == 9 and minute == 45)
+        orb15Established := true
+
+// ===== Price Reference Levels =====
+prevHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+prevLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+premarketHigh = request.security(syminfo.tickerid, "15", high, lookahead=barmerge.lookahead_off)[1]
+premarketLow  = request.security(syminfo.tickerid, "15", low,  lookahead=barmerge.lookahead_off)[1]
+fiveDayHigh   = request.security(syminfo.tickerid, "D", ta.highest(high, 5), lookahead=barmerge.lookahead_off)[1]
+fiveDayLow    = request.security(syminfo.tickerid, "D", ta.lowest(low, 5),  lookahead=barmerge.lookahead_off)[1]
+
+// ===== Retest Conditions =====
+prevHighRetest = false
+prevLowRetest  = false
+premHighRetest = false
+premLowRetest  = false
+fiveDayHighRetest = false
+fiveDayLowRetest  = false
+for i = 1 to retestLookback
+    cond1 = low[i] <= prevHigh and (close[i] > prevHigh or high[i] > prevHigh) and close > prevHigh
+    cond2 = high[i] >= prevLow  and (close[i] < prevLow  or low[i]  < prevLow)  and close < prevLow
+    cond3 = low[i] <= premarketHigh and (close[i] > premarketHigh or high[i] > premarketHigh) and close > premarketHigh
+    cond4 = high[i] >= premarketLow  and (close[i] < premarketLow  or low[i]  < premarketLow)  and close < premarketLow
+    cond5 = low[i] <= fiveDayHigh and (close[i] > fiveDayHigh or high[i] > fiveDayHigh) and close > fiveDayHigh
+    cond6 = high[i] >= fiveDayLow  and (close[i] < fiveDayLow  or low[i]  < fiveDayLow)  and close < fiveDayLow
+    prevHighRetest   := prevHighRetest   or cond1
+    prevLowRetest    := prevLowRetest    or cond2
+    premHighRetest   := premHighRetest   or cond3
+    premLowRetest    := premLowRetest    or cond4
+    fiveDayHighRetest:= fiveDayHighRetest or cond5
+    fiveDayLowRetest := fiveDayLowRetest  or cond6
+
+// ===== MTF CONFIRM (HTF close-gated) =====
+[f1, s1, c1] = request.security(syminfo.tickerid, mtfRes1, [ta.ema(close, emaFastLen), ta.ema(close, emaSlowLen), barstate.isconfirmed], lookahead=barmerge.lookahead_off)
+[f2, s2, c2] = request.security(syminfo.tickerid, mtfRes2, [ta.ema(close, emaFastLen), ta.ema(close, emaSlowLen), barstate.isconfirmed], lookahead=barmerge.lookahead_off)
+mtfCrossUp   = (ta.crossover(f1, s1) or ta.crossover(f2, s2))
+mtfCrossDown = (ta.crossunder(f1, s1) or ta.crossunder(f2, s2))
+mtfAlignedUp = (f1 > s1) or (f2 > s2)
+mtfAlignedDn = (f1 < s1) or (f2 < s2)
+htfClosed    = c1 and c2
+
+// ===== MARKET REGIME (plan-safe) =====
+[mPlus, mMinus, mAdx] = request.security(marketTicker, regimeTF, ta.dmi(14,14), lookahead=barmerge.lookahead_off)
+mFast = request.security(marketTicker, regimeTF, ta.ema(close, 20), lookahead=barmerge.lookahead_off)
+mSlow = request.security(marketTicker, regimeTF, ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+mUp    = mFast > mSlow
+mDown  = mFast < mSlow
+mStrong= mAdx >= 20
+
+// ===== SIGNAL SCORING =====
+emaCrossUp   = ta.crossover(emaFast, emaSlow)
+emaCrossDown = ta.crossunder(emaFast, emaSlow)
+
+buyScore =
+     (emaCrossUp ? 1 : 0) +
+     (vwmacdBullish ? 1 : 0) +
+     (obvBreakout ? 1 : 0) +
+     (squeezeBuy ? 1 : 0) +
+     (keltnerBuy ? 1 : 0) +
+     (wedgeUp ? 1 : 0) +
+     (pocBullish ? 1 : 0) +
+     (trendUp ? 1 : 0) +
+     ((plusDI > minusDI) ? 1 : 0)
+
+sellScore =
+     (emaCrossDown ? 1 : 0) +
+     (vwmacdBearish ? 1 : 0) +
+     (obvBreakdown ? 1 : 0) +
+     (squeezeSell ? 1 : 0) +
+     (keltnerSell ? 1 : 0) +
+     (wedgeDown ? 1 : 0) +
+     (pocBearish ? 1 : 0) +
+     (trendDown ? 1 : 0) +
+     ((minusDI > plusDI) ? 1 : 0)
+
+baseBuy  = emaCrossUp or emaFast > emaSlow
+baseSell = emaCrossDown or emaFast < emaSlow
+
+// Adaptive ADX threshold vs ATR%
+dynAdx = math.round(baseAdxThresh + (atrPct * 100))  // +1 per 1% ATR
+needAdxBuy  = adxValue >= dynAdx
+needAdxSell = adxValue >= dynAdx
+
+mtfConfirmBuy  = useMTF ? (requireMTF ? (htfClosed and (mtfCrossUp or mtfAlignedUp)) : true) : true
+mtfConfirmSell = useMTF ? (requireMTF ? (htfClosed and (mtfCrossDown or mtfAlignedDn)) : true) : true
+volumeConfirm  = requireVolume ? unusualVol : true
+
+preBuyTrigger  = ((useMLfilter and buyScore  >= minScore) or (not useMLfilter and baseBuy)  or (prevHighRetest and needAdxBuy))  and volumeConfirm and uofBullish and mtfConfirmBuy
+preSellTrigger = ((useMLfilter and sellScore >= minScore) or (not useMLfilter and baseSell) or (prevLowRetest  and needAdxSell)) and volumeConfirm and uofBearish and mtfConfirmSell
+
+// Conflict resolution + tie-breaker by regime
+buyPref  = preBuyTrigger
+sellPref = preSellTrigger
+if preBuyTrigger and preSellTrigger
+    if buyScore - sellScore >= minScoreDiff
+        buyPref := true, sellPref := false
+    else if sellScore - buyScore >= minScoreDiff
+        buyPref := false, sellPref := true
+    else if trendFilter
+        buyPref := mUp and mStrong
+        sellPref := mDown and mStrong
+
+// Directional cooldown
+var int  lastBuyBar  = na
+var int  lastSellBar = na
+buyOk  = na(lastBuyBar)  or bar_index - lastBuyBar  >= signalCooldown
+sellOk = na(lastSellBar) or bar_index - lastSellBar >= signalCooldown
+
+buyTrigger  = false
+sellTrigger = false
+if buyPref and buyOk
+    buyTrigger := true
+    lastBuyBar := bar_index
+else if sellPref and sellOk
+    sellTrigger := true
+    lastSellBar := bar_index
+
+// Gate by market regime if enabled
+if trendFilter
+    buyTrigger  := buyTrigger  and (mUp   and mStrong)
+    sellTrigger := sellTrigger and (mDown and mStrong)
+
+// Confirm on close (final)
+buyTrigger  := buyTrigger  and (confirmOnClose ? barstate.isconfirmed : true)
+sellTrigger := sellTrigger and (confirmOnClose ? barstate.isconfirmed : true)
+
+// ===== STRIKE & EXPIRY HELPERS =====
+getStrikeStep(p) => p >= 200 ? 5.0 : p >= 75 ? 2.5 : p >= 25 ? 1.0 : 0.5
+getRoundedStrike() =>
+    step = getStrikeStep(close)
+    math.round(close / step) * step
+
+getExpiryString() =>
+    // Upcoming Friday (today if Friday)
+    dw = dayofweek
+    offset = dw <= dayofweek.friday ? (dayofweek.friday - dw) : (7 - (dw - dayofweek.friday))
+    expiryTs = timestamp(year, month, dayofmonth + offset)
+    str.format("{0,date,yyyy-MM-dd}", expiryTs)
+
+// Trade type inference (quiet tape → swing, else intraday)
+isSwing = (atrPct < 0.02) and (mUp or mDown)
+tradeType = isSwing ? "swing" : "intraday"
+
+// ===== RISK LINES =====
+longStop  = buyTrigger  ? close - atr * riskATR : na
+longTgt   = buyTrigger  ? close + atr * riskATR * rr : na
+shortStop = sellTrigger ? close + atr * riskATR : na
+shortTgt  = sellTrigger ? close - atr * riskATR * rr : na
+
+plot(longStop,  "Long Stop",  color=color.new(color.red,  30), style=plot.style_linebr)
+plot(longTgt,   "Long Tgt",   color=color.new(color.green,30), style=plot.style_linebr)
+plot(shortStop, "Short Stop", color=color.new(color.red,  30), style=plot.style_linebr)
+plot(shortTgt,  "Short Tgt",  color=color.new(color.green,30), style=plot.style_linebr)
+
+// ===== WEBHOOK ALERTS =====
+// Helper: boolean -> "true"/"false"
+b2s(b) =>
+    b ? "true" : "false"
+
+// JSON builder (no fragile line continuations)
+mkJson(_type, _price, _strike, _expiry, _tradeType) =>
+    // Pre-format numbers as strings where precision matters
+    _price_s   = str.tostring(_price, "#.####")
+    _strike_s  = str.tostring(_strike, "#.##")
+    _rsi_s     = str.tostring(rsiValue, "#.##")
+    _adx_s     = str.tostring(adxValue, "#.##")
+    _atrpct_s  = str.tostring(atrPct * 100, "#.##")
+    _vwap_s    = str.tostring(vwap, "#.####")
+    _buy_s     = str.tostring(buyScore)
+    _sell_s    = str.tostring(sellScore)
+    _mAdx_s    = str.tostring(mAdx, "#.##")
+    _spr_s     = str.tostring(bk_spread_pct, "#.##")
+    _oi_s      = str.tostring(bk_oi)
+    _iv_s      = str.tostring(bk_iv, "#.###")
+    _d_s       = str.tostring(bk_delta, "#.###")
+    _g_s       = str.tostring(bk_gamma, "#.###")
+    _t_s       = str.tostring(bk_theta, "#.###")
+    _v_s       = str.tostring(bk_vega, "#.###")
+    _qa_s      = str.tostring(bk_quote_age_s)
+
+    // NOTE: Double braces {{ }} to escape literal braces in str.format template
+    tmpl = "{{\"v\":\"1.3\",\"type\":\"{0}\",\"symbol\":\"{1}\",\"time\":{2},\"signal_id\":\"{1}:{3}:{0}\",\"price\":{4},\"strike\":{5},\"expiry\":\"{6}\",\"tradeType\":\"{7}\",\"rsi\":{8},\"adx\":{9},\"atrPct\":{10},\"buyScore\":{11},\"sellScore\":{12},\"mtfReq\":{13},\"mtfUsed\":{14},\"regime\":{{\"up\":{15},\"down\":{16},\"adx\":{17}}},\"orb\":{{\"established45\":{18},\"established15\":{19}}},\"vwap\":{20},\"bk\":{{\"enabled\":{21},\"nbbo_ok\":{22},\"spread_pct\":{23},\"oi\":{24},\"iv\":{25},\"delta\":{26},\"gamma\":{27},\"theta\":{28},\"vega\":{29},\"quote_age_s\":{30},\"gates_ok\":{31}}}}}"
+
+    str.format(tmpl,_type,syminfo.ticker,time,bar_index,_price_s,_strike_s,_expiry,_tradeType,_rsi_s,_adx_s,_atrpct_s,_buy_s,_sell_s,b2s(requireMTF),b2s(useMTF),b2s(mUp),b2s(mDown),_mAdx_s,b2s(orbEstablished),b2s(orb15Established),_vwap_s,b2s(bk_enabled),b2s(bk_nbbo_ok),_spr_s,_oi_s,_iv_s,_d_s,_g_s,_t_s,_v_s,_qa_s,b2s(bk_gates_ok))
+
+
+if buyTrigger
+    strike = getRoundedStrike()
+    expiry = getExpiryString()
+    msgJS = mkJson("CALL", close, strike, expiry, tradeType)
+    alert(msgJS, alert.freq_once_per_bar_close)
+
+if sellTrigger
+    strike = getRoundedStrike()
+    expiry = getExpiryString()
+    msgJS = mkJson("PUT", close, strike, expiry, tradeType)
+    alert(msgJS, alert.freq_once_per_bar_close)
+
+// ===== BACKEND OVERLAY LABEL (fires on signal) =====
+mkGateText(ok) => ok ? "OK" : "FAIL"
+mkOverlayText(_side) => " " + _side + " " + syminfo.ticker + "\n" + "PX " + str.tostring(close, "#.##") + "  VWAP " + str.tostring(vwap, "#.##") + "\n" + (orb15Established ? "ORB15 " + str.tostring(orb15High, "#.##") + "/" + str.tostring(orb15Low, "#.##") + "\n" : "") + (orbEstablished ? "ORB45 " + str.tostring(orbHigh, "#.##") + "/" + str.tostring(orbLow, "#.##") + "\n" : "") + "RSI " + str.tostring(rsiValue, "#.0") + "  ADX " + str.tostring(adxValue, "#.0") + "  ATR% " + str.tostring(atrPct*100, "#.1") + "\n" + (bk_enabled ? ("NBBO " + mkGateText(bk_nbbo_ok) + "  Spr% " + str.tostring(bk_spread_pct, "#.2") + " " + mkGateText(bk_spread_ok) + "\n" + "OI " + str.tostring(bk_oi) + " " + mkGateText(bk_oi_ok) + "  Age " + str.tostring(bk_quote_age_s) + "s " + mkGateText(bk_age_ok) + "\n" + "IV " + str.tostring(bk_iv, "#.3") + "  Δ " + str.tostring(bk_delta, "#.3") + " Γ " + str.tostring(bk_gamma, "#.3") + " Θ " + str.tostring(bk_theta, "#.3") + " ν " + str.tostring(bk_vega, "#.3") + "\n" + "GATES: " + mkGateText(bk_gates_ok)) : "BK: OFF")
+
+
+var label sigLbl = na
+if buyTrigger or sellTrigger
+    if not na(sigLbl)
+        label.delete(sigLbl)
+    txt = mkOverlayText(buyTrigger ? "CALL" : "PUT")
+    sigLbl := label.new(bar_index, high, txt, xloc.bar_index, yloc.abovebar, style=label.style_label_up, textcolor=color.white, color=bk_enabled ? (bk_gates_ok ? color.new(color.green, 20) : color.new(color.red, 10)) : color.new(color.blue, 20), size=size.normal)
+
+
+// ===== HEADS-UP SPIKE / DIP (optional) =====
+enableSpikeAlerts   = input.bool(false, "Enable Heads-Up Spike Alerts")
+spikeTF             = input.timeframe("1", "Spike TF (micro)")
+spikePct            = input.float(0.3, "Spike threshold %", step=0.1, minval=0.1)
+spikeVolMult        = input.float(1.5, "Spike Volume x SMA(10)", step=0.1, minval=1.0)
+spikeWindowBars     = input.int(3, "Spike window (bars on Spike TF)", minval=1, maxval=10)
+spikeCooldownBars   = input.int(10, "Spike cooldown (current TF bars)", minval=0, maxval=500)
+showSpikeMarkers    = input.bool(true, "Show Heads-Up Markers")
+
+[mClose, mOpen, mVol] = request.security(syminfo.tickerid, spikeTF, [close, open, volume], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+mVolSma10 = request.security(syminfo.tickerid, spikeTF, ta.sma(volume, 10), lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+// Z-score guard
+mVolMean  = request.security(syminfo.tickerid, spikeTF, ta.sma(volume, 50), lookahead=barmerge.lookahead_off)
+mVolStd   = request.security(syminfo.tickerid, spikeTF, ta.stdev(volume, 50), lookahead=barmerge.lookahead_off)
+volZ      = (mVol - mVolMean) / nz(mVolStd, 1)
+
+enoughMicro = not na(mClose[spikeWindowBars])
+rocUp   = mClose / nz(mClose[spikeWindowBars], mClose) - 1.0
+rocDown = 1.0 - mClose / nz(mClose[spikeWindowBars], mClose)
+volOk   = (mVol > mVolSma10 * spikeVolMult) and (volZ > 1.0)
+spikeUp   = enableSpikeAlerts and enoughMicro and volOk and (rocUp   >= spikePct / 100.0)
+spikeDown = enableSpikeAlerts and enoughMicro and volOk and (rocDown >= spikePct / 100.0)
+
+var int lastSpikeBar = na
+spikeCooldownOk = na(lastSpikeBar) or bar_index - lastSpikeBar >= spikeCooldownBars
+
+if barstate.isrealtime and spikeCooldownOk
+    if spikeUp
+        msg = "HEADS-UP SPIKE: " + syminfo.ticker + " +" + str.tostring(spikePct, "#.##") + "% in ~" + str.tostring(spikeWindowBars) + " " + spikeTF + " bars"
+        alert(msg, alert.freq_once_per_bar)
+        lastSpikeBar := bar_index
+    else if spikeDown
+        msg = "HEADS-UP DIP: " + syminfo.ticker + " −" + str.tostring(spikePct, "#.##") + "% in ~" + str.tostring(spikeWindowBars) + " " + spikeTF + " bars"
+        alert(msg, alert.freq_once_per_bar)
+        lastSpikeBar := bar_index
+
+plotshape(showSpikeMarkers and spikeUp,   title="Heads-Up Spike", style=shape.triangleup,   location=location.belowbar, color=color.new(color.yellow, 0), text="SPIKE", textcolor=color.black, size=size.tiny)
+plotshape(showSpikeMarkers and spikeDown, title="Heads-Up Dip",   style=shape.triangledown, location=location.abovebar, color=color.new(color.aqua, 0),   text="DIP",   textcolor=color.black, size=size.tiny)
+
+// ===== VISUALS =====
+plot(emaFast, "Fast EMA", color=color.new(#00FF00, 0), linewidth=2)
+plot(emaSlow, "Slow EMA", color=color.new(#FF0000, 0), linewidth=2)
+
+plotshape(buyTrigger and showSignals,  "Buy",  shape.labelup,   location.belowbar, color=color.new(#00B300, 0), text="BUY",  textcolor=color.white, size=size.normal)
+plotshape(sellTrigger and showSignals, "Sell", shape.labeldown, location.abovebar, color=color.new(#E00000, 0), text="SELL", textcolor=color.white, size=size.normal)
+
+bgcolor(unusualVol ? color.new(#0000FF, 89) : na)
+
+// ORB lines
+plot(showORBLevels and orbEstablished  ? orbHigh   : na, "ORB45 High", color=color.new(#00FF00, 50), style=plot.style_linebr)
+plot(showORBLevels and orbEstablished  ? orbLow    : na, "ORB45 Low",  color=color.new(#FF0000, 50), style=plot.style_linebr)
+plot(showORB15    and orb15Established ? orb15High : na, "ORB15 High", color=color.new(color.green, 15), style=plot.style_linebr)
+plot(showORB15    and orb15Established ? orb15Low  : na, "ORB15 Low",  color=color.new(color.red,   15), style=plot.style_linebr)
+
+// Prev-day
+plot(showPrevDay ? prevHigh : na, "Prev High", color=color.new(#00FF00, 50), style=plot.style_linebr)
+plot(showPrevDay ? prevLow  : na, "Prev Low",  color=color.new(#FF0000, 50), style=plot.style_linebr)
+
+// Supertrend
+plot(showSupertrend ? supertrend : na, "Supertrend", color=dir == 1 ? color.green : color.red, linewidth=2)
+
+// Stats box
+var table statsTable = table.new(position.top_right, 3, 7, bgcolor=color.new(#2D3E50, 90))
+if barstate.islast and showStats
+    table.cell(statsTable, 0, 0, "Fast EMA", text_color=color.white)
+    table.cell(statsTable, 1, 0, str.tostring(emaFast, format.mintick), text_color=color.green)
+    table.cell(statsTable, 0, 1, "Slow EMA", text_color=color.white)
+    table.cell(statsTable, 1, 1, str.tostring(emaSlow, format.mintick), text_color=color.red)
+    table.cell(statsTable, 0, 2, "RSI", text_color=color.white)
+    table.cell(statsTable, 1, 2, str.tostring(rsiValue, "#.00"), text_color=rsiValue > 70 ? color.red : rsiValue < 30 ? color.green : color.white)
+    table.cell(statsTable, 0, 3, "ADX", text_color=color.white)
+    table.cell(statsTable, 1, 3, str.tostring(adxValue, "#.00"), text_color=adxValue > baseAdxThresh ? color.blue : color.gray)
+    table.cell(statsTable, 0, 4, "ATR %", text_color=color.white)
+    table.cell(statsTable, 1, 4, str.tostring(atrPct*100, "#.##") + "%", text_color=color.white)
+    table.cell(statsTable, 0, 5, "Regime", text_color=color.white)
+    table.cell(statsTable, 1, 5, (mUp ? "UP" : mDown ? "DOWN" : "FLAT") + " / ADX " + str.tostring(mAdx, "#.0"), text_color=mUp ? color.green : mDown ? color.red : color.gray)
+    table.cell(statsTable, 0, 6, "BK Gates", text_color=color.white)
+    table.cell(statsTable, 1, 6, bk_enabled ? (bk_gates_ok ? "OK" : "FAIL") : "OFF", text_color=bk_enabled ? (bk_gates_ok ? color.green : color.red) : color.gray)
+
+// Debug preview in Data Window
+jsonPreview = debugQA ? mkJson("PREVIEW", close, getRoundedStrike(), getExpiryString(), tradeType) : ""
