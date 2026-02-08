@@ -44,6 +44,19 @@ trendFilter     = input.bool(true,  "Gate by Market Regime")
 // Alert & Risk Settings
 minScore        = input.int(5, "Minimum Confirmation Score", minval=1, maxval=9)
 minScoreDiff    = input.int(5, "Minimum Score Difference", minval=1, maxval=9)
+confluenceMin   = input.int(4, "Min directional confluence", minval=1, maxval=8)
+maxOpposingScore= input.int(3, "Max opposing score allowed", minval=0, maxval=9)
+requireStructureBreak = input.bool(true, "Require structure break (ORB/PDH/PDL/PM)")
+requireVwapSide = input.bool(true, "Require price on correct VWAP side")
+useSessionFilter = input.bool(true, "Session quality window filter")
+noTradeFirstMin = input.int(10, "No-trade first N minutes", minval=0, maxval=120)
+noTradeLastMin  = input.int(20, "No-trade last N minutes", minval=0, maxval=120)
+minAtrPctFilter = input.float(0.10, "Min ATR% filter", step=0.01)
+maxAtrPctFilter = input.float(4.00, "Max ATR% filter", step=0.10)
+avoidRsiExtremes = input.bool(true, "Avoid RSI exhaustion")
+rsiBuyMax = input.int(72, "Max RSI for CALL", minval=50, maxval=95)
+rsiSellMin = input.int(28, "Min RSI for PUT", minval=5, maxval=50)
+maxBodyAtr = input.float(1.20, "Max candle body / ATR", step=0.05)
 requireVolume   = input.bool(true, "Require Unusual Volume")
 baseAdxThresh   = input.int(25, "Base ADX Strength", minval=0, maxval=50)
 signalCooldown  = input.int(50, "Cooldown (bars) between signals", minval=0, maxval=200)
@@ -181,8 +194,6 @@ plot(pb_show_levels ? pb_rangeLow  : na, "PB Range Low",  color=color.new(color.
 plotshape(pb_short, style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.tiny, text="PB↓")
 plotshape(pb_long,  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.tiny, text="PB↑")
 
-alertcondition(pb_short, "Peek-a-Boo Short", "Peek-a-Boo SHORT trap detected")
-alertcondition(pb_long,  "Peek-a-Boo Long",  "Peek-a-Boo LONG trap detected")
 
 // VW-MACD on VWAP
 vw     = vwap
@@ -279,6 +290,7 @@ sess = input.session("0930-1600", "RTH Session")
 inRTH = not na(time(timeframe.period, sess))
 rthOpenTs = timestamp(syminfo.timezone, year, month, dayofmonth, 9, 30)
 minsFromOpen = (time - rthOpenTs) / 60000.0
+minsToClose = 390.0 - minsFromOpen
 
 isORB15 = inRTH and minsFromOpen >= 0 and minsFromOpen < 15
 isORB45 = inRTH and minsFromOpen >= 0 and minsFromOpen < 45
@@ -429,12 +441,51 @@ dynAdx = math.round(baseAdxThresh + (atrPct * 100))
 needAdxBuy  = adxValue >= dynAdx
 needAdxSell = adxValue >= dynAdx
 
+// Directional confluence and structural checks (reduce false positives)
+buyConfluence =
+     (emaFast > emaSlow ? 1 : 0) +
+     (vwmacd > vwmacdSignal ? 1 : 0) +
+     (plusDI > minusDI ? 1 : 0) +
+     (close > vwap ? 1 : 0) +
+     (mtfAlignedUp ? 1 : 0) +
+     (trendUp ? 1 : 0) +
+     (mUp ? 1 : 0) +
+     (adxValue >= dynAdx ? 1 : 0)
+
+sellConfluence =
+     (emaFast < emaSlow ? 1 : 0) +
+     (vwmacd < vwmacdSignal ? 1 : 0) +
+     (minusDI > plusDI ? 1 : 0) +
+     (close < vwap ? 1 : 0) +
+     (mtfAlignedDn ? 1 : 0) +
+     (trendDown ? 1 : 0) +
+     (mDown ? 1 : 0) +
+     (adxValue >= dynAdx ? 1 : 0)
+
+buyStructureOk = (prevHighRetest or fiveDayHighRetest or (orb15Established and close > orb15High) or (orbEstablished and close > orbHigh) or (not na(premarketHigh) and close > premarketHigh))
+sellStructureOk = (prevLowRetest or fiveDayLowRetest or (orb15Established and close < orb15Low) or (orbEstablished and close < orbLow) or (not na(premarketLow) and close < premarketLow))
+
+vwapSideBuyOk = not requireVwapSide or close >= vwap
+vwapSideSellOk = not requireVwapSide or close <= vwap
+confluenceBuyOk = buyConfluence >= confluenceMin
+confluenceSellOk = sellConfluence >= confluenceMin
+oppositionBuyOk = sellScore <= maxOpposingScore
+oppositionSellOk = buyScore <= maxOpposingScore
+structureBuyOk = not requireStructureBreak or buyStructureOk
+structureSellOk = not requireStructureBreak or sellStructureOk
+sessionWindowOk = (not useSessionFilter) or (inRTH and minsFromOpen >= noTradeFirstMin and minsToClose >= noTradeLastMin)
+atrRegimeOk = (atrPct * 100.0) >= minAtrPctFilter and (atrPct * 100.0) <= maxAtrPctFilter
+rsiBuyOk = not avoidRsiExtremes or (rsiValue <= rsiBuyMax)
+rsiSellOk = not avoidRsiExtremes or (rsiValue >= rsiSellMin)
+candleBodyAtr = atr > 0 ? (pb_body / atr) : 0.0
+candleExtensionOk = candleBodyAtr <= maxBodyAtr
+
 mtfConfirmBuy  = useMTF ? (requireMTF ? (htfClosed and (mtfCrossUp or mtfAlignedUp)) : true) : true
 mtfConfirmSell = useMTF ? (requireMTF ? (htfClosed and (mtfCrossDown or mtfAlignedDn)) : true) : true
 volumeConfirm  = requireVolume ? unusualVol : true
 
-preBuyTrigger  = ((useMLfilter and buyScore  >= minScore) or (not useMLfilter and baseBuy)  or (prevHighRetest and needAdxBuy))  and volumeConfirm and uofBullish and mtfConfirmBuy
-preSellTrigger = ((useMLfilter and sellScore >= minScore) or (not useMLfilter and baseSell) or (prevLowRetest  and needAdxSell)) and volumeConfirm and uofBearish and mtfConfirmSell
+preBuyTrigger  = ((useMLfilter and buyScore  >= minScore) or (not useMLfilter and baseBuy)  or (prevHighRetest and needAdxBuy))  and volumeConfirm and uofBullish and mtfConfirmBuy and confluenceBuyOk and oppositionBuyOk and structureBuyOk and vwapSideBuyOk and sessionWindowOk and atrRegimeOk and rsiBuyOk and candleExtensionOk
+preSellTrigger = ((useMLfilter and sellScore >= minScore) or (not useMLfilter and baseSell) or (prevLowRetest  and needAdxSell)) and volumeConfirm and uofBearish and mtfConfirmSell and confluenceSellOk and oppositionSellOk and structureSellOk and vwapSideSellOk and sessionWindowOk and atrRegimeOk and rsiSellOk and candleExtensionOk
 
 buyPref  = preBuyTrigger
 sellPref = preSellTrigger
@@ -484,6 +535,16 @@ if pb_on and pb_gateMode != "None"
 
 buyTrigger  := buyTrigger  and (confirmOnClose ? barstate.isconfirmed : true)
 sellTrigger := sellTrigger and (confirmOnClose ? barstate.isconfirmed : true)
+
+// Final conflict resolution: emit at most one directional alert on a bar
+if buyTrigger and sellTrigger
+    if buyConfluence > sellConfluence
+        sellTrigger := false
+    else if sellConfluence > buyConfluence
+        buyTrigger := false
+    else
+        buyTrigger := false
+        sellTrigger := false
 
 // =====================
 // Strike & expiry helpers
@@ -578,7 +639,6 @@ if sellTrigger
 // Make script visible in TradingView alert Condition list
 alertcondition(buyTrigger,  title="CALL Signal", message="CALL Signal: {{ticker}} at {{close}}")
 alertcondition(sellTrigger, title="PUT Signal",  message="PUT Signal: {{ticker}} at {{close}}")
-alertcondition(buyTrigger or sellTrigger, title="ANY Signal", message="UOAS SIGNAL {{ticker}} TF={{interval}} Close={{close}} Time={{time}}")
 
 // =====================
 // Backend overlay label (on signal)
@@ -642,11 +702,9 @@ var int lastSpikeBar = na
 spikeCooldownOk = na(lastSpikeBar) or bar_index - lastSpikeBar >= spikeCooldownBars
 
 if barstate.isrealtime and spikeCooldownOk
-    if spikeUp
-        alert("HEADS-UP SPIKE: " + syminfo.ticker + " +" + str.tostring(spikePct, "#.##") + "% in ~" + str.tostring(spikeWindowBars) + " " + spikeTF + " bars", alert.freq_once_per_bar)
-        lastSpikeBar := bar_index
-    else if spikeDown
-        alert("HEADS-UP DIP: " + syminfo.ticker + " -" + str.tostring(spikePct, "#.##") + "% in ~" + str.tostring(spikeWindowBars) + " " + spikeTF + " bars", alert.freq_once_per_bar)
+    if spikeUp or spikeDown
+        // Consolidated signal model: keep only CALL/PUT trade alerts.
+        // Spike/dip remains visual-only via markers.
         lastSpikeBar := bar_index
 
 plotshape(showSpikeMarkers and spikeUp,   title="Heads-Up Spike", style=shape.triangleup,   location=location.belowbar, color=color.new(color.yellow, 0), text="SPIKE", textcolor=color.black, size=size.tiny)
