@@ -10,23 +10,30 @@ from datetime import datetime, timezone, timedelta, date
 
 from fastapi import HTTPException, Request
 from config import CDT_TZ, MAX_LLM_PER_DAY
-from polygon_client import build_option_contract
 
 logger = logging.getLogger("trading_engine")
+
+
+def build_option_contract(symbol: str, expiry_iso: str, side: str, strike: float) -> str:
+    dt_ = datetime.fromisoformat(expiry_iso).date()
+    yy = dt_.year % 100
+    cp = "C" if str(side).upper().startswith("C") else "P"
+    strike_int = int(round(float(strike) * 1000))
+    return f"O:{symbol.upper()}{yy:02d}{dt_.month:02d}{dt_.day:02d}{cp}{strike_int:08d}"
 
 # =========================
 # Env / knobs
 # =========================
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+POLYGON_API_KEY = None  # Polygon integration removed
 
 def _env_truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
 
-IBKR_ENABLED = _env_truthy(os.getenv("IBKR_ENABLED", "0"))
-IBKR_DEFAULT_QTY = int(os.getenv("IBKR_DEFAULT_QTY", "1"))
-IBKR_TIF = os.getenv("IBKR_TIF", "DAY").upper()
-IBKR_ORDER_MODE = os.getenv("IBKR_ORDER_MODE", "auto").lower()   # auto | market | limit
-IBKR_USE_MID_AS_LIMIT = os.getenv("IBKR_USE_MID_AS_LIMIT", "1") == "1"
+IBKR_ENABLED = False  # IBKR integration removed
+IBKR_DEFAULT_QTY = 0
+IBKR_TIF = "DAY"
+IBKR_ORDER_MODE = "disabled"
+IBKR_USE_MID_AS_LIMIT = False
 
 # Trading thresholds (tunable)
 TARGET_DELTA_CALL = float(os.getenv("TARGET_DELTA_CALL", "0.35"))
