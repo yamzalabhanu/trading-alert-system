@@ -2,7 +2,7 @@
 // © byamzala
 
 //@version=6
-indicator("Peek-a-Boo Setup", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+indicator("Peek-a-Boo Setup (Full Filters + Tech EventWindow + S/R) v1.9", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
 
 // =====================
 // INPUTS
@@ -78,11 +78,40 @@ debugQA         = input.bool(false, "Show Debug JSON in Data Window")
 profile = input.string("Stock", "Preset", options=["Stock","ETF","SmallCap"])
 volMultAdj = profile == "SmallCap" ? volMult * 1.3 : profile == "ETF" ? volMult * 0.8 : volMult
 
-// Payload mode (faster webhook if Lite)
+// Payload mode
 payloadMode = input.string("Full", "Webhook Payload", options=["Lite","Full"])
 
-// NEW: Alert message output mode (matches screenshot)
-alertMsgMode = input.string("TEXT", "Alert Message Mode", options=["TEXT","JSON","TEXT+JSON"])
+// Alert output mode
+alertMsgMode = input.string("JSON", "Alert Message Mode", options=["TEXT","JSON","TEXT+JSON"])
+
+// =====================
+// TECHNICALS GATE (requested)
+// =====================
+useTechGate      = input.bool(true,  "Gate by Technicals (RSI/MACD/EMAs)")
+useDailyTrend    = input.bool(true,  "Include Daily EMA21/EMA50 gate")
+useTripleEMA     = input.bool(true,  "Include Triple EMA 4/9/18 gate")
+useEMAStack      = input.bool(true,  "Include EMA stack 10/20/60/120 gate")
+
+techEventMode    = input.string("Balanced", "Tech Event Mode", options=["Off","Balanced","Strict"])
+
+// ✅ Your request: 3 bars, plus optional ATR% dynamic window
+useDynamicEventWin = input.bool(true, "Dynamic tech event window (ATR% based)")
+fixedEventWindow   = input.int(3, "Fixed event window (bars)", minval=1, maxval=20)
+
+atrSmallPct = input.float(1.0, "ATR% small (<=) → larger window", step=0.1)
+atrLargePct = input.float(2.0, "ATR% large (>=) → smaller window", step=0.1)
+winSmall    = input.int(5, "Window bars when ATR% small", minval=2, maxval=20)
+winMid      = input.int(3, "Window bars when ATR% mid",   minval=1, maxval=20)
+winLarge    = input.int(2, "Window bars when ATR% large", minval=1, maxval=20)
+
+// =====================
+// SUPPORT/RESISTANCE (requested)
+// =====================
+useSRGate        = input.bool(true,  "Use Support/Resistance context gate")
+pivotL           = input.int(3, "Pivot strength (L/R)", minval=1, maxval=10)
+nearPct          = input.float(0.25, "Near S/R threshold (%)", step=0.05, minval=0.05, maxval=2.0)
+rangeSRLen       = input.int(20, "Range S/R lookback bars", minval=10, maxval=200)
+showSR           = input.bool(true, "Plot Pivot S/R lines")
 
 // =====================
 // BACKEND FEEDBACK OVERLAY
@@ -117,9 +146,10 @@ kvN(k, v) => q(k) + ":" + v
 kvB(k, b) => q(k) + ":" + b2s(b)
 kvRaw(k, raw) => q(k) + ":" + raw
 nf(x, fmt) => str.tostring(x, fmt)
+kvNullOrN(k, x, fmt) => q(k) + ":" + (na(x) ? "null" : str.tostring(x, fmt))
 
 // =====================
-// ALERT TEXT (matches screenshot)
+// ALERT TEXT
 // =====================
 mkAlertText(_side, _sym, _px, _strike, _expiry) =>
     _px_s     = str.tostring(_px, "#.##")
@@ -135,10 +165,16 @@ emaSlow = ta.ema(close, emaSlowLen)
 atr     = ta.atr(atrPeriod)
 vol20   = ta.sma(volume, 20)
 unusualVol = volume > vol20 * volMultAdj
-atrPct  = atr / close
+atrPct  = (atr / close) * 100.0
 
 [plusDI, minusDI, adxValue] = ta.dmi(adxLen, adxLen)
 [supertrend, dir] = ta.supertrend(3, atrPeriod)
+
+// Dynamic tech event window
+eventWin =
+    useDynamicEventWin ?
+        (atrPct <= atrSmallPct ? winSmall : atrPct >= atrLargePct ? winLarge : winMid)
+    : fixedEventWindow
 
 // =====================
 // Peek-a-Boo (Trap) Module
@@ -184,18 +220,122 @@ pb_level = pb_short ? pb_rangeHigh : pb_long ? pb_rangeLow : na
 pb_dir   = pb_short ? "SHORT" : pb_long ? "LONG" : "NONE"
 patternTag = pb_long ? "peekaboo_long" : pb_short ? "peekaboo_short" : "none"
 
-pb_plot_levels = input.bool(false, "Plot PB Range Levels")
-// --- Peek-a-Boo plots (MUST be global scope; use na to hide) ---
+// PB plots + conditions
 pb_show_levels = input.bool(false, "Plot PB Range Levels")
-
 plot(pb_show_levels ? pb_rangeHigh : na, "PB Range High", color=color.new(color.red, 40))
 plot(pb_show_levels ? pb_rangeLow  : na, "PB Range Low",  color=color.new(color.green, 40))
-
 plotshape(pb_short, style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.tiny, text="PB↓")
 plotshape(pb_long,  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.tiny, text="PB↑")
+alertcondition(pb_short, "Peek-a-Boo Short", "Peek-a-Boo SHORT trap detected")
+alertcondition(pb_long,  "Peek-a-Boo Long",  "Peek-a-Boo LONG trap detected")
 
+// =====================
+// Requested Technicals (RSI, MACD, EMA10/20/60/120, Daily 21/50, Triple 4/9/18)
+// =====================
+rsiValue = ta.rsi(close, rsiLen)
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
 
+macdTrendUp = macdLine > macdSig
+macdTrendDn = macdLine < macdSig
+macdBullEvt = ta.crossover(macdLine, macdSig)
+macdBearEvt = ta.crossunder(macdLine, macdSig)
+
+rsiBullBias  = rsiValue > 50
+rsiBearBias  = rsiValue < 50
+rsiBullEvt50 = ta.crossover(rsiValue, 50)
+rsiBearEvt50 = ta.crossunder(rsiValue, 50)
+
+withinBars(cond, n) =>
+    bs = ta.barssince(cond)
+    bs >= 0 and bs <= n
+
+macdBullRecent = withinBars(macdBullEvt, eventWin)
+macdBearRecent = withinBars(macdBearEvt, eventWin)
+rsiBullRecent  = withinBars(rsiBullEvt50, eventWin)
+rsiBearRecent  = withinBars(rsiBearEvt50, eventWin)
+
+// EMA stack 10/20/60/120
+ema10  = ta.ema(close, 10)
+ema20  = ta.ema(close, 20)
+ema60  = ta.ema(close, 60)
+ema120 = ta.ema(close, 120)
+emaStackBull = ema10 > ema20 and ema20 > ema60 and ema60 > ema120
+emaStackBear = ema10 < ema20 and ema20 < ema60 and ema60 < ema120
+
+// Triple EMA 4/9/18
+ema4  = ta.ema(close, 4)
+ema9  = ta.ema(close, 9)
+ema18 = ta.ema(close, 18)
+tripleBull = ema4 > ema9 and ema9 > ema18
+tripleBear = ema4 < ema9 and ema9 < ema18
+
+// Daily EMA 21/50
+dEma21 = request.security(syminfo.tickerid, "D", ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+dEma50 = request.security(syminfo.tickerid, "D", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+dailyBull = dEma21 > dEma50
+dailyBear = dEma21 < dEma50
+
+// Event mode gates (within last eventWin bars)
+bullEvtOk =
+    techEventMode == "Off" ? true :
+    techEventMode == "Balanced" ? (macdBullRecent or rsiBullRecent) :
+    (macdBullRecent and rsiBullRecent)
+
+bearEvtOk =
+    techEventMode == "Off" ? true :
+    techEventMode == "Balanced" ? (macdBearRecent or rsiBearRecent) :
+    (macdBearRecent and rsiBearRecent)
+
+// Final tech gates
+techBullOk =
+    not useTechGate or (
+        rsiBullBias and macdTrendUp and
+        (not useEMAStack or emaStackBull) and
+        (not useTripleEMA or tripleBull) and
+        (not useDailyTrend or dailyBull) and
+        bullEvtOk
+    )
+
+techBearOk =
+    not useTechGate or (
+        rsiBearBias and macdTrendDn and
+        (not useEMAStack or emaStackBear) and
+        (not useTripleEMA or tripleBear) and
+        (not useDailyTrend or dailyBear) and
+        bearEvtOk
+    )
+
+// =====================
+// Support / Resistance Context
+// =====================
+pivH = ta.pivothigh(high, pivotL, pivotL)
+pivL = ta.pivotlow(low,  pivotL, pivotL)
+
+var float lastRes = na
+var float lastSup = na
+if not na(pivH)
+    lastRes := pivH
+if not na(pivL)
+    lastSup := pivL
+
+nearMult = nearPct / 100.0
+nearSup = not na(lastSup) and close <= lastSup * (1 + nearMult)
+nearRes = not na(lastRes) and close >= lastRes * (1 - nearMult)
+
+srHigh = ta.highest(high, rangeSRLen)
+srLow  = ta.lowest(low,  rangeSRLen)
+rangeBreakout  = ta.crossover(close, srHigh[1])
+rangeBreakdown = ta.crossunder(close, srLow[1])
+
+srBullOk = not useSRGate or (nearSup or rangeBreakout)
+srBearOk = not useSRGate or (nearRes or rangeBreakdown)
+
+plot(showSR ? lastRes : na, "Pivot Resistance", color=color.new(color.red, 55), style=plot.style_linebr)
+plot(showSR ? lastSup : na, "Pivot Support",    color=color.new(color.green, 55), style=plot.style_linebr)
+
+// =====================
 // VW-MACD on VWAP
+// =====================
 vw     = vwap
 vwFast = ta.ema(vw, 12)
 vwSlow = ta.ema(vw, 26)
@@ -204,25 +344,30 @@ vwmacdSignal = ta.ema(vwmacd, 9)
 vwmacdBullish = useVwmacd and ta.crossover(vwmacd, vwmacdSignal)
 vwmacdBearish = useVwmacd and ta.crossunder(vwmacd, vwmacdSignal)
 
+// =====================
 // OBV Breakouts
+// =====================
 obvSeries   = ta.cum(close > close[1] ? volume : close < close[1] ? -volume : 0)
 obvHigh     = ta.highest(obvSeries, 20)
 obvLow      = ta.lowest(obvSeries, 20)
 obvBreakout  = useObv and (ta.crossover(obvSeries, obvHigh) or ta.crossover(obvSeries, obvHigh[1]))
 obvBreakdown = useObv and (ta.crossunder(obvSeries, obvLow) or ta.crossunder(obvSeries, obvLow[1]))
 
+// =====================
 // Bollinger Squeeze
+// =====================
 basis   = ta.sma(close, 20)
 dev     = ta.stdev(close, 20)
 upperBB = basis + 2 * dev
 lowerBB = basis - 2 * dev
 rangeBB = upperBB - lowerBB
 squeeze = rangeBB < ta.atr(14) * 1.2
-rsiValue    = ta.rsi(close, rsiLen)
 squeezeBuy  = useSqueeze and squeeze and rsiValue < 40
 squeezeSell = useSqueeze and squeeze and rsiValue > 60
 
+// =====================
 // Keltner
+// =====================
 keltnerMiddle = ta.ema(close, 20)
 keltnerUpper  = keltnerMiddle + 1.5 * ta.atr(14)
 keltnerLower  = keltnerMiddle - 1.5 * ta.atr(14)
@@ -231,10 +376,13 @@ rsiCross70dn  = ta.crossunder(rsiValue, 70)
 keltnerBuy    = useKeltner and (close < keltnerLower or close[1] < keltnerLower[1]) and (rsiCross30 or rsiValue > 25)
 keltnerSell   = useKeltner and (close > keltnerUpper or close[1] > keltnerUpper[1]) and (rsiCross70dn or rsiValue < 75)
 
+// =====================
 // UOF proxy
+// =====================
 uofBullish = useUOF ? ((volume > vol20 * 2.0 and close > open * 1.01) or (volume > vol20 * 1.5)) : true
 uofBearish = useUOF ? ((volume > vol20 * 2.0 and close < open * 0.99) or (volume > vol20 * 1.5)) : true
 
+// =====================
 // Trendline patterns (lightweight)
 linreg     = ta.linreg(close, 20, 0)
 trendUp    = close > linreg and linreg >= linreg[1]
@@ -290,7 +438,6 @@ sess = input.session("0930-1600", "RTH Session")
 inRTH = not na(time(timeframe.period, sess))
 rthOpenTs = timestamp(syminfo.timezone, year, month, dayofmonth, 9, 30)
 minsFromOpen = (time - rthOpenTs) / 60000.0
-minsToClose = 390.0 - minsFromOpen
 
 isORB15 = inRTH and minsFromOpen >= 0 and minsFromOpen < 15
 isORB45 = inRTH and minsFromOpen >= 0 and minsFromOpen < 45
@@ -377,6 +524,20 @@ for i = 1 to retestLookback
     fiveDayHighRetest := fiveDayHighRetest or cond5
     fiveDayLowRetest  := fiveDayLowRetest  or cond6
 
+// Upgrade S/R context with your levels (helps avoid “late” triggers)
+srBullCtx =
+    srBullOk or prevHighRetest or premHighRetest or fiveDayHighRetest or
+    (orb15Established and close > orb15High) or (orbEstablished and close > orbHigh) or
+    (not na(premarketHigh) and close > premarketHigh) or (close > prevHigh)
+
+srBearCtx =
+    srBearOk or prevLowRetest or premLowRetest or fiveDayLowRetest or
+    (orb15Established and close < orb15Low) or (orbEstablished and close < orbLow) or
+    (not na(premarketLow) and close < premarketLow) or (close < prevLow)
+
+srBullCtxOk = not useSRGate or srBullCtx
+srBearCtxOk = not useSRGate or srBearCtx
+
 // =====================
 // MTF confirm
 // =====================
@@ -401,12 +562,12 @@ mDown  = mFast < mSlow
 mStrong= mAdx >= 20
 
 // =====================
-// Signal scoring & triggers
+// Signal scoring & triggers (FULL)
 // =====================
 emaCrossUp   = ta.crossover(emaFast, emaSlow)
 emaCrossDown = ta.crossunder(emaFast, emaSlow)
 
-// Peek-a-Boo score contribution (+2 for PB long, +2 for PB short (on sell), else 0)
+// Peek-a-Boo score contribution
 pbBuyScore  = pb_long  ? 2 : 0
 pbSellScore = pb_short ? 2 : 0
 
@@ -437,7 +598,7 @@ sellScore =
 baseBuy  = emaCrossUp or emaFast > emaSlow
 baseSell = emaCrossDown or emaFast < emaSlow
 
-dynAdx = math.round(baseAdxThresh + (atrPct * 100))
+dynAdx = math.round(baseAdxThresh + (atrPct))
 needAdxBuy  = adxValue >= dynAdx
 needAdxSell = adxValue >= dynAdx
 
@@ -484,13 +645,18 @@ mtfConfirmBuy  = useMTF ? (requireMTF ? (htfClosed and (mtfCrossUp or mtfAligned
 mtfConfirmSell = useMTF ? (requireMTF ? (htfClosed and (mtfCrossDown or mtfAlignedDn)) : true) : true
 volumeConfirm  = requireVolume ? unusualVol : true
 
-preBuyTrigger  = ((useMLfilter and buyScore  >= minScore) or (not useMLfilter and baseBuy)  or (prevHighRetest and needAdxBuy))  and volumeConfirm and uofBullish and mtfConfirmBuy and confluenceBuyOk and oppositionBuyOk and structureBuyOk and vwapSideBuyOk and sessionWindowOk and atrRegimeOk and rsiBuyOk and candleExtensionOk
-preSellTrigger = ((useMLfilter and sellScore >= minScore) or (not useMLfilter and baseSell) or (prevLowRetest  and needAdxSell)) and volumeConfirm and uofBearish and mtfConfirmSell and confluenceSellOk and oppositionSellOk and structureSellOk and vwapSideSellOk and sessionWindowOk and atrRegimeOk and rsiSellOk and candleExtensionOk
+// Pre-triggers (full), then apply Tech+S/R context to avoid stale signals
+preBuyTrigger  = ((useMLfilter and buyScore  >= minScore) or (not useMLfilter and baseBuy)  or (prevHighRetest and needAdxBuy))  and volumeConfirm and uofBullish and mtfConfirmBuy
+preSellTrigger = ((useMLfilter and sellScore >= minScore) or (not useMLfilter and baseSell) or (prevLowRetest  and needAdxSell)) and volumeConfirm and uofBearish and mtfConfirmSell
 
-buyPref  = preBuyTrigger
-sellPref = preSellTrigger
+preBuyGated  = preBuyTrigger  and techBullOk and srBullCtxOk
+preSellGated = preSellTrigger and techBearOk and srBearCtxOk
 
-if preBuyTrigger and preSellTrigger
+buyPref  = preBuyGated
+sellPref = preSellGated
+
+// Conflict resolution
+if preBuyGated and preSellGated
     if buyScore - sellScore >= minScoreDiff
         buyPref := true
         sellPref := false
@@ -501,22 +667,27 @@ if preBuyTrigger and preSellTrigger
         buyPref := mUp and mStrong
         sellPref := mDown and mStrong
 
+// Cooldown tracking
 var int lastBuyBar  = na
 var int lastSellBar = na
-
 buyOk  = na(lastBuyBar)  or bar_index - lastBuyBar  >= signalCooldown
 sellOk = na(lastSellBar) or bar_index - lastSellBar >= signalCooldown
+
+// ✅ Event-based firing (prevents late/repeated 5m alerts)
+buyEvent  = buyPref  and not buyPref[1]
+sellEvent = sellPref and not sellPref[1]
 
 buyTrigger  = false
 sellTrigger = false
 
-if buyPref and buyOk
+if buyEvent and buyOk
     buyTrigger := true
     lastBuyBar := bar_index
-else if sellPref and sellOk
+else if sellEvent and sellOk
     sellTrigger := true
     lastSellBar := bar_index
 
+// Regime filter
 if trendFilter
     buyTrigger  := buyTrigger  and (mUp   and mStrong)
     sellTrigger := sellTrigger and (mDown and mStrong)
@@ -533,18 +704,9 @@ if pb_on and pb_gateMode != "None"
         buyTrigger  := buyTrigger  and pb_long
         sellTrigger := sellTrigger and pb_short
 
+// Confirm on close
 buyTrigger  := buyTrigger  and (confirmOnClose ? barstate.isconfirmed : true)
 sellTrigger := sellTrigger and (confirmOnClose ? barstate.isconfirmed : true)
-
-// Final conflict resolution: emit at most one directional alert on a bar
-if buyTrigger and sellTrigger
-    if buyConfluence > sellConfluence
-        sellTrigger := false
-    else if sellConfluence > buyConfluence
-        buyTrigger := false
-    else
-        buyTrigger := false
-        sellTrigger := false
 
 // =====================
 // Strike & expiry helpers
@@ -556,13 +718,13 @@ getRoundedStrike() =>
     math.round(close / step) * step
 
 getExpiryString() =>
-    // Upcoming Friday (today if Friday)
+    // Upcoming Friday (today if Friday) — safe across month/year by using milliseconds math
     dw = dayofweek
-    offset = dw <= dayofweek.friday ? (dayofweek.friday - dw) : (7 - (dw - dayofweek.friday))
-    expiryTs = timestamp(year, month, dayofmonth + offset)
+    offsetDays = dw <= dayofweek.friday ? (dayofweek.friday - dw) : (7 - (dw - dayofweek.friday))
+    expiryTs = time + offsetDays * 24 * 60 * 60 * 1000
     str.format("{0,date,yyyy-MM-dd}", expiryTs)
 
-isSwing = (atrPct < 0.02) and (mUp or mDown)
+isSwing = (atrPct < 2.0) and (mUp or mDown)
 tradeType = isSwing ? "swing" : "intraday"
 
 // =====================
@@ -579,17 +741,16 @@ plot(shortStop, "Short Stop", color=color.new(color.red,  30), style=plot.style_
 plot(shortTgt,  "Short Tgt",  color=color.new(color.green,30), style=plot.style_linebr)
 
 // =====================
-// mkJson (Lite/Full) - cleaned (no duplicate blocks)
+// mkJson (Lite/Full)
 // =====================
 mkJson(_type, _price, _strike, _expiry, _tradeType) =>
     sigId = syminfo.ticker + ":" + timeframe.period + ":" + str.tostring(time) + ":" + _type
     price_s  = nf(_price,  "#.####")
     strike_s = nf(_strike, "#.##")
-
-    pbLevelStr = na(pb_level) ? "na" : str.tostring(pb_level, format.mintick)
+    pbLevelRaw = na(pb_level) ? "null" : str.tostring(pb_level, format.mintick)
 
     core = "{"
-    core += kvS("v", "1.4")
+    core += kvS("v", "1.9")
     core += "," + kvS("type", _type)
     core += "," + kvS("symbol", syminfo.ticker)
     core += "," + kvN("time", str.tostring(time))
@@ -599,12 +760,9 @@ mkJson(_type, _price, _strike, _expiry, _tradeType) =>
     core += "," + kvS("expiry", _expiry)
     core += "," + kvS("tradeType", _tradeType)
 
-    // ✅ Peek-a-Boo fields
     core += "," + kvS("pattern", patternTag)
     core += "," + kvS("pb_dir", pb_dir)
-    core += "," + kvS("pb_level", pbLevelStr)
-    core += "," + kvN("pb_reclaimBars", str.tostring(pb_reclaimBars))
-    core += "," + kvN("pb_wickMin", str.tostring(pb_wickMin))
+    core += "," + kvRaw("pb_level", pbLevelRaw)
 
     if payloadMode == "Lite"
         core + "}"
@@ -613,22 +771,58 @@ mkJson(_type, _price, _strike, _expiry, _tradeType) =>
         orbObj    = "{" + kvB("established45", orbEstablished) + "," + kvB("established15", orb15Established) + "}"
         bkObj = "{" + kvB("enabled", bk_enabled) + "," + kvB("nbbo_ok", bk_nbbo_ok) + "," + kvN("spread_pct", nf(bk_spread_pct, "#.##")) + "," + kvN("oi", str.tostring(bk_oi)) + "," + kvN("iv", nf(bk_iv, "#.###")) + "," + kvN("delta", nf(bk_delta, "#.###")) + "," + kvN("gamma", nf(bk_gamma, "#.###")) + "," + kvN("theta", nf(bk_theta, "#.###")) + "," + kvN("vega", nf(bk_vega, "#.###")) + "," + kvN("quote_age_s", str.tostring(bk_quote_age_s)) + "," + kvB("gates_ok", bk_gates_ok) + "}"
 
-        core + "," + kvN("rsi", nf(rsiValue, "#.##")) + "," + kvN("adx", nf(adxValue, "#.##")) + "," + kvN("atrPct", nf(atrPct * 100, "#.##")) + "," + kvN("buyScore", str.tostring(buyScore)) + "," + kvN("sellScore", str.tostring(sellScore)) + "," + kvB("mtfReq", requireMTF) + "," + kvB("mtfUsed", useMTF) + "," + kvRaw("regime", regimeObj) + "," + kvRaw("orb", orbObj) + "," + kvN("vwap", nf(vwap, "#.####")) + "," + kvRaw("bk", bkObj) + "}"
+        techObj = "{" +
+          kvS("techEventMode", techEventMode) + "," +
+          kvN("eventWinBars", str.tostring(eventWin)) + "," +
+          kvN("rsi", nf(rsiValue, "#.##")) + "," +
+          kvN("macd", nf(macdLine, "#.####")) + "," +
+          kvN("macd_sig", nf(macdSig, "#.####")) + "," +
+          kvB("macd_x_up_recent", macdBullRecent) + "," +
+          kvB("macd_x_dn_recent", macdBearRecent) + "," +
+          kvB("rsi_x50_up_recent", rsiBullRecent) + "," +
+          kvB("rsi_x50_dn_recent", rsiBearRecent) + "," +
+          kvNullOrN("dEma21", dEma21, "#.####") + "," +
+          kvNullOrN("dEma50", dEma50, "#.####") +
+        "}"
+
+        srObj = "{" +
+          kvRaw("pivot_sup", na(lastSup) ? "null" : str.tostring(lastSup, format.mintick)) + "," +
+          kvRaw("pivot_res", na(lastRes) ? "null" : str.tostring(lastRes, format.mintick)) + "," +
+          kvN("srHigh", nf(srHigh, "#.####")) + "," +
+          kvN("srLow", nf(srLow, "#.####")) + "," +
+          kvB("nearSup", nearSup) + "," +
+          kvB("nearRes", nearRes) + "," +
+          kvB("rangeBreakout", rangeBreakout) + "," +
+          kvB("rangeBreakdown", rangeBreakdown) +
+        "}"
+
+        core +
+          "," + kvN("adx", nf(adxValue, "#.##")) +
+          "," + kvN("atrPct", nf(atrPct, "#.##")) +
+          "," + kvN("buyScore", str.tostring(buyScore)) +
+          "," + kvN("sellScore", str.tostring(sellScore)) +
+          "," + kvB("mtfReq", requireMTF) +
+          "," + kvB("mtfUsed", useMTF) +
+          "," + kvRaw("regime", regimeObj) +
+          "," + kvRaw("orb", orbObj) +
+          "," + kvN("vwap", nf(vwap, "#.####")) +
+          "," + kvRaw("bk", bkObj) +
+          "," + kvRaw("tech", techObj) +
+          "," + kvRaw("sr", srObj) +
+        "}"
 
 // =====================
-// ALERTS (TEXT / JSON) - screenshot format
+// ALERTS (TEXT / JSON)
 // =====================
 sendAlert(_side, _type, _price) =>
     _strike = getRoundedStrike()
     _expiry = getExpiryString()
 
-    string msgOut = ""
-
     txt = mkAlertText(_side, syminfo.ticker, _price, _strike, _expiry)
     js  = mkJson(_type, _price, _strike, _expiry, tradeType)
 
-    msgOut := alertMsgMode == "TEXT" ? txt : alertMsgMode == "JSON" ? js : (txt + "\n\n" + js)
-    alert(msgOut, alert.freq_once_per_bar_close)
+    msgOut = alertMsgMode == "TEXT" ? txt : alertMsgMode == "JSON" ? js : (txt + "\n\n" + js)
+    alert(msgOut, confirmOnClose ? alert.freq_once_per_bar_close : alert.freq_once_per_bar)
 
 if buyTrigger
     sendAlert("CALL", "CALL", close)
@@ -639,6 +833,7 @@ if sellTrigger
 // Make script visible in TradingView alert Condition list
 alertcondition(buyTrigger,  title="CALL Signal", message="CALL Signal: {{ticker}} at {{close}}")
 alertcondition(sellTrigger, title="PUT Signal",  message="PUT Signal: {{ticker}} at {{close}}")
+alertcondition(buyTrigger or sellTrigger, title="ANY Signal", message="UOAS SIGNAL {{ticker}} TF={{interval}} Close={{close}} Time={{time}}")
 
 // =====================
 // Backend overlay label (on signal)
@@ -647,14 +842,16 @@ mkGateText(ok) => ok ? "OK" : "FAIL"
 mkOverlayText(_side) =>
      " " + _side + " " + syminfo.ticker + "\n" +
      "PX " + str.tostring(close, "#.##") + "  VWAP " + str.tostring(vwap, "#.##") + "\n" +
-     (orb15Established ? "ORB15 " + str.tostring(orb15High, "#.##") + "/" + str.tostring(orb15Low, "#.##") + "\n" : "") +
-     (orbEstablished ? "ORB45 " + str.tostring(orbHigh, "#.##") + "/" + str.tostring(orbLow, "#.##") + "\n" : "") +
-     "RSI " + str.tostring(rsiValue, "#.0") + "  ADX " + str.tostring(adxValue, "#.0") + "  ATR% " + str.tostring(atrPct*100, "#.1") + "\n" +
+     "RSI " + str.tostring(rsiValue, "#.0") + "  MACD " + str.tostring(macdLine, "#.000") + "\n" +
+     "EMA10/20/60/120 " + (emaStackBull ? "BULL" : emaStackBear ? "BEAR" : "MIX") + "\n" +
+     "Triple 4/9/18 " + (tripleBull ? "BULL" : tripleBear ? "BEAR" : "MIX") + "\n" +
+     "Daily 21/50 " + (dailyBull ? "UP" : dailyBear ? "DN" : "FLAT") + "\n" +
+     "EventWin " + str.tostring(eventWin) + " bars (mode " + techEventMode + ")\n" +
      "PB " + patternTag + " dir=" + pb_dir + " lvl=" + (na(pb_level) ? "na" : str.tostring(pb_level, format.mintick)) + "\n" +
+     "SR sup=" + (na(lastSup) ? "na" : str.tostring(lastSup, format.mintick)) + " res=" + (na(lastRes) ? "na" : str.tostring(lastRes, format.mintick)) + "\n" +
      (bk_enabled ?
          ("NBBO " + mkGateText(bk_nbbo_ok) + "  Spr% " + str.tostring(bk_spread_pct, "#.2") + " " + mkGateText(bk_spread_ok) + "\n" +
           "OI " + str.tostring(bk_oi) + " " + mkGateText(bk_oi_ok) + "  Age " + str.tostring(bk_quote_age_s) + "s " + mkGateText(bk_age_ok) + "\n" +
-          "IV " + str.tostring(bk_iv, "#.3") + "  Δ " + str.tostring(bk_delta, "#.3") + " Γ " + str.tostring(bk_gamma, "#.3") + " Θ " + str.tostring(bk_theta, "#.3") + " ν " + str.tostring(bk_vega, "#.3") + "\n" +
           "GATES: " + mkGateText(bk_gates_ok))
          : "BK: OFF")
 
@@ -662,53 +859,15 @@ var label sigLbl = na
 if buyTrigger or sellTrigger
     if not na(sigLbl)
         label.delete(sigLbl)
-    txt = mkOverlayText(buyTrigger ? "CALL" : "PUT")
+    txt2 = mkOverlayText(buyTrigger ? "CALL" : "PUT")
     sigLbl := label.new(
-      bar_index, high, txt,
+      bar_index, high, txt2,
       xloc.bar_index, yloc.abovebar,
       style=label.style_label_up,
       textcolor=color.white,
       color=bk_enabled ? (bk_gates_ok ? color.new(color.green, 20) : color.new(color.red, 10)) : color.new(color.blue, 20),
       size=size.normal
     )
-
-// =====================
-// Heads-up spike / dip (optional)
-// =====================
-enableSpikeAlerts   = input.bool(false, "Enable Heads-Up Spike Alerts")
-spikeTF             = input.timeframe("1", "Spike TF (micro)")
-spikePct            = input.float(0.3, "Spike threshold %", step=0.1, minval=0.1)
-spikeVolMult        = input.float(1.5, "Spike Volume x SMA(10)", step=0.1, minval=1.0)
-spikeWindowBars     = input.int(3, "Spike window (bars on Spike TF)", minval=1, maxval=10)
-spikeCooldownBars   = input.int(10, "Spike cooldown (current TF bars)", minval=0, maxval=500)
-showSpikeMarkers    = input.bool(true, "Show Heads-Up Markers")
-
-[mClose, mOpen, mVol] = request.security(syminfo.tickerid, spikeTF, [close, open, volume], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
-mVolSma10 = request.security(syminfo.tickerid, spikeTF, ta.sma(volume, 10), lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
-mVolMean  = request.security(syminfo.tickerid, spikeTF, ta.sma(volume, 50), lookahead=barmerge.lookahead_off)
-mVolStd   = request.security(syminfo.tickerid, spikeTF, ta.stdev(volume, 50), lookahead=barmerge.lookahead_off)
-
-volZ      = (mVol - mVolMean) / nz(mVolStd, 1)
-
-enoughMicro = not na(mClose[spikeWindowBars])
-rocUp   = mClose / nz(mClose[spikeWindowBars], mClose) - 1.0
-rocDown = 1.0 - mClose / nz(mClose[spikeWindowBars], mClose)
-volOk   = (mVol > mVolSma10 * spikeVolMult) and (volZ > 1.0)
-
-spikeUp   = enableSpikeAlerts and enoughMicro and volOk and (rocUp   >= spikePct / 100.0)
-spikeDown = enableSpikeAlerts and enoughMicro and volOk and (rocDown >= spikePct / 100.0)
-
-var int lastSpikeBar = na
-spikeCooldownOk = na(lastSpikeBar) or bar_index - lastSpikeBar >= spikeCooldownBars
-
-if barstate.isrealtime and spikeCooldownOk
-    if spikeUp or spikeDown
-        // Consolidated signal model: keep only CALL/PUT trade alerts.
-        // Spike/dip remains visual-only via markers.
-        lastSpikeBar := bar_index
-
-plotshape(showSpikeMarkers and spikeUp,   title="Heads-Up Spike", style=shape.triangleup,   location=location.belowbar, color=color.new(color.yellow, 0), text="SPIKE", textcolor=color.black, size=size.tiny)
-plotshape(showSpikeMarkers and spikeDown, title="Heads-Up Dip",   style=shape.triangledown, location=location.abovebar, color=color.new(color.aqua, 0),   text="DIP",   textcolor=color.black, size=size.tiny)
 
 // =====================
 // VISUALS
@@ -741,32 +900,38 @@ plot(showSupertrend ? supertrend : na, "Supertrend", color=dir == 1 ? color.gree
 // =====================
 // Stats box
 // =====================
-var table statsTable = table.new(position.top_right, 3, 7, bgcolor=color.new(#2D3E50, 90))
+var table statsTable = table.new(position.top_right, 3, 9, bgcolor=color.new(#2D3E50, 90))
 
 if barstate.islast and showStats
-    table.cell(statsTable, 0, 0, "Fast EMA", text_color=color.white)
-    table.cell(statsTable, 1, 0, str.tostring(emaFast, format.mintick), text_color=color.green)
+    table.cell(statsTable, 0, 0, "EventWin", text_color=color.white)
+    table.cell(statsTable, 1, 0, str.tostring(eventWin) + " / " + techEventMode, text_color=color.white)
 
-    table.cell(statsTable, 0, 1, "Slow EMA", text_color=color.white)
-    table.cell(statsTable, 1, 1, str.tostring(emaSlow, format.mintick), text_color=color.red)
+    table.cell(statsTable, 0, 1, "RSI / MACD", text_color=color.white)
+    table.cell(statsTable, 1, 1, str.tostring(rsiValue, "#.0") + " / " + str.tostring(macdLine, "#.000"), text_color=macdTrendUp ? color.green : color.red)
 
-    table.cell(statsTable, 0, 2, "RSI", text_color=color.white)
-    table.cell(statsTable, 1, 2, str.tostring(rsiValue, "#.00"), text_color=rsiValue > 70 ? color.red : rsiValue < 30 ? color.green : color.white)
+    table.cell(statsTable, 0, 2, "MACD recent", text_color=color.white)
+    table.cell(statsTable, 1, 2, macdBullRecent ? "BULL" : macdBearRecent ? "BEAR" : "no", text_color=macdBullRecent ? color.green : macdBearRecent ? color.red : color.gray)
 
-    table.cell(statsTable, 0, 3, "ADX", text_color=color.white)
-    table.cell(statsTable, 1, 3, str.tostring(adxValue, "#.00"), text_color=adxValue > baseAdxThresh ? color.blue : color.gray)
+    table.cell(statsTable, 0, 3, "RSI50 recent", text_color=color.white)
+    table.cell(statsTable, 1, 3, rsiBullRecent ? "BULL" : rsiBearRecent ? "BEAR" : "no", text_color=rsiBullRecent ? color.green : rsiBearRecent ? color.red : color.gray)
 
-    table.cell(statsTable, 0, 4, "ATR %", text_color=color.white)
-    table.cell(statsTable, 1, 4, str.tostring(atrPct*100, "#.##") + "%", text_color=color.white)
+    table.cell(statsTable, 0, 4, "EMA stack", text_color=color.white)
+    table.cell(statsTable, 1, 4, emaStackBull ? "BULL" : emaStackBear ? "BEAR" : "MIX", text_color=emaStackBull ? color.green : emaStackBear ? color.red : color.gray)
 
-    table.cell(statsTable, 0, 5, "Regime", text_color=color.white)
-    table.cell(statsTable, 1, 5, (mUp ? "UP" : mDown ? "DOWN" : "FLAT") + " / ADX " + str.tostring(mAdx, "#.0"), text_color=mUp ? color.green : mDown ? color.red : color.gray)
+    table.cell(statsTable, 0, 5, "Triple 4/9/18", text_color=color.white)
+    table.cell(statsTable, 1, 5, tripleBull ? "BULL" : tripleBear ? "BEAR" : "MIX", text_color=tripleBull ? color.green : tripleBear ? color.red : color.gray)
 
-    table.cell(statsTable, 0, 6, "BK Gates", text_color=color.white)
-    table.cell(statsTable, 1, 6, bk_enabled ? (bk_gates_ok ? "OK" : "FAIL") : "OFF", text_color=bk_enabled ? (bk_gates_ok ? color.green : color.red) : color.gray)
+    table.cell(statsTable, 0, 6, "Daily 21/50", text_color=color.white)
+    table.cell(statsTable, 1, 6, dailyBull ? "UP" : dailyBear ? "DN" : "FLAT", text_color=dailyBull ? color.green : dailyBear ? color.red : color.gray)
+
+    table.cell(statsTable, 0, 7, "buy/sellScore", text_color=color.white)
+    table.cell(statsTable, 1, 7, str.tostring(buyScore) + " / " + str.tostring(sellScore), text_color=color.white)
+
+    table.cell(statsTable, 0, 8, "BK Gates", text_color=color.white)
+    table.cell(statsTable, 1, 8, bk_enabled ? (bk_gates_ok ? "OK" : "FAIL") : "OFF", text_color=bk_enabled ? (bk_gates_ok ? color.green : color.red) : color.gray)
 
 // =====================
-// Debug preview in Data Window (only computed when enabled)
+// Debug preview in Data Window
 // =====================
 jsonPreview = debugQA ? mkJson("PREVIEW", close, getRoundedStrike(), getExpiryString(), tradeType) : ""
 plotchar(debugQA ? 1 : na, title="DEBUG_JSON_PREVIEW_ON", char="ⓘ")
