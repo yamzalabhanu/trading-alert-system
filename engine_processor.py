@@ -18,6 +18,8 @@ from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from scoring import compute_decision_score, map_score_to_rating
 from daily_reporter import log_alert_snapshot
 
+from polygon_client import PolygonClient, polygon_enabled
+
 try:
     from reporting import _DECISIONS_LOG
 except Exception:
@@ -88,7 +90,11 @@ def _safe_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return ((a - b) / b) * 100.0
 
 
+
+async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
+
 async def _fetch_equity_features(symbol: str) -> Dict[str, Any]:
+
     cli = get_http_client()
     if cli is None:
         return {}
@@ -129,8 +135,11 @@ async def _fetch_equity_features(symbol: str) -> Dict[str, Any]:
             return {}
 
         closes = [r[4] for r in rows]
+
+
         highs = [r[2] for r in rows]
         lows = [r[3] for r in rows]
+
         vols = [r[5] for r in rows]
         last_px = closes[-1]
 
@@ -154,7 +163,10 @@ async def _fetch_equity_features(symbol: str) -> Dict[str, Any]:
         bb_upper = (sma20 + 2 * st) if (sma20 is not None and st is not None) else None
         bb_lower = (sma20 - 2 * st) if (sma20 is not None and st is not None) else None
 
+
+
         # day partition
+
         day_key = rows[-1][0].date()
         day_rows = [r for r in rows if r[0].date() == day_key]
         prev_rows = [r for r in rows if r[0].date() < day_key]
@@ -169,7 +181,10 @@ async def _fetch_equity_features(symbol: str) -> Dict[str, Any]:
         pm_high = max((r[2] for r in pm), default=None)
         pm_low = min((r[3] for r in pm), default=None)
 
+
+
         # ORB15 from current regular session
+
         rth = [r for r in day_rows if (r[0].hour > 9 or (r[0].hour == 9 and r[0].minute >= 30)) and (r[0].hour < 16)]
         orb15 = [r for r in rth if (r[0].hour == 9 and r[0].minute < 45)]
         orb15_high = max((r[2] for r in orb15), default=None)
@@ -180,10 +195,14 @@ async def _fetch_equity_features(symbol: str) -> Dict[str, Any]:
         vwap = (vwap_num / vwap_den) if vwap_den > 0 else None
 
         vol_now = day_rows[-1][5] if day_rows else vols[-1]
+
+        qchg = _safe_pct(last_px, prev_close)
+
         vol_avg = (sum(vols[-20:]) / 20.0) if len(vols) >= 20 else None
         qchg = _safe_pct(last_px, prev_close)
 
         # simple trend proxy
+
         regime_flag = "trending" if (ema20 is not None and ema50 is not None and abs(ema20 - ema50) / max(last_px, 1e-9) > 0.002) else "choppy"
         mtf_align = bool(ema20 is not None and ema50 is not None and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50)))
 
@@ -222,10 +241,116 @@ async def _fetch_equity_features(symbol: str) -> Dict[str, Any]:
             "regime_flag": regime_flag,
             "ta_src": "yahoo_chart_5m",
             "synthetic_nbbo_used": True,
+            "data_provider": "yahoo",
+
         }
     except Exception as e:
         logger.warning("[features] parse error for %s: %r", symbol, e)
         return {}
+
+
+
+async def _fetch_polygon_features(symbol: str, *, expiry_iso: Optional[str], side: Optional[str], strike: Optional[float]) -> Dict[str, Any]:
+    cli = get_http_client()
+    if cli is None:
+        return {}
+    pc = PolygonClient(cli)
+    if not pc.enabled:
+        return {}
+    try:
+        snap_task = pc.get_stock_snapshot(symbol)
+        quote_task = pc.get_last_quote(symbol)
+        trade_task = pc.get_last_trade(symbol)
+        agg_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
+        tech_task = pc.get_technicals_bundle(symbol)
+        opt_task = pc.get_targeted_option_context(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+        stock_snap, last_quote, last_trade, aggs, techs, opt_ctx = await asyncio.gather(
+            snap_task, quote_task, trade_task, agg_task, tech_task, opt_task
+        )
+    except Exception as e:
+        logger.warning("[features] polygon fetch failed for %s: %r", symbol, e)
+        return {}
+
+    out: Dict[str, Any] = {
+        "ta_src": "polygon_rest",
+        "data_provider": "polygon",
+        "nbbo_provider": "polygon:stocks",
+        "synthetic_nbbo_used": False,
+        "em_vs_be_ok": True,
+        "sr_headroom_ok": True,
+        "mtf_align": True,
+    }
+
+    q = stock_snap.get("lastQuote") or {}
+    d = stock_snap.get("day") or {}
+    pd = stock_snap.get("prevDay") or {}
+    bid = q.get("p") or last_quote.get("p")
+    ask = q.get("P") or last_quote.get("P")
+    if isinstance(bid, (int, float)):
+        out["bid"] = float(bid)
+    if isinstance(ask, (int, float)):
+        out["ask"] = float(ask)
+    if isinstance(out.get("bid"), float) and isinstance(out.get("ask"), float):
+        out["mid"] = (out["bid"] + out["ask"]) / 2.0
+
+    last_trade_px = (stock_snap.get("lastTrade") or {}).get("p") or last_trade.get("p")
+    if isinstance(last_trade_px, (int, float)):
+        out["last"] = float(last_trade_px)
+
+    if isinstance(d.get("v"), (int, float)):
+        out["vol"] = float(d.get("v"))
+    if isinstance(pd.get("h"), (int, float)):
+        out["prev_high"] = float(pd.get("h"))
+    if isinstance(pd.get("l"), (int, float)):
+        out["prev_low"] = float(pd.get("l"))
+    if isinstance(pd.get("c"), (int, float)):
+        out["prev_close"] = float(pd.get("c"))
+
+    # Aggregates context (ORB + VWAP estimate)
+    bars = aggs or []
+    if bars:
+        closes = [float(x.get("c")) for x in bars if isinstance(x.get("c"), (int, float))]
+        highs = [float(x.get("h")) for x in bars if isinstance(x.get("h"), (int, float))]
+        lows = [float(x.get("l")) for x in bars if isinstance(x.get("l"), (int, float))]
+        vols = [float(x.get("v") or 0.0) for x in bars]
+        if closes:
+            out.setdefault("last", closes[-1])
+            if len(closes) >= 15:
+                out["orb15_high"] = max(highs[:3]) if len(highs) >= 3 else None
+                out["orb15_low"] = min(lows[:3]) if len(lows) >= 3 else None
+            if out.get("prev_close"):
+                out["quote_change_pct"] = _safe_pct(out.get("last"), out.get("prev_close"))
+            if len(vols) >= 20:
+                out["vol_avg20"] = sum(vols[-20:]) / 20.0
+            try:
+                tps = [((float(x.get("h"))+float(x.get("l"))+float(x.get("c")))/3.0, float(x.get("v") or 0.0)) for x in bars if all(isinstance(x.get(k), (int, float)) for k in ("h","l","c"))]
+                den = sum(v for _, v in tps)
+                if den > 0:
+                    out["vwap"] = sum(tp*v for tp, v in tps) / den
+                    out["vwap_dist"] = _safe_pct(out.get("last"), out.get("vwap"))
+            except Exception:
+                pass
+
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(symbol: str, *, expiry_iso: Optional[str], side: Optional[str], strike: Optional[float]) -> Dict[str, Any]:
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
+
+
 
 
 async def process_tradingview_job(job: Dict[str, Any]) -> None:
@@ -262,7 +387,16 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "sr_headroom_ok": True,
         "nbbo_provider": "disabled",
     }
+
+    live = await _fetch_equity_features(
+        str(alert.get("symbol") or "").upper(),
+        expiry_iso=alert.get("expiry"),
+        side=alert.get("side"),
+        strike=alert.get("strike"),
+    )
+
     live = await _fetch_equity_features(str(alert.get("symbol") or "").upper())
+
     for k, v in live.items():
         if v is not None:
             f[k] = v
@@ -290,7 +424,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         score, rating = None, None
 
     try:
+        src = str(f.get("ta_src") or "unknown")
+        data_note = f"📊 TA source: {src}" if live else "⚠️ Live data unavailable; using alert baseline"
+
         data_note = "📊 TA source: Yahoo 5m" if live else "⚠️ Live data unavailable; using alert baseline"
+
         tg_text = compose_telegram_text(
             alert=alert,
             option_ticker=None,
@@ -332,9 +470,15 @@ async def net_debug_info() -> Dict[str, Any]:
     return {
         "integrations": {
             "ibkr": "disabled",
+
+            "polygon": "enabled" if polygon_enabled() else "disabled",
+            "perplexity": "disabled",
+            "market_data": "polygon_rest_with_yahoo_fallback",
+
             "polygon": "disabled",
             "perplexity": "disabled",
             "market_data": "yahoo_public_chart",
+
         }
     }
 

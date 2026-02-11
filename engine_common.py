@@ -9,7 +9,11 @@ from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone, timedelta, date
 
 from fastapi import HTTPException, Request
+
+from config import CDT_TZ, MAX_LLM_PER_DAY, POLYGON_API_KEY as CFG_POLYGON_API_KEY
+
 from config import CDT_TZ, MAX_LLM_PER_DAY
+
 
 logger = logging.getLogger("trading_engine")
 
@@ -24,7 +28,11 @@ def build_option_contract(symbol: str, expiry_iso: str, side: str, strike: float
 # =========================
 # Env / knobs
 # =========================
+
+POLYGON_API_KEY = CFG_POLYGON_API_KEY
+
 POLYGON_API_KEY = None  # Polygon integration removed
+
 
 def _env_truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
