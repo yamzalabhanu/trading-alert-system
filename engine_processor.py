@@ -88,6 +88,7 @@ def _safe_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
         return None
     return ((a - b) / b) * 100.0
 
+async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
 
 async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
     cli = get_http_client()
@@ -331,6 +332,10 @@ async def _fetch_equity_features(
         return poly
     return await _fetch_yahoo_features(symbol)
 
+        day_key = rows[-1][0].date()
+        day_rows = [r for r in rows if r[0].date() == day_key]
+        prev_rows = [r for r in rows if r[0].date() < day_key]
+        prev_day = prev_rows[-78:] if prev_rows else []
 
 async def process_tradingview_job(job: Dict[str, Any]) -> None:
     client = get_http_client()
