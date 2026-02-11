@@ -17,6 +17,7 @@ from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from scoring import compute_decision_score, map_score_to_rating
 from daily_reporter import log_alert_snapshot
+
 from polygon_client import PolygonClient, polygon_enabled
 
 try:
@@ -89,7 +90,11 @@ def _safe_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return ((a - b) / b) * 100.0
 
 
+
 async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
+
+async def _fetch_equity_features(symbol: str) -> Dict[str, Any]:
+
     cli = get_http_client()
     if cli is None:
         return {}
@@ -130,6 +135,11 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
             return {}
 
         closes = [r[4] for r in rows]
+
+
+        highs = [r[2] for r in rows]
+        lows = [r[3] for r in rows]
+
         vols = [r[5] for r in rows]
         last_px = closes[-1]
 
@@ -153,6 +163,10 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         bb_upper = (sma20 + 2 * st) if (sma20 is not None and st is not None) else None
         bb_lower = (sma20 - 2 * st) if (sma20 is not None and st is not None) else None
 
+
+
+        # day partition
+
         day_key = rows[-1][0].date()
         day_rows = [r for r in rows if r[0].date() == day_key]
         prev_rows = [r for r in rows if r[0].date() < day_key]
@@ -167,6 +181,10 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         pm_high = max((r[2] for r in pm), default=None)
         pm_low = min((r[3] for r in pm), default=None)
 
+
+
+        # ORB15 from current regular session
+
         rth = [r for r in day_rows if (r[0].hour > 9 or (r[0].hour == 9 and r[0].minute >= 30)) and (r[0].hour < 16)]
         orb15 = [r for r in rth if (r[0].hour == 9 and r[0].minute < 45)]
         orb15_high = max((r[2] for r in orb15), default=None)
@@ -177,7 +195,13 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         vwap = (vwap_num / vwap_den) if vwap_den > 0 else None
 
         vol_now = day_rows[-1][5] if day_rows else vols[-1]
+
         qchg = _safe_pct(last_px, prev_close)
+
+        vol_avg = (sum(vols[-20:]) / 20.0) if len(vols) >= 20 else None
+        qchg = _safe_pct(last_px, prev_close)
+
+        # simple trend proxy
 
         regime_flag = "trending" if (ema20 is not None and ema50 is not None and abs(ema20 - ema50) / max(last_px, 1e-9) > 0.002) else "choppy"
         mtf_align = bool(ema20 is not None and ema50 is not None and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50)))
@@ -218,10 +242,12 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
             "ta_src": "yahoo_chart_5m",
             "synthetic_nbbo_used": True,
             "data_provider": "yahoo",
+
         }
     except Exception as e:
         logger.warning("[features] parse error for %s: %r", symbol, e)
         return {}
+
 
 
 async def _fetch_polygon_features(symbol: str, *, expiry_iso: Optional[str], side: Optional[str], strike: Optional[float]) -> Dict[str, Any]:
@@ -325,6 +351,8 @@ async def _fetch_equity_features(symbol: str, *, expiry_iso: Optional[str], side
     return await _fetch_yahoo_features(symbol)
 
 
+
+
 async def process_tradingview_job(job: Dict[str, Any]) -> None:
     client = get_http_client()
     if client is None:
@@ -359,12 +387,16 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "sr_headroom_ok": True,
         "nbbo_provider": "disabled",
     }
+
     live = await _fetch_equity_features(
         str(alert.get("symbol") or "").upper(),
         expiry_iso=alert.get("expiry"),
         side=alert.get("side"),
         strike=alert.get("strike"),
     )
+
+    live = await _fetch_equity_features(str(alert.get("symbol") or "").upper())
+
     for k, v in live.items():
         if v is not None:
             f[k] = v
@@ -394,6 +426,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     try:
         src = str(f.get("ta_src") or "unknown")
         data_note = f"📊 TA source: {src}" if live else "⚠️ Live data unavailable; using alert baseline"
+
+        data_note = "📊 TA source: Yahoo 5m" if live else "⚠️ Live data unavailable; using alert baseline"
+
         tg_text = compose_telegram_text(
             alert=alert,
             option_ticker=None,
@@ -435,9 +470,15 @@ async def net_debug_info() -> Dict[str, Any]:
     return {
         "integrations": {
             "ibkr": "disabled",
+
             "polygon": "enabled" if polygon_enabled() else "disabled",
             "perplexity": "disabled",
             "market_data": "polygon_rest_with_yahoo_fallback",
+
+            "polygon": "disabled",
+            "perplexity": "disabled",
+            "market_data": "yahoo_public_chart",
+
         }
     }
 
