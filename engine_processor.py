@@ -84,10 +84,7 @@ def _stddev(vals: List[float]) -> Optional[float]:
 
 
 def _safe_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    """Return (a-b)/b as percent, guarding missing/zero denominator."""
-    if a is None or b is None or b == 0:
-        return None
-    return ((a - b) / b) * 100.0
+    return None if (a is None or b is None or b == 0) else ((a - b) / b) * 100.0
 
 async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
 
@@ -307,6 +304,32 @@ async def _fetch_polygon_features(symbol: str, *, expiry_iso: Optional[str], sid
                     out["vwap_dist"] = _safe_pct(out.get("last"), out.get("vwap"))
             except Exception:
                 pass
+
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str] = None,
+    side: Optional[str] = None,
+    strike: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
 
     out.update({k: v for k, v in techs.items() if v is not None})
     out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
