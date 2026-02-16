@@ -1,4 +1,5 @@
 # engine_processor.py
+import asyncio
 import logging
 import math
 from datetime import datetime, timezone
@@ -28,6 +29,9 @@ logger = logging.getLogger("trading_engine")
 NY_TZ = ZoneInfo("America/New_York")
 
 
+# =============================================================================
+# Small TA helpers
+# =============================================================================
 def _ema_last(vals: List[float], period: int) -> Optional[float]:
     if len(vals) < period:
         return None
@@ -87,11 +91,15 @@ def _safe_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return None if (a is None or b is None or b == 0) else ((a - b) / b) * 100.0
 
 
+# =============================================================================
+# Yahoo fallback features
+# =============================================================================
 async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
     """Fallback market-data enricher using Yahoo 5m chart API."""
     cli = get_http_client()
     if cli is None:
         return {}
+
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {
         "range": "5d",
@@ -111,6 +119,7 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         res = (js.get("chart") or {}).get("result") or []
         if not res:
             return {}
+
         node = res[0]
         ts = node.get("timestamp") or []
         q = ((node.get("indicators") or {}).get("quote") or [{}])[0]
@@ -119,17 +128,19 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         lows_raw = q.get("low") or []
         opens_raw = q.get("open") or []
         vols_raw = q.get("volume") or []
+
         rows: List[Tuple[datetime, float, float, float, float, float]] = []
         for t, o, h, l, c, v in zip(ts, opens_raw, highs_raw, lows_raw, closes_raw, vols_raw):
             if c is None or h is None or l is None or o is None:
                 continue
             dt = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(NY_TZ)
             rows.append((dt, float(o), float(h), float(l), float(c), float(v or 0.0)))
+
         if len(rows) < 30:
             return {}
 
-        closes = [r[4] for r in rows]
-        vols = [r[5] for r in rows]
+        closes = [rr[4] for rr in rows]
+        vols = [rr[5] for rr in rows]
         last_px = closes[-1]
 
         ema20 = _ema_last(closes, 20)
@@ -153,33 +164,55 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         bb_lower = (sma20 - 2 * st) if (sma20 is not None and st is not None) else None
 
         day_key = rows[-1][0].date()
-        day_rows = [r for r in rows if r[0].date() == day_key]
-        prev_rows = [r for r in rows if r[0].date() < day_key]
+        day_rows = [rr for rr in rows if rr[0].date() == day_key]
+        prev_rows = [rr for rr in rows if rr[0].date() < day_key]
         prev_day = prev_rows[-78:] if prev_rows else []
 
-        prev_high = max((r[2] for r in prev_day), default=None)
-        prev_low = min((r[3] for r in prev_day), default=None)
+        prev_high = max((rr[2] for rr in prev_day), default=None)
+        prev_low = min((rr[3] for rr in prev_day), default=None)
         prev_close = prev_day[-1][4] if prev_day else None
         prev_open = prev_day[0][1] if prev_day else None
 
-        pm = [r for r in day_rows if (r[0].hour > 4 or (r[0].hour == 4 and r[0].minute >= 0)) and (r[0].hour < 9 or (r[0].hour == 9 and r[0].minute < 30))]
-        pm_high = max((r[2] for r in pm), default=None)
-        pm_low = min((r[3] for r in pm), default=None)
+        pm = [
+            rr
+            for rr in day_rows
+            if (rr[0].hour > 4 or (rr[0].hour == 4 and rr[0].minute >= 0))
+            and (rr[0].hour < 9 or (rr[0].hour == 9 and rr[0].minute < 30))
+        ]
+        pm_high = max((rr[2] for rr in pm), default=None)
+        pm_low = min((rr[3] for rr in pm), default=None)
 
-        rth = [r for r in day_rows if (r[0].hour > 9 or (r[0].hour == 9 and r[0].minute >= 30)) and (r[0].hour < 16)]
-        orb15 = [r for r in rth if (r[0].hour == 9 and r[0].minute < 45)]
-        orb15_high = max((r[2] for r in orb15), default=None)
-        orb15_low = min((r[3] for r in orb15), default=None)
+        rth = [
+            rr
+            for rr in day_rows
+            if (rr[0].hour > 9 or (rr[0].hour == 9 and rr[0].minute >= 30))
+            and (rr[0].hour < 16)
+        ]
+        orb15 = [rr for rr in rth if (rr[0].hour == 9 and rr[0].minute < 45)]
+        orb15_high = max((rr[2] for rr in orb15), default=None)
+        orb15_low = min((rr[3] for rr in orb15), default=None)
 
-        vwap_num = sum((((r[2] + r[3] + r[4]) / 3.0) * r[5]) for r in rth)
-        vwap_den = sum(r[5] for r in rth)
+        vwap_num = sum((((rr[2] + rr[3] + rr[4]) / 3.0) * rr[5]) for rr in rth)
+        vwap_den = sum(rr[5] for rr in rth)
         vwap = (vwap_num / vwap_den) if vwap_den > 0 else None
 
         vol_now = day_rows[-1][5] if day_rows else vols[-1]
         qchg = _safe_pct(last_px, prev_close)
 
-        regime_flag = "trending" if (ema20 is not None and ema50 is not None and abs(ema20 - ema50) / max(last_px, 1e-9) > 0.002) else "choppy"
-        mtf_align = bool(ema20 is not None and ema50 is not None and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50)))
+        regime_flag = (
+            "trending"
+            if (
+                ema20 is not None
+                and ema50 is not None
+                and abs(ema20 - ema50) / max(last_px, 1e-9) > 0.002
+            )
+            else "choppy"
+        )
+        mtf_align = bool(
+            ema20 is not None
+            and ema50 is not None
+            and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50))
+        )
 
         return {
             "last": last_px,
@@ -223,13 +256,24 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         return {}
 
 
-async def _fetch_polygon_features(symbol: str, *, expiry_iso: Optional[str], side: Optional[str], strike: Optional[float]) -> Dict[str, Any]:
+# =============================================================================
+# Polygon primary features
+# =============================================================================
+async def _fetch_polygon_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str],
+    side: Optional[str],
+    strike: Optional[float],
+) -> Dict[str, Any]:
     cli = get_http_client()
     if cli is None:
         return {}
+
     pc = PolygonClient(cli)
     if not pc.enabled:
         return {}
+
     try:
         snap_task = pc.get_stock_snapshot(symbol)
         quote_task = pc.get_last_quote(symbol)
@@ -237,6 +281,7 @@ async def _fetch_polygon_features(symbol: str, *, expiry_iso: Optional[str], sid
         agg_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
         tech_task = pc.get_technicals_bundle(symbol)
         opt_task = pc.get_targeted_option_context(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+
         stock_snap, last_quote, last_trade, aggs, techs, opt_ctx = await asyncio.gather(
             snap_task, quote_task, trade_task, agg_task, tech_task, opt_task
         )
@@ -257,8 +302,10 @@ async def _fetch_polygon_features(symbol: str, *, expiry_iso: Optional[str], sid
     q = stock_snap.get("lastQuote") or {}
     d = stock_snap.get("day") or {}
     pd = stock_snap.get("prevDay") or {}
+
     bid = q.get("p") or last_quote.get("p")
     ask = q.get("P") or last_quote.get("P")
+
     if isinstance(bid, (int, float)):
         out["bid"] = float(bid)
     if isinstance(ask, (int, float)):
@@ -279,44 +326,68 @@ async def _fetch_polygon_features(symbol: str, *, expiry_iso: Optional[str], sid
     if isinstance(pd.get("c"), (int, float)):
         out["prev_close"] = float(pd.get("c"))
 
-    # Aggregates context (ORB + VWAP estimate)
     bars = aggs or []
     if bars:
         closes = [float(x.get("c")) for x in bars if isinstance(x.get("c"), (int, float))]
         highs = [float(x.get("h")) for x in bars if isinstance(x.get("h"), (int, float))]
         lows = [float(x.get("l")) for x in bars if isinstance(x.get("l"), (int, float))]
         vols = [float(x.get("v") or 0.0) for x in bars]
+
         if closes:
             out.setdefault("last", closes[-1])
             if len(closes) >= 15:
                 out["orb15_high"] = max(highs[:3]) if len(highs) >= 3 else None
                 out["orb15_low"] = min(lows[:3]) if len(lows) >= 3 else None
+
             if out.get("prev_close"):
                 out["quote_change_pct"] = _safe_pct(out.get("last"), out.get("prev_close"))
+
             if len(vols) >= 20:
                 out["vol_avg20"] = sum(vols[-20:]) / 20.0
+
             try:
-                tps = [((float(x.get("h"))+float(x.get("l"))+float(x.get("c")))/3.0, float(x.get("v") or 0.0)) for x in bars if all(isinstance(x.get(k), (int, float)) for k in ("h","l","c"))]
+                tps = [
+                    (
+                        (float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0,
+                        float(x.get("v") or 0.0),
+                    )
+                    for x in bars
+                    if all(isinstance(x.get(k), (int, float)) for k in ("h", "l", "c"))
+                ]
                 den = sum(v for _, v in tps)
                 if den > 0:
-                    out["vwap"] = sum(tp*v for tp, v in tps) / den
+                    out["vwap"] = sum(tp * v for tp, v in tps) / den
                     out["vwap_dist"] = _safe_pct(out.get("last"), out.get("vwap"))
             except Exception:
                 pass
 
-    out.update({k: v for k, v in techs.items() if v is not None})
-    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if isinstance(techs, dict):
+        out.update({k: v for k, v in techs.items() if v is not None})
+
+    out["regime_flag"] = (
+        "trending"
+        if (
+            out.get("ema20") is not None
+            and out.get("ema50") is not None
+            and out.get("last") is not None
+            and abs(out["ema20"] - out["ema50"]) / max(float(out["last"]), 1e-9) > 0.002
+        )
+        else "choppy"
+    )
     if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
         lp = float(out["last"])
         out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
 
-    if opt_ctx:
+    if opt_ctx and isinstance(opt_ctx, dict):
         out.update({k: v for k, v in opt_ctx.items() if v is not None})
         out["nbbo_provider"] = "polygon:options_snapshot"
 
     return out
 
 
+# =============================================================================
+# Unified features fetch (Polygon → Yahoo)
+# =============================================================================
 async def _fetch_equity_features(
     symbol: str,
     *,
@@ -330,141 +401,10 @@ async def _fetch_equity_features(
         return poly
     return await _fetch_yahoo_features(symbol)
 
-    out.update({k: v for k, v in techs.items() if v is not None})
-    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
-    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
-        lp = float(out["last"])
-        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
 
-    if opt_ctx:
-        out.update({k: v for k, v in opt_ctx.items() if v is not None})
-        out["nbbo_provider"] = "polygon:options_snapshot"
-
-    return out
-
-
-async def _fetch_equity_features(
-    symbol: str,
-    *,
-    expiry_iso: Optional[str] = None,
-    side: Optional[str] = None,
-    strike: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Fetch live market features using Polygon first, with Yahoo fallback."""
-    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-    if poly:
-        return poly
-    return await _fetch_yahoo_features(symbol)
-
-    out.update({k: v for k, v in techs.items() if v is not None})
-    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
-    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
-        lp = float(out["last"])
-        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
-
-    if opt_ctx:
-        out.update({k: v for k, v in opt_ctx.items() if v is not None})
-        out["nbbo_provider"] = "polygon:options_snapshot"
-
-    return out
-
-
-async def _fetch_equity_features(
-    symbol: str,
-    *,
-    expiry_iso: Optional[str] = None,
-    side: Optional[str] = None,
-    strike: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Fetch live market features using Polygon first, with Yahoo fallback."""
-    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-    if poly:
-        return poly
-    return await _fetch_yahoo_features(symbol)
-
-    out.update({k: v for k, v in techs.items() if v is not None})
-    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
-    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
-        lp = float(out["last"])
-        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
-
-    if opt_ctx:
-        out.update({k: v for k, v in opt_ctx.items() if v is not None})
-        out["nbbo_provider"] = "polygon:options_snapshot"
-
-    return out
-
-
-async def _fetch_equity_features(
-    symbol: str,
-    *,
-    expiry_iso: Optional[str] = None,
-    side: Optional[str] = None,
-    strike: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Fetch live market features using Polygon first, with Yahoo fallback."""
-    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-    if poly:
-        return poly
-    return await _fetch_yahoo_features(symbol)
-
-    out.update({k: v for k, v in techs.items() if v is not None})
-    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
-    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
-        lp = float(out["last"])
-        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
-
-    if opt_ctx:
-        out.update({k: v for k, v in opt_ctx.items() if v is not None})
-        out["nbbo_provider"] = "polygon:options_snapshot"
-
-    return out
-
-
-async def _fetch_equity_features(
-    symbol: str,
-    *,
-    expiry_iso: Optional[str] = None,
-    side: Optional[str] = None,
-    strike: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Fetch live market features using Polygon first, with Yahoo fallback."""
-    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-    if poly:
-        return poly
-    return await _fetch_yahoo_features(symbol)
-
-    out.update({k: v for k, v in techs.items() if v is not None})
-    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
-    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
-        lp = float(out["last"])
-        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
-
-    if opt_ctx:
-        out.update({k: v for k, v in opt_ctx.items() if v is not None})
-        out["nbbo_provider"] = "polygon:options_snapshot"
-
-    return out
-
-
-async def _fetch_equity_features(
-    symbol: str,
-    *,
-    expiry_iso: Optional[str] = None,
-    side: Optional[str] = None,
-    strike: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Fetch live market features using Polygon first, with Yahoo fallback."""
-    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-    if poly:
-        return poly
-    return await _fetch_yahoo_features(symbol)
-
-        day_key = rows[-1][0].date()
-        day_rows = [r for r in rows if r[0].date() == day_key]
-        prev_rows = [r for r in rows if r[0].date() < day_key]
-        prev_day = prev_rows[-78:] if prev_rows else []
-
+# =============================================================================
+# Worker entrypoint
+# =============================================================================
 async def process_tradingview_job(job: Dict[str, Any]) -> None:
     client = get_http_client()
     if client is None:
@@ -478,7 +418,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         return
 
     expiry = alert.get("expiry")
-    dte = None
+    dte: Optional[int] = None
     if expiry:
         try:
             dte = (datetime.fromisoformat(expiry).date() - datetime.now(timezone.utc).date()).days
@@ -499,6 +439,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "sr_headroom_ok": True,
         "nbbo_provider": "disabled",
     }
+
     live = await _fetch_equity_features(
         str(alert.get("symbol") or "").upper(),
         expiry_iso=alert.get("expiry"),
@@ -555,17 +496,19 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning("[daily-report] log snapshot failed: %r", e)
 
-    _append_decision_log({
-        "timestamp_local": market_now(),
-        "symbol": alert.get("symbol"),
-        "side": alert.get("side"),
-        "decision_final": decision_final,
-        "llm": llm,
-        "features": f,
-        "preflight_ok": pf_ok,
-        "preflight_checks": pf_checks,
-        "ibkr": {"enabled": False, "attempted": False, "result": None},
-    })
+    _append_decision_log(
+        {
+            "timestamp_local": market_now(),
+            "symbol": alert.get("symbol"),
+            "side": alert.get("side"),
+            "decision_final": decision_final,
+            "llm": llm,
+            "features": f,
+            "preflight_ok": pf_ok,
+            "preflight_checks": pf_checks,
+            "ibkr": {"enabled": False, "attempted": False, "result": None},
+        }
+    )
 
 
 def _append_decision_log(entry: Dict[str, Any]) -> None:
@@ -574,6 +517,7 @@ def _append_decision_log(entry: Dict[str, Any]) -> None:
         _DECISIONS_LOG.append(entry)
     except Exception as e:
         logger.warning("decision log append failed: %r", e)
+
 
 async def net_debug_info() -> Dict[str, Any]:
     return {
