@@ -434,6 +434,32 @@ async def _fetch_equity_features(
         return poly
     return await _fetch_yahoo_features(symbol)
 
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str] = None,
+    side: Optional[str] = None,
+    strike: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
+
         day_key = rows[-1][0].date()
         day_rows = [r for r in rows if r[0].date() == day_key]
         prev_rows = [r for r in rows if r[0].date() < day_key]
@@ -529,21 +555,25 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning("[daily-report] log snapshot failed: %r", e)
 
+    _append_decision_log({
+        "timestamp_local": market_now(),
+        "symbol": alert.get("symbol"),
+        "side": alert.get("side"),
+        "decision_final": decision_final,
+        "llm": llm,
+        "features": f,
+        "preflight_ok": pf_ok,
+        "preflight_checks": pf_checks,
+        "ibkr": {"enabled": False, "attempted": False, "result": None},
+    })
+
+
+def _append_decision_log(entry: Dict[str, Any]) -> None:
+    """Append decision entry to in-memory log with local safety guard."""
     try:
-        _DECISIONS_LOG.append({
-            "timestamp_local": market_now(),
-            "symbol": alert.get("symbol"),
-            "side": alert.get("side"),
-            "decision_final": decision_final,
-            "llm": llm,
-            "features": f,
-            "preflight_ok": pf_ok,
-            "preflight_checks": pf_checks,
-            "ibkr": {"enabled": False, "attempted": False, "result": None},
-        })
+        _DECISIONS_LOG.append(entry)
     except Exception as e:
         logger.warning("decision log append failed: %r", e)
-
 
 async def net_debug_info() -> Dict[str, Any]:
     return {
