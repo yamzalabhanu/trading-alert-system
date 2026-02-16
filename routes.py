@@ -3,10 +3,8 @@ import os
 import asyncio
 import logging
 from typing import Optional
-from urllib.parse import quote
 from datetime import datetime, timezone, timedelta, date as dt_date
 
-import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -272,12 +270,11 @@ async def alerts_window_status():
 @router.post("/webhook")
 async def webhook(
     request: Request,
-    ib: bool = False,
     force: bool = False,
     qty: int = 1,
     bypass_window: bool = False,  # for manual testing of the alert window guard
 ):
-    log.info("webhook received; ib=%s force=%s qty=%s bypass=%s", ib, force, qty, bypass_window)
+    log.info("webhook received; force=%s qty=%s bypass=%s", force, qty, bypass_window)
 
     # Enforce TradingView alert windows unless bypassed
     if ALERT_ENFORCE_WINDOW and not bypass_window and not _in_alert_window_cdt():
@@ -294,7 +291,7 @@ async def webhook(
 
     ok = engine.enqueue_webhook_job(
         alert_text=text,
-        flags={"ib_enabled": bool(ib), "qty": int(qty), "force_buy": bool(force)},
+        flags={"qty": int(qty), "force_buy": bool(force)},
     )
     if not ok:
         raise HTTPException(status_code=503, detail="Queue is full")
@@ -308,12 +305,11 @@ async def webhook(
 @router.post("/webhook/tradingview")
 async def webhook_tradingview(
     request: Request,
-    ib: bool = False,
     force: bool = False,
     qty: int = 1,
     bypass_window: bool = False,
 ):
-    return await webhook(request=request, ib=ib, force=force, qty=qty, bypass_window=bypass_window)
+    return await webhook(request=request, force=force, qty=qty, bypass_window=bypass_window)
 
 # ---------- uv-scan control & status ----------
 @router.get("/uvscan/status")
@@ -346,83 +342,6 @@ async def uvscan_stop():
 @router.get("/net/debug")
 async def net_debug():
     return await engine.net_debug_info()
-
-# Lightweight Polygon diagnostics
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-
-async def _http_json(client: httpx.AsyncClient, url: str, params=None, timeout: float = 8.0):
-    try:
-        r = await client.get(url, params=params or {}, timeout=timeout)
-        if r.status_code in (402, 403, 404, 429):
-            return {"status": r.status_code, "body": r.text[:400]}
-        r.raise_for_status()
-        js = r.json()
-        return js if isinstance(js, dict) else None
-    except Exception as e:
-        return {"error": str(e)}
-
-@router.get("/diag/polygon")
-async def diag_polygon(underlying: str, contract: str):
-    if not POLYGON_API_KEY:
-        raise HTTPException(400, "POLYGON_API_KEY not configured")
-    enc = quote(contract, safe="")
-    out = {}
-    async with httpx.AsyncClient(timeout=6.0) as HTTP:
-        out["single"] = await _http_json(
-            HTTP,
-            f"https://api.polygon.io/v3/snapshot/options/{underlying}/{enc}?",
-            {"apiKey": POLYGON_API_KEY},
-            6.0,
-        )
-        out["last_quote"] = await _http_json(
-            HTTP,
-            f"https://api.polygon.io/v3/quotes/options/{enc}/last",
-            {"apiKey": POLYGON_API_KEY},
-            6.0,
-        )
-        yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
-        out["open_close"] = await _http_json(
-            HTTP,
-            f"https://api.polygon.io/v1/open-close/options/{enc}/{yday}",
-            {"apiKey": POLYGON_API_KEY},
-            6.0,
-        )
-
-    def skim(d):
-        if not isinstance(d, dict):
-            return d
-        res = d.get("results")
-        return {
-            "keys": list(d.keys())[:10],
-            "sample": (res[:2] if isinstance(res, list) else (res if isinstance(res, dict) else d)),
-            "status_hint": d.get("status"),
-        }
-
-    return {
-        "single": skim(out.get("single")),
-        "last_quote": skim(out.get("last_quote")),
-        "open_close": skim(out.get("open_close")),
-    }
-
-# NBBO diag
-@router.get("/diag/nbbo")
-async def diag_nbbo(ticker: str):
-    from trading_engine import _http_get_any, _encode_ticker_path, POLYGON_API_KEY as PK
-    if not PK:
-        raise HTTPException(400, "POLYGON_API_KEY not configured")
-
-    enc = _encode_ticker_path(ticker)
-    url = f"https://api.polygon.io/v3/quotes/options/{enc}/last"
-    res = await _http_get_any(url, params={"apiKey": PK}, timeout=6.0)
-    body = res.get("body")
-    if isinstance(body, dict):
-        body_sample = {k: body[k] for k in list(body.keys())[:6]}
-    else:
-        body_sample = (body or "")[:800]
-    return {
-        "status": res.get("status"),
-        "body_sample": body_sample,
-    }
 
 # ---------- Daily EOD Report ----------
 @router.get("/reports/daily")
