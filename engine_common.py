@@ -2,6 +2,7 @@
 import os
 import re
 import math
+import json
 from typing import List
 import logging
 from urllib.parse import quote
@@ -99,11 +100,47 @@ async def get_alert_text_from_request(request: Request) -> str:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
             data = await request.json()
-            return str(data.get("message") or data.get("alert") or data.get("text") or "").strip()
+            msg = str(data.get("message") or data.get("alert") or data.get("text") or "").strip()
+            if msg:
+                return msg
+            # Accept direct TradingView/Pine JSON payloads too.
+            return json.dumps(data, separators=(",", ":"))
         body = await request.body()
         return body.decode("utf-8").strip()
     except Exception:
         return ""
+
+
+def _as_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    side_raw = str(payload.get("side") or payload.get("type") or payload.get("signal") or "").upper().strip()
+    side = "CALL" if side_raw in ("CALL", "BUY", "LONG", "BULL") else "PUT" if side_raw in ("PUT", "SELL", "SHORT", "BEAR") else None
+    symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("underlying") or "").upper().strip()
+    px = _as_float(payload.get("price") if payload.get("price") is not None else payload.get("last"))
+    strike = _as_float(payload.get("strike"))
+    expiry = str(payload.get("expiry") or "").strip()
+
+    if not side or not symbol or px is None or strike is None:
+        return None
+
+    out: Dict[str, Any] = {
+        "side": side,
+        "symbol": symbol,
+        "underlying_price_from_alert": px,
+        "strike": strike,
+    }
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
+        out["expiry"] = expiry
+    return out
+
 
 def parse_alert_text(text: str) -> Dict[str, Any]:
     m = ALERT_RE_WITH_EXP.match(text)
@@ -125,6 +162,17 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
             "underlying_price_from_alert": float(ul),
             "strike": float(strike),
         }
+
+    # Accept JSON payloads from TradingView/Pine webhook directly.
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            parsed = _parse_alert_json_payload(payload)
+            if parsed:
+                return parsed
+    except Exception:
+        pass
+
     raise HTTPException(status_code=400, detail="Unrecognized alert format")
 
 # =========================
