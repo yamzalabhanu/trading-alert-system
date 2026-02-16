@@ -330,6 +330,140 @@ async def _fetch_equity_features(
         return poly
     return await _fetch_yahoo_features(symbol)
 
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str] = None,
+    side: Optional[str] = None,
+    strike: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
+
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str] = None,
+    side: Optional[str] = None,
+    strike: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
+
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str] = None,
+    side: Optional[str] = None,
+    strike: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
+
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str] = None,
+    side: Optional[str] = None,
+    strike: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
+
+    out.update({k: v for k, v in techs.items() if v is not None})
+    out["regime_flag"] = "trending" if (out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None and abs(out["ema20"]-out["ema50"])/max(float(out["last"]),1e-9) > 0.002) else "choppy"
+    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
+        lp = float(out["last"])
+        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+
+    if opt_ctx:
+        out.update({k: v for k, v in opt_ctx.items() if v is not None})
+        out["nbbo_provider"] = "polygon:options_snapshot"
+
+    return out
+
+
+async def _fetch_equity_features(
+    symbol: str,
+    *,
+    expiry_iso: Optional[str] = None,
+    side: Optional[str] = None,
+    strike: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    return await _fetch_yahoo_features(symbol)
+
+        day_key = rows[-1][0].date()
+        day_rows = [r for r in rows if r[0].date() == day_key]
+        prev_rows = [r for r in rows if r[0].date() < day_key]
+        prev_day = prev_rows[-78:] if prev_rows else []
 
 async def process_tradingview_job(job: Dict[str, Any]) -> None:
     client = get_http_client()
@@ -440,8 +574,6 @@ def _append_decision_log(entry: Dict[str, Any]) -> None:
         _DECISIONS_LOG.append(entry)
     except Exception as e:
         logger.warning("decision log append failed: %r", e)
-
-
 
 async def net_debug_info() -> Dict[str, Any]:
     return {

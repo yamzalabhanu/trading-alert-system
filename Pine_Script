@@ -44,6 +44,19 @@ trendFilter     = input.bool(true,  "Gate by Market Regime")
 // Alert & Risk Settings
 minScore        = input.int(5, "Minimum Confirmation Score", minval=1, maxval=9)
 minScoreDiff    = input.int(5, "Minimum Score Difference", minval=1, maxval=9)
+confluenceMin   = input.int(4, "Min directional confluence", minval=1, maxval=8)
+maxOpposingScore= input.int(3, "Max opposing score allowed", minval=0, maxval=9)
+requireStructureBreak = input.bool(true, "Require structure break (ORB/PDH/PDL/PM)")
+requireVwapSide = input.bool(true, "Require price on correct VWAP side")
+useSessionFilter = input.bool(true, "Session quality window filter")
+noTradeFirstMin = input.int(10, "No-trade first N minutes", minval=0, maxval=120)
+noTradeLastMin  = input.int(20, "No-trade last N minutes", minval=0, maxval=120)
+minAtrPctFilter = input.float(0.10, "Min ATR% filter", step=0.01)
+maxAtrPctFilter = input.float(4.00, "Max ATR% filter", step=0.10)
+avoidRsiExtremes = input.bool(true, "Avoid RSI exhaustion")
+rsiBuyMax = input.int(72, "Max RSI for CALL", minval=50, maxval=95)
+rsiSellMin = input.int(28, "Min RSI for PUT", minval=5, maxval=50)
+maxBodyAtr = input.float(1.20, "Max candle body / ATR", step=0.05)
 requireVolume   = input.bool(true, "Require Unusual Volume")
 baseAdxThresh   = input.int(25, "Base ADX Strength", minval=0, maxval=50)
 signalCooldown  = input.int(50, "Cooldown (bars) between signals", minval=0, maxval=200)
@@ -589,6 +602,45 @@ dynAdx = math.round(baseAdxThresh + (atrPct))
 needAdxBuy  = adxValue >= dynAdx
 needAdxSell = adxValue >= dynAdx
 
+// Directional confluence and structural checks (reduce false positives)
+buyConfluence =
+     (emaFast > emaSlow ? 1 : 0) +
+     (vwmacd > vwmacdSignal ? 1 : 0) +
+     (plusDI > minusDI ? 1 : 0) +
+     (close > vwap ? 1 : 0) +
+     (mtfAlignedUp ? 1 : 0) +
+     (trendUp ? 1 : 0) +
+     (mUp ? 1 : 0) +
+     (adxValue >= dynAdx ? 1 : 0)
+
+sellConfluence =
+     (emaFast < emaSlow ? 1 : 0) +
+     (vwmacd < vwmacdSignal ? 1 : 0) +
+     (minusDI > plusDI ? 1 : 0) +
+     (close < vwap ? 1 : 0) +
+     (mtfAlignedDn ? 1 : 0) +
+     (trendDown ? 1 : 0) +
+     (mDown ? 1 : 0) +
+     (adxValue >= dynAdx ? 1 : 0)
+
+buyStructureOk = (prevHighRetest or fiveDayHighRetest or (orb15Established and close > orb15High) or (orbEstablished and close > orbHigh) or (not na(premarketHigh) and close > premarketHigh))
+sellStructureOk = (prevLowRetest or fiveDayLowRetest or (orb15Established and close < orb15Low) or (orbEstablished and close < orbLow) or (not na(premarketLow) and close < premarketLow))
+
+vwapSideBuyOk = not requireVwapSide or close >= vwap
+vwapSideSellOk = not requireVwapSide or close <= vwap
+confluenceBuyOk = buyConfluence >= confluenceMin
+confluenceSellOk = sellConfluence >= confluenceMin
+oppositionBuyOk = sellScore <= maxOpposingScore
+oppositionSellOk = buyScore <= maxOpposingScore
+structureBuyOk = not requireStructureBreak or buyStructureOk
+structureSellOk = not requireStructureBreak or sellStructureOk
+sessionWindowOk = (not useSessionFilter) or (inRTH and minsFromOpen >= noTradeFirstMin and minsToClose >= noTradeLastMin)
+atrRegimeOk = (atrPct * 100.0) >= minAtrPctFilter and (atrPct * 100.0) <= maxAtrPctFilter
+rsiBuyOk = not avoidRsiExtremes or (rsiValue <= rsiBuyMax)
+rsiSellOk = not avoidRsiExtremes or (rsiValue >= rsiSellMin)
+candleBodyAtr = atr > 0 ? (pb_body / atr) : 0.0
+candleExtensionOk = candleBodyAtr <= maxBodyAtr
+
 mtfConfirmBuy  = useMTF ? (requireMTF ? (htfClosed and (mtfCrossUp or mtfAlignedUp)) : true) : true
 mtfConfirmSell = useMTF ? (requireMTF ? (htfClosed and (mtfCrossDown or mtfAlignedDn)) : true) : true
 volumeConfirm  = requireVolume ? unusualVol : true
@@ -660,6 +712,7 @@ sellTrigger := sellTrigger and (confirmOnClose ? barstate.isconfirmed : true)
 // Strike & expiry helpers
 // =====================
 getStrikeStep(p) => p >= 200 ? 5.0 : p >= 75 ? 2.5 : p >= 25 ? 1.0 : 0.5
+
 getRoundedStrike() =>
     step = getStrikeStep(close)
     math.round(close / step) * step
