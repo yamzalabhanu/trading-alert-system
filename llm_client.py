@@ -11,7 +11,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("trading_engine.llm")
 
-# --- thresholds (env overridable) --------------------------------------------
+# --- thresholdsc (env overridable) --------------------------------------------
 BUY_THRESHOLD = float(os.getenv("LLM_BUY_THRESHOLD", "60"))
 WAIT_THRESHOLD = float(os.getenv("LLM_WAIT_THRESHOLD", "45"))
 
