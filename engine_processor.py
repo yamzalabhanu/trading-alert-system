@@ -19,7 +19,7 @@ from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from scoring import compute_decision_score, map_score_to_rating
 from daily_reporter import log_alert_snapshot
-from polygon_client import PolygonClient, polygon_enabled, MassiveClient, massive_enabled
+from polygon_client import PolygonClient, polygon_enabled
 
 try:
     from reporting import _DECISIONS_LOG
@@ -29,21 +29,10 @@ except Exception:
 logger = logging.getLogger("trading_engine")
 NY_TZ = ZoneInfo("America/New_York")
 
-# -----------------------------------------------------------------------------
-# Provider policy (polygon | massive | hybrid)
-# -----------------------------------------------------------------------------
-DATA_PROVIDER = os.getenv("DATA_PROVIDER", "massive").strip().lower()  # polygon|massive|hybrid
-
+DATA_PROVIDER = os.getenv("DATA_PROVIDER", "polygon").strip().lower()  # polygon|hybrid
 USE_YAHOO_FALLBACK = str(os.getenv("USE_YAHOO_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
-USE_MASSIVE_FALLBACK = str(os.getenv("USE_MASSIVE_FALLBACK", "1")).strip().lower() in ("1", "true", "yes", "on")
-
-# If enabled, engine_common should allow bypassing time window (see "other changes" section)
-BYPASS_ALERT_WINDOW = str(os.getenv("ALERT_WINDOW_BYPASS", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
-# =============================================================================
-# Small TA helpers
-# =============================================================================
 def _ema_last(vals: List[float], period: int) -> Optional[float]:
     if len(vals) < period:
         return None
@@ -114,7 +103,6 @@ def _last_close(bars: List[Dict[str, Any]]) -> Optional[float]:
 def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
     if not daily_bars or len(daily_bars) < 16:
         return None
-
     trs: List[float] = []
     prev_c: Optional[float] = None
     for b in daily_bars[-16:]:
@@ -123,189 +111,165 @@ def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
         c = b.get("c")
         if not all(isinstance(x, (int, float)) for x in (h, l, c)):
             continue
-        h = float(h)
-        l = float(l)
-        c = float(c)
+        h = float(h); l = float(l); c = float(c)
         if prev_c is None:
             tr = h - l
         else:
             tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
         trs.append(tr)
         prev_c = c
-
     if len(trs) < 15:
         return None
     return sum(trs[-14:]) / 14.0
 
 
-# =============================================================================
-# Massive primary features (+ MTF summaries)
-# =============================================================================
-async def _fetch_massive_features(
-    symbol: str,
-    *,
-    expiry_iso: Optional[str],
-    side: Optional[str],
-    strike: Optional[float],
-) -> Dict[str, Any]:
+async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
     cli = get_http_client()
     if cli is None:
         return {}
 
-    mc = MassiveClient(cli)
-    if not mc.enabled:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "5d", "interval": "5m", "includePrePost": "true", "events": "div,splits"}
+    try:
+        r = await cli.get(url, params=params, timeout=8.0)
+        r.raise_for_status()
+        js = r.json()
+    except Exception as e:
+        logger.warning("[features] yahoo fetch failed for %s: %r", symbol, e)
         return {}
 
     try:
-        # Equity
-        last_trade_task = mc.get_last_trade(symbol)
-        last_quote_task = mc.get_last_quote(symbol)
-        agg5m_task = mc.get_aggs(symbol, multiplier=5, timespan="minute", lookback_days=5, limit=600)
+        res = (js.get("chart") or {}).get("result") or []
+        if not res:
+            return {}
 
-        # MTF
-        daily_task = mc.get_aggs(symbol, multiplier=1, timespan="day", lookback_days=260, limit=260)
-        h1_task = mc.get_aggs(symbol, multiplier=1, timespan="hour", lookback_days=30, limit=800)
-        m15_task = mc.get_aggs(symbol, multiplier=15, timespan="minute", lookback_days=10, limit=1200)
+        node = res[0]
+        ts = node.get("timestamp") or []
+        q = ((node.get("indicators") or {}).get("quote") or [{}])[0]
+        closes_raw = q.get("close") or []
+        highs_raw = q.get("high") or []
+        lows_raw = q.get("low") or []
+        opens_raw = q.get("open") or []
+        vols_raw = q.get("volume") or []
 
-        # Options (only if identifiers present)
-        if expiry_iso and side and (strike is not None):
-            opt_task: Awaitable[Dict[str, Any]] = mc.get_targeted_option_context(
-                symbol, expiry_iso=expiry_iso, side=side, strike=strike
-            )
-        else:
-            async def _empty() -> Dict[str, Any]:
-                return {}
-            opt_task = _empty()
+        rows: List[Tuple[datetime, float, float, float, float, float]] = []
+        for t, o, h, l, c, v in zip(ts, opens_raw, highs_raw, lows_raw, closes_raw, vols_raw):
+            if c is None or h is None or l is None or o is None:
+                continue
+            dt = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(NY_TZ)
+            rows.append((dt, float(o), float(h), float(l), float(c), float(v or 0.0)))
 
-        last_trade, last_quote, aggs5m, daily_bars, h1_bars, m15_bars, opt_ctx = await asyncio.gather(
-            last_trade_task,
-            last_quote_task,
-            agg5m_task,
-            daily_task,
-            h1_task,
-            m15_task,
-            opt_task,
+        if len(rows) < 30:
+            return {}
+
+        closes = [rr[4] for rr in rows]
+        vols = [rr[5] for rr in rows]
+        last_px = closes[-1]
+
+        ema20 = _ema_last(closes, 20)
+        ema50 = _ema_last(closes, 50)
+        ema200 = _ema_last(closes, 200)
+        rsi14 = _rsi_last(closes, 14)
+
+        ema12_s = _ema_series(closes, 12)
+        ema26_s = _ema_series(closes, 26)
+        macd_series: List[float] = []
+        for a, b in zip(ema12_s, ema26_s):
+            if a is not None and b is not None:
+                macd_series.append(a - b)
+        macd_line = macd_series[-1] if macd_series else None
+        macd_signal = _ema_last(macd_series, 9) if macd_series else None
+        macd_hist = (macd_line - macd_signal) if (macd_line is not None and macd_signal is not None) else None
+
+        sma20 = sum(closes[-20:]) / 20.0 if len(closes) >= 20 else None
+        st = _stddev(closes[-20:]) if len(closes) >= 20 else None
+        bb_upper = (sma20 + 2 * st) if (sma20 is not None and st is not None) else None
+        bb_lower = (sma20 - 2 * st) if (sma20 is not None and st is not None) else None
+
+        day_key = rows[-1][0].date()
+        day_rows = [rr for rr in rows if rr[0].date() == day_key]
+        prev_rows = [rr for rr in rows if rr[0].date() < day_key]
+        prev_day = prev_rows[-78:] if prev_rows else []
+
+        prev_high = max((rr[2] for rr in prev_day), default=None)
+        prev_low = min((rr[3] for rr in prev_day), default=None)
+        prev_close = prev_day[-1][4] if prev_day else None
+        prev_open = prev_day[0][1] if prev_day else None
+
+        pm = [
+            rr for rr in day_rows
+            if (rr[0].hour > 4 or (rr[0].hour == 4 and rr[0].minute >= 0))
+            and (rr[0].hour < 9 or (rr[0].hour == 9 and rr[0].minute < 30))
+        ]
+        pm_high = max((rr[2] for rr in pm), default=None)
+        pm_low = min((rr[3] for rr in pm), default=None)
+
+        rth = [
+            rr for rr in day_rows
+            if (rr[0].hour > 9 or (rr[0].hour == 9 and rr[0].minute >= 30))
+            and (rr[0].hour < 16)
+        ]
+        orb15 = [rr for rr in rth if (rr[0].hour == 9 and rr[0].minute < 45)]
+        orb15_high = max((rr[2] for rr in orb15), default=None)
+        orb15_low = min((rr[3] for rr in orb15), default=None)
+
+        vwap_num = sum((((rr[2] + rr[3] + rr[4]) / 3.0) * rr[5]) for rr in rth)
+        vwap_den = sum(rr[5] for rr in rth)
+        vwap = (vwap_num / vwap_den) if vwap_den > 0 else None
+
+        vol_now = day_rows[-1][5] if day_rows else vols[-1]
+        qchg = _safe_pct(last_px, prev_close)
+
+        regime_flag = "trending" if (
+            ema20 is not None and ema50 is not None and abs(ema20 - ema50) / max(last_px, 1e-9) > 0.002
+        ) else "choppy"
+
+        mtf_align = bool(
+            ema20 is not None and ema50 is not None and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50))
         )
+
+        return {
+            "last": last_px,
+            "mid": last_px,
+            "rsi14": rsi14,
+            "ema20": ema20,
+            "ema50": ema50,
+            "ema200": ema200,
+            "sma20": sma20,
+            "macd_line": macd_line,
+            "macd_signal": macd_signal,
+            "macd_hist": macd_hist,
+            "bb_upper": bb_upper,
+            "bb_lower": bb_lower,
+            "vwap": vwap,
+            "vwap_dist": _safe_pct(last_px, vwap),
+            "orb15_high": orb15_high,
+            "orb15_low": orb15_low,
+            "prev_open": prev_open,
+            "prev_high": prev_high,
+            "prev_low": prev_low,
+            "prev_close": prev_close,
+            "premarket_high": pm_high,
+            "premarket_low": pm_low,
+            "quote_change_pct": qchg,
+            "vol": vol_now,
+            "oi": None,
+            "option_spread_pct": None,
+            "quote_age_sec": 0,
+            "nbbo_provider": "yahoo:equity",
+            "em_vs_be_ok": True,
+            "mtf_align": mtf_align,
+            "sr_headroom_ok": True,
+            "regime_flag": regime_flag,
+            "ta_src": "yahoo_chart_5m",
+            "synthetic_nbbo_used": True,
+            "data_provider": "yahoo",
+        }
     except Exception as e:
-        logger.warning("[features] massive fetch failed for %s: %r", symbol, e)
+        logger.warning("[features] parse error for %s: %r", symbol, e)
         return {}
 
-    out: Dict[str, Any] = {
-        "ta_src": "massive_rest",
-        "data_provider": "massive",
-        "nbbo_provider": "massive:equity",
-        "synthetic_nbbo_used": False,
-        "em_vs_be_ok": True,
-        "sr_headroom_ok": True,
-        "mtf_align": True,
-    }
 
-    # Quote / trade
-    bid = last_quote.get("bid")
-    ask = last_quote.get("ask")
-    if isinstance(bid, (int, float)):
-        out["bid"] = float(bid)
-    if isinstance(ask, (int, float)):
-        out["ask"] = float(ask)
-    if isinstance(out.get("bid"), float) and isinstance(out.get("ask"), float):
-        out["mid"] = (out["bid"] + out["ask"]) / 2.0
-
-    px = last_trade.get("price")
-    if isinstance(px, (int, float)):
-        out["last"] = float(px)
-
-    # 5m bars (VWAP/ORB + basic tech derived in your PolygonClient tech bundle; here we keep it minimal)
-    bars = aggs5m or []
-    if bars:
-        closes = [float(x.get("c")) for x in bars if isinstance(x.get("c"), (int, float))]
-        highs = [float(x.get("h")) for x in bars if isinstance(x.get("h"), (int, float))]
-        lows = [float(x.get("l")) for x in bars if isinstance(x.get("l"), (int, float))]
-        vols = [float(x.get("v") or 0.0) for x in bars]
-
-        if closes:
-            out.setdefault("last", closes[-1])
-            if len(closes) >= 15:
-                out["orb15_high"] = max(highs[:3]) if len(highs) >= 3 else None
-                out["orb15_low"] = min(lows[:3]) if len(lows) >= 3 else None
-            if len(vols) >= 20:
-                out["vol_avg20"] = sum(vols[-20:]) / 20.0
-
-            # VWAP (session-ish approximation using available bars)
-            try:
-                tps = [
-                    (
-                        (float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0,
-                        float(x.get("v") or 0.0),
-                    )
-                    for x in bars
-                    if all(isinstance(x.get(k), (int, float)) for k in ("h", "l", "c"))
-                ]
-                den = sum(v for _, v in tps)
-                if den > 0:
-                    out["vwap"] = sum(tp * v for tp, v in tps) / den
-                    out["vwap_dist"] = _safe_pct(out.get("last"), out.get("vwap"))
-            except Exception:
-                pass
-
-            # Light indicators (so LLM/scoring has something even without Polygon)
-            out["ema20"] = _ema_last(closes, 20)
-            out["ema50"] = _ema_last(closes, 50)
-            out["ema200"] = _ema_last(closes, 200)
-            out["rsi14"] = _rsi_last(closes, 14)
-
-            if len(closes) >= 20:
-                sma20 = sum(closes[-20:]) / 20.0
-                st = _stddev(closes[-20:])
-                out["sma20"] = sma20
-                if st is not None:
-                    out["bb_upper"] = sma20 + 2 * st
-                    out["bb_lower"] = sma20 - 2 * st
-
-    # Daily ATR / regime
-    atr14 = _atr14_from_daily(daily_bars or [])
-    if atr14 is not None:
-        out["atr14_daily"] = atr14
-        if out.get("last") is not None:
-            out["atr14_pct"] = (atr14 / max(float(out["last"]), 1e-9)) * 100.0
-
-    out["bars_meta"] = {
-        "daily_n": len(daily_bars or []),
-        "h1_n": len(h1_bars or []),
-        "m15_n": len(m15_bars or []),
-        "m5_n": len(bars or []),
-    }
-    out["mtf"] = {
-        "daily_last": _last_close(daily_bars or []),
-        "h1_last": _last_close(h1_bars or []),
-        "m15_last": _last_close(m15_bars or []),
-        "m5_last": _last_close(bars or []),
-    }
-
-    out["regime_flag"] = (
-        "trending"
-        if (
-            out.get("ema20") is not None
-            and out.get("ema50") is not None
-            and out.get("last") is not None
-            and abs(out["ema20"] - out["ema50"]) / max(float(out["last"]), 1e-9) > 0.002
-        )
-        else "choppy"
-    )
-    if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
-        lp = float(out["last"])
-        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
-
-    # Options context (if available from Massive plan)
-    if opt_ctx and isinstance(opt_ctx, dict) and opt_ctx:
-        out.update({k: v for k, v in opt_ctx.items() if v is not None})
-        out["nbbo_provider"] = "massive:options"
-
-    return out
-
-
-# =============================================================================
-# Polygon primary features (+ MTF summaries) [kept, but will be blocked on your plan]
-# =============================================================================
 async def _fetch_polygon_features(
     symbol: str,
     *,
@@ -338,6 +302,7 @@ async def _fetch_polygon_features(
         agg5m_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
         tech_task = pc.get_technicals_bundle(symbol)
 
+        # Only fetch option context when we have option identifiers
         if expiry_iso and side and (strike is not None):
             opt_task: Awaitable[Dict[str, Any]] = pc.get_targeted_option_context(
                 symbol, expiry_iso=expiry_iso, side=side, strike=strike
@@ -352,15 +317,7 @@ async def _fetch_polygon_features(
         m15_task = _aggs_window(symbol, 15, "minute", (today - timedelta(days=10)).isoformat(), to_iso, limit=1200)
 
         stock_snap, last_quote, last_trade, aggs5m, techs, opt_ctx, daily_bars, h1_bars, m15_bars = await asyncio.gather(
-            snap_task,
-            quote_task,
-            trade_task,
-            agg5m_task,
-            tech_task,
-            opt_task,
-            daily_task,
-            h1_task,
-            m15_task,
+            snap_task, quote_task, trade_task, agg5m_task, tech_task, opt_task, daily_task, h1_task, m15_task
         )
     except Exception as e:
         logger.warning("[features] polygon fetch failed for %s: %r", symbol, e)
@@ -424,10 +381,7 @@ async def _fetch_polygon_features(
 
             try:
                 tps = [
-                    (
-                        (float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0,
-                        float(x.get("v") or 0.0),
-                    )
+                    (((float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0), float(x.get("v") or 0.0)))
                     for x in bars
                     if all(isinstance(x.get(k), (int, float)) for k in ("h", "l", "c"))
                 ]
@@ -481,17 +435,6 @@ async def _fetch_polygon_features(
     return out
 
 
-# =============================================================================
-# Yahoo fallback features (kept; optional)
-# =============================================================================
-async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
-    # keep your existing yahoo implementation if you still want it
-    return {}
-
-
-# =============================================================================
-# Unified features fetch (provider policy)
-# =============================================================================
 async def _fetch_equity_features(
     symbol: str,
     *,
@@ -499,34 +442,14 @@ async def _fetch_equity_features(
     side: Optional[str] = None,
     strike: Optional[float] = None,
 ) -> Dict[str, Any]:
-    provider = DATA_PROVIDER
-
-    if provider == "massive":
-        return await _fetch_massive_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-
-    if provider == "polygon":
-        return await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-
-    # hybrid: polygon first, fallback to massive, then optional yahoo
-    if provider == "hybrid":
-        poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-        if poly:
-            return poly
-        if USE_MASSIVE_FALLBACK:
-            ms = await _fetch_massive_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
-            if ms:
-                return ms
-        if USE_YAHOO_FALLBACK:
-            return await _fetch_yahoo_features(symbol)
-        return {}
-
-    # unknown -> try massive
-    return await _fetch_massive_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
+    if poly:
+        return poly
+    if DATA_PROVIDER == "hybrid" and USE_YAHOO_FALLBACK:
+        return await _fetch_yahoo_features(symbol)
+    return {}
 
 
-# =============================================================================
-# Worker entrypoint
-# =============================================================================
 async def process_tradingview_job(job: Dict[str, Any]) -> None:
     client = get_http_client()
     if client is None:
@@ -539,7 +462,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] bad alert payload: %s", e)
         return
 
-    # Pull extra TradingView metadata if present
+    # Meta extracted directly from alert (now consistent keys from engine_common.py)
     tv_meta_keys = [
         "source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange",
         "level", "ats", "bp", "tp1", "tp2", "tp3", "trail", "relvol", "relVol", "chop",
@@ -567,7 +490,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "mtf_align": True,
         "sr_headroom_ok": True,
         "nbbo_provider": "disabled",
-        "tv_meta": tv_meta,  # ✅
+        "tv_meta": tv_meta,
     }
 
     live = await _fetch_equity_features(
@@ -620,7 +543,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             meta_bits.append(f"reason={tv_meta.get('reason')}")
 
         meta_note = (" | " + ", ".join(meta_bits)) if meta_bits else ""
-        data_note = f"📊 Data: {provider} ({src}){meta_note}" if live else f"⚠️ Live data unavailable; using alert baseline{meta_note}"
+
+        if live:
+            data_note = f"📊 Data: {provider} ({src}){meta_note}"
+        else:
+            data_note = f"⚠️ Live data unavailable; using alert baseline{meta_note}"
 
         tg_text = compose_telegram_text(
             alert=alert,
@@ -675,15 +602,13 @@ def _append_decision_log(entry: Dict[str, Any]) -> None:
 
 
 async def net_debug_info() -> Dict[str, Any]:
+    md = "polygon_only" if (DATA_PROVIDER == "polygon") else f"hybrid(yahoo_fallback={USE_YAHOO_FALLBACK})"
     return {
         "integrations": {
             "ibkr": "disabled",
             "polygon": "enabled" if polygon_enabled() else "disabled",
-            "massive": "enabled" if massive_enabled() else "disabled",
-            "market_data": DATA_PROVIDER,
-            "yahoo_fallback": USE_YAHOO_FALLBACK,
-            "massive_fallback": USE_MASSIVE_FALLBACK,
-            "alert_window_bypass": BYPASS_ALERT_WINDOW,
+            "perplexity": "disabled",
+            "market_data": md,
         }
     }
 
