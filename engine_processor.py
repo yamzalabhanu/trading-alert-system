@@ -14,6 +14,7 @@ from engine_common import (
     parse_alert_text,
     preflight_ok,
     compose_telegram_text,
+    round_strike_to_common_increment,
 )
 from llm_client import analyze_with_openai
 from telegram_client import send_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -34,6 +35,12 @@ NY_TZ = ZoneInfo("America/New_York")
 # -----------------------------------------------------------------------------
 DATA_PROVIDER = os.getenv("DATA_PROVIDER", "polygon").strip().lower()  # polygon|hybrid
 USE_YAHOO_FALLBACK = str(os.getenv("USE_YAHOO_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+# -----------------------------------------------------------------------------
+# NEW: Alert inference knobs (for enriched JSON alerts that omit strike/expiry)
+# -----------------------------------------------------------------------------
+DEFAULT_EXPIRY_MODE = os.getenv("DEFAULT_EXPIRY_MODE", "next_friday").strip().lower()  # next_friday|two_weeks_friday
+DEFAULT_STRIKE_MODE = os.getenv("DEFAULT_STRIKE_MODE", "rounded").strip().lower()  # rounded|level
 
 
 # =============================================================================
@@ -131,6 +138,33 @@ def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
     if len(trs) < 15:
         return None
     return sum(trs[-14:]) / 14.0
+
+
+# =============================================================================
+# NEW: inference helpers for missing strike/expiry
+# =============================================================================
+def _next_friday(d: date) -> date:
+    return d + timedelta(days=(4 - d.weekday()) % 7)
+
+
+def _infer_expiry_iso(mode: str) -> str:
+    today = datetime.now(timezone.utc).date()
+    if mode == "two_weeks_friday":
+        return (_next_friday(today) + timedelta(days=7)).isoformat()
+    return _next_friday(today).isoformat()
+
+
+def _infer_strike(alert: Dict[str, Any]) -> Optional[float]:
+    # Prefer level if configured and present; else round underlying
+    if DEFAULT_STRIKE_MODE == "level" and isinstance(alert.get("level"), (int, float)):
+        try:
+            return float(alert["level"])
+        except Exception:
+            return None
+    ul = alert.get("underlying_price_from_alert")
+    if isinstance(ul, (int, float)):
+        return float(round_strike_to_common_increment(float(ul)))
+    return None
 
 
 # =============================================================================
@@ -318,7 +352,14 @@ async def _fetch_polygon_features(
     async def _empty_dict() -> Dict[str, Any]:
         return {}
 
-    async def _aggs_window(sym: str, multiplier: int, timespan: str, from_: str, to: str, limit: int) -> List[Dict[str, Any]]:
+    async def _aggs_window(
+        sym: str,
+        multiplier: int,
+        timespan: str,
+        from_: str,
+        to: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
         if hasattr(pc, "get_aggs_window"):
             return await pc.get_aggs_window(sym, multiplier=multiplier, timespan=timespan, from_=from_, to=to, limit=limit)
         if timespan in ("minute", "hour", "day"):
@@ -334,9 +375,7 @@ async def _fetch_polygon_features(
 
         # ✅ Only fetch option context when we have option identifiers
         if expiry_iso and side and (strike is not None):
-            opt_task: Awaitable[Dict[str, Any]] = pc.get_targeted_option_context(
-                symbol, expiry_iso=expiry_iso, side=side, strike=strike
-            )
+            opt_task: Awaitable[Dict[str, Any]] = pc.get_targeted_option_context(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
         else:
             opt_task = _empty_dict()
 
@@ -512,11 +551,41 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] bad alert payload: %s", e)
         return
 
+    # -------------------------------------------------------------------------
+    # NEW: infer missing expiry/strike for enriched JSON alerts
+    # -------------------------------------------------------------------------
+    if not alert.get("expiry"):
+        alert["expiry"] = _infer_expiry_iso(DEFAULT_EXPIRY_MODE)
+    if alert.get("strike") is None:
+        strike_guess = _infer_strike(alert)
+        if strike_guess is not None:
+            alert["strike"] = float(strike_guess)
+
     # Pull extra TradingView metadata if present (from JSON passthrough)
     tv_meta_keys = [
-        "source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange",
-        "level", "ats", "bp", "tp1", "tp2", "tp3", "trail", "relvol", "chop",
-        "fast_stop", "ason",
+        "source",
+        "model",
+        "confirm_tf",
+        "chart_tf",
+        "event",
+        "reason",
+        "exchange",
+        "level",
+        "ats",
+        "bp",
+        "tp1",
+        "tp2",
+        "tp3",
+        "trail",
+        "relVol",
+        "chop",
+        "adx",
+        "fast_stop",
+        "ason",
+        # also keep your engine_common passthrough keys if present:
+        "alert_source",
+        "alert_model",
+        "alert_event",
     ]
     tv_meta: Dict[str, Any] = {k: alert.get(k) for k in tv_meta_keys if alert.get(k) is not None}
 
@@ -543,6 +612,14 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "nbbo_provider": "disabled",
         # ✅ store meta on features too (helps LLM/scoring/telemetry)
         "tv_meta": tv_meta,
+        # ✅ baseline confirmation fields (so LLM sees them even when live data fails)
+        "adx": alert.get("adx"),
+        "relVol": alert.get("relVol"),
+        "chop": alert.get("chop"),
+        "level": alert.get("level"),
+        "alert_event": alert.get("alert_event") or alert.get("event"),
+        "alert_model": alert.get("alert_model") or alert.get("model"),
+        "alert_source": alert.get("alert_source") or alert.get("source"),
     }
 
     live = await _fetch_equity_features(
@@ -557,7 +634,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     pf_ok, pf_checks = preflight_ok(f)
 
-    # LLM analysis (include meta in alert payload by attaching into alert)
+    # LLM analysis
     try:
         llm = await analyze_with_openai(alert, f)
         consume_llm()
@@ -571,7 +648,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         }
 
     # If this is an explicit EXIT event, keep decision semantics but log it clearly
-    event = str(alert.get("event") or "").lower().strip()
+    event = str(alert.get("event") or alert.get("alert_event") or "").lower().strip()
     decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
     if event == "exit":
         decision_final = f"{decision_final}_exit"
@@ -588,14 +665,20 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         provider = str(f.get("data_provider") or "unknown")
 
         meta_bits = []
-        if tv_meta.get("event"):
-            meta_bits.append(f"event={tv_meta.get('event')}")
+        if tv_meta.get("event") or tv_meta.get("alert_event"):
+            meta_bits.append(f"event={tv_meta.get('event') or tv_meta.get('alert_event')}")
         if tv_meta.get("confirm_tf"):
             meta_bits.append(f"confirm={tv_meta.get('confirm_tf')}")
-        if tv_meta.get("model"):
-            meta_bits.append(f"model={tv_meta.get('model')}")
+        if tv_meta.get("model") or tv_meta.get("alert_model"):
+            meta_bits.append(f"model={tv_meta.get('model') or tv_meta.get('alert_model')}")
         if tv_meta.get("reason"):
             meta_bits.append(f"reason={tv_meta.get('reason')}")
+        if tv_meta.get("adx") is not None:
+            meta_bits.append(f"adx={tv_meta.get('adx')}")
+        if tv_meta.get("relVol") is not None:
+            meta_bits.append(f"relVol={tv_meta.get('relVol')}")
+        if tv_meta.get("chop") is not None:
+            meta_bits.append(f"chop={tv_meta.get('chop')}")
 
         meta_note = (" | " + ", ".join(meta_bits)) if meta_bits else ""
 
@@ -644,7 +727,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "timestamp_local": market_now(),
             "symbol": alert.get("symbol"),
             "side": alert.get("side"),
-            "event": alert.get("event"),
+            "event": alert.get("event") or alert.get("alert_event"),
             "decision_final": decision_final,
             "llm": llm,
             "features": f,
