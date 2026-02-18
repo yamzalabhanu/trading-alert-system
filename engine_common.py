@@ -55,12 +55,12 @@ SCAN_MIN_OI_RTH = int(os.getenv("SCAN_MIN_OI_RTH", os.getenv("SCAN_MIN_OI", "500
 SCAN_MIN_VOL_AH = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
 SCAN_MIN_OI_AH = int(os.getenv("SCAN_MIN_OI_AH", "100"))
 
-# Keep these env toggles defined (even if you’ve disabled messages elsewhere)
+# Keep these env toggles defined
 SEND_CHAIN_SCAN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "0"))
 SEND_CHAIN_SCAN_TOPN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "0"))
 REPLACE_IF_NO_NBBO = _env_truthy(os.getenv("REPLACE_IF_NO_NBBO", "1"))
 
-# NEW: allow enriched JSON alerts without strike/expiry
+# Allow enriched JSON alerts without strike/expiry (equity-only ok)
 ALLOW_NO_STRIKE_JSON = _env_truthy(os.getenv("ALLOW_NO_STRIKE_JSON", "1"))
 
 # =========================
@@ -111,6 +111,8 @@ ALERT_RE_NO_EXP = re.compile(
 # -----------------------------
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 _NA_TOKEN_RE = re.compile(r":\s*na(\s*[,}])", re.IGNORECASE)  # :na, or :na}
+_DOUBLE_COMMA_RE = re.compile(r",\s*,+")  # ",," or ", ,"
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # invalid JSON control chars
 
 
 def _extract_json_object(s: str) -> Optional[str]:
@@ -128,17 +130,36 @@ def _salvage_json_text(s: str) -> str:
       - extra prefix/suffix text around JSON
       - Pine 'na' token => JSON null
       - trailing commas before } or ]
+      - accidental double commas:  "tp1":null,, "x":1
+      - stray control chars
     """
     s = (s or "").strip()
     obj = _extract_json_object(s)
     if obj is not None:
         s = obj
+
+    s = _CONTROL_CHARS_RE.sub("", s)
     s = _NA_TOKEN_RE.sub(r": null\1", s)
+
+    # Fix double commas anywhere
+    # Example: {"tp1":null,, "tp2":null}  -> {"tp1":null, "tp2":null}
+    while True:
+        s2 = _DOUBLE_COMMA_RE.sub(",", s)
+        if s2 == s:
+            break
+        s = s2
+
+    # Remove trailing commas before closing braces/brackets
     s = _TRAILING_COMMA_RE.sub(r"\1", s)
     return s
 
 
 async def get_alert_text_from_request(request: Request) -> str:
+    """
+    Returns:
+      - plain text if client posted text/plain
+      - a JSON string if client posted application/json
+    """
     try:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -146,7 +167,6 @@ async def get_alert_text_from_request(request: Request) -> str:
             msg = str(data.get("message") or data.get("alert") or data.get("text") or "").strip()
             if msg:
                 return msg
-            # Accept direct TradingView/Pine JSON payloads too.
             return json.dumps(data, separators=(",", ":"))
         body = await request.body()
         return body.decode("utf-8").strip()
@@ -173,7 +193,7 @@ def _norm_side(side_raw: str) -> Optional[str]:
 
 
 def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # Support: your original schema + scalper_v4_2 schema
+    # Support: original schema + scalper_v4_2 schema
     side = _norm_side(str(payload.get("side") or payload.get("type") or payload.get("signal") or ""))
     symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("underlying") or "").upper().strip()
 
@@ -181,12 +201,7 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
     strike = _as_float(payload.get("strike"))
     expiry = str(payload.get("expiry") or "").strip()
 
-    # New: event/model passthrough (entry/exit etc.)
-    event = str(payload.get("event") or "").strip().lower() or None
-    model = str(payload.get("model") or "").strip() or None
-    source = str(payload.get("source") or "").strip() or None
-
-    # Must have at least side+symbol+price (strike can be inferred later)
+    # must have at least side+symbol+price
     if not side or not symbol or px is None:
         return None
 
@@ -196,24 +211,23 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         "underlying_price_from_alert": px,
     }
 
+    # Optional options fields
     if strike is not None:
         out["strike"] = strike
     if re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
         out["expiry"] = expiry
 
-    if event:
-        out["alert_event"] = event
-    if model:
-        out["alert_model"] = model
-    if source:
-        out["alert_source"] = source
+    # IMPORTANT: keep meta keys in the same names your processor/llm expect
+    # (do NOT rename to alert_event/etc.)
+    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
+        if payload.get(k) is not None:
+            out[k] = payload.get(k)
 
-    # Pass-through useful enriched fields if present
-    for k in ("adx", "relVol", "chop", "level", "confirm_tf", "chart_tf", "exchange", "reason", "tp1", "tp2", "tp3"):
+    # pass-through other useful fields (if present)
+    for k in ("adx", "relVol", "relvol", "chop", "tp1", "tp2", "tp3", "trail", "fast_stop", "ason", "bp", "ats"):
         if k in payload:
             out[k] = payload.get(k)
 
-    # If strike missing and policy disallows, reject
     if out.get("strike") is None and not ALLOW_NO_STRIKE_JSON:
         return None
 
@@ -254,7 +268,7 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
                 if parsed:
                     return parsed
         except Exception as e:
-            logger.debug("JSON parse failed (will try other formats): %s", e)
+            logger.debug("JSON parse failed: %s", e)
 
     raise HTTPException(status_code=400, detail="Unrecognized alert format")
 
@@ -355,6 +369,46 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
 
 
 # =========================
-# Telegram composition (unchanged below)
+# Telegram composition (keep unchanged)
 # =========================
 # ... keep your compose_telegram_text and the rest EXACTLY as you already have ...
+
+__all__ = [
+    "POLYGON_API_KEY",
+    "IBKR_ENABLED",
+    "IBKR_DEFAULT_QTY",
+    "IBKR_TIF",
+    "IBKR_ORDER_MODE",
+    "IBKR_USE_MID_AS_LIMIT",
+    "TARGET_DELTA_CALL",
+    "TARGET_DELTA_PUT",
+    "MAX_SPREAD_PCT",
+    "MAX_QUOTE_AGE_S",
+    "MIN_VOL_TODAY",
+    "MIN_OI",
+    "MIN_DTE",
+    "MAX_DTE",
+    "SCAN_MIN_VOL_RTH",
+    "SCAN_MIN_OI_RTH",
+    "SCAN_MIN_VOL_AH",
+    "SCAN_MIN_OI_AH",
+    "SEND_CHAIN_SCAN_ALERTS",
+    "SEND_CHAIN_SCAN_TOPN_ALERTS",
+    "REPLACE_IF_NO_NBBO",
+    "ALLOW_NO_STRIKE_JSON",
+    "market_now",
+    "llm_quota_snapshot",
+    "consume_llm",
+    "get_alert_text_from_request",
+    "parse_alert_text",
+    "round_strike_to_common_increment",
+    "_next_friday",
+    "same_week_friday",
+    "two_weeks_friday",
+    "is_same_week",
+    "_encode_ticker_path",
+    "_is_rth_now",
+    "_occ_meta",
+    "_ticker_matches_side",
+    "preflight_ok",
+]
