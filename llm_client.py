@@ -97,13 +97,16 @@ def _score_ema_stack(side: str, price: Optional[float], ema20: Optional[float], 
             if rel is None:
                 continue
             if side == "CALL":
-                if rel > 0: pts += 3.3; notes.append(f"{name}↑")
-                else:       pts -= 2.0; notes.append(f"{name}↓")
+                if rel > 0:
+                    pts += 3.3; notes.append(f"{name}↑")
+                else:
+                    pts -= 2.0; notes.append(f"{name}↓")
             else:
-                if rel < 0: pts += 3.3; notes.append(f"{name}↓")
-                else:       pts -= 2.0; notes.append(f"{name}↑")
+                if rel < 0:
+                    pts += 3.3; notes.append(f"{name}↓")
+                else:
+                    pts -= 2.0; notes.append(f"{name}↑")
     else:
-        # fallback to EMAs cross structure if price missing
         if ema20 and ema50 and ema200:
             if ema20 > ema50 > ema200:
                 pts += 6.0; notes.append("20>50>200")
@@ -119,13 +122,19 @@ def _score_macd(side: str, macd_line: Optional[float], macd_signal: Optional[flo
     pts = 0.0
     cross = macd_line - macd_signal
     if side == "CALL":
-        if macd_line > 0 and cross > 0: pts += 6.0
-        elif cross > 0:                  pts += 3.0
-        elif macd_line < 0 and cross<0:  pts -= 3.0
+        if macd_line > 0 and cross > 0:
+            pts += 6.0
+        elif cross > 0:
+            pts += 3.0
+        elif macd_line < 0 and cross < 0:
+            pts -= 3.0
     else:
-        if macd_line < 0 and cross < 0:  pts += 6.0
-        elif cross < 0:                  pts += 3.0
-        elif macd_line > 0 and cross>0:  pts -= 3.0
+        if macd_line < 0 and cross < 0:
+            pts += 6.0
+        elif cross < 0:
+            pts += 3.0
+        elif macd_line > 0 and cross > 0:
+            pts -= 3.0
     if macd_hist is not None:
         pts += _clip((macd_hist * (1 if side == "CALL" else -1)) * 4.0, -2.0, 2.0)
     return pts, _mk_reason("MACD", pts, f"macd={macd_line:.3f},sig={macd_signal:.3f}")
@@ -162,8 +171,10 @@ def _score_orb15(side: str, price: Optional[float], orb_high: Optional[float], o
     if price is None or (orb_high is None and orb_low is None):
         return 0.0, _mk_reason("ORB15", 0, "missing")
     pts = 0.0
-    if orb_high is not None and price > orb_high: pts += (6.0 if side == "CALL" else -4.0)
-    if orb_low  is not None and price < orb_low:  pts += (6.0 if side == "PUT"  else -4.0)
+    if orb_high is not None and price > orb_high:
+        pts += (6.0 if side == "CALL" else -4.0)
+    if orb_low is not None and price < orb_low:
+        pts += (6.0 if side == "PUT" else -4.0)
     if pts == 0.0:
         return 0.0, _mk_reason("ORB15", 0, "inside range")
     return pts, _mk_reason("ORB15", pts, "range break")
@@ -180,18 +191,24 @@ def _score_iv(side: str, iv: Optional[float], iv_rank: Optional[float]) -> Tuple
         return 0.0, _mk_reason("IV", 0, "missing")
     pts = 0.0
     if iv_rank is not None:
-        if 0.3 <= iv_rank <= 0.7: pts += 4.0
-        elif iv_rank > 0.85:      pts -= 3.0
-        elif iv_rank < 0.15:      pts -= 2.0
+        if 0.3 <= iv_rank <= 0.7:
+            pts += 4.0
+        elif iv_rank > 0.85:
+            pts -= 3.0
+        elif iv_rank < 0.15:
+            pts -= 2.0
     return pts, _mk_reason("IV", pts, f"rank={iv_rank!r}")
 
 def _score_liquidity(spread_pct: Optional[float], oi: Optional[float], vol: Optional[float], synthetic_nbbo_used: bool) -> Tuple[float, str]:
     pts = 0.0
     notes: List[str] = []
     if spread_pct is not None:
-        if spread_pct <= 5:   pts += 5.0; notes.append("tight")
-        elif spread_pct <=12: pts += 2.0; notes.append("ok")
-        else:                 pts -= 3.0; notes.append("wide")
+        if spread_pct <= 5:
+            pts += 5.0; notes.append("tight")
+        elif spread_pct <= 12:
+            pts += 2.0; notes.append("ok")
+        else:
+            pts -= 3.0; notes.append("wide")
     if oi is not None:
         if oi >= 5000: pts += 2.0
         elif oi >= 500: pts += 1.0
@@ -213,26 +230,26 @@ def _score_structure(mtf_align: Any, regime_flag: Any) -> Tuple[float, str]:
     return pts, _mk_reason("Structure", pts, f"mtf={mtf_align},regime={regime_flag}")
 
 def _score_dte(dte: Optional[float]) -> Tuple[float, str]:
+    """
+    UPDATED: DTE is optional now (equity-only alerts).
+    - If missing: neutral (0) instead of penalizing.
+    """
     if dte is None:
-        return 0.0, _mk_reason("DTE", 0, "missing")
+        return 0.0, _mk_reason("DTE", 0, "missing (equity-only ok)")
     if dte <= 0:
         return -10.0, _mk_reason("DTE", -10.0, "0DTE high risk")
     pts = 0.0
-    if dte < 2:            pts -= 3.0
-    elif 5 <= dte <= 35:   pts += 3.0
-    elif dte > 45:         pts -= 2.0
+    if dte < 2:
+        pts -= 3.0
+    elif 5 <= dte <= 35:
+        pts += 3.0
+    elif dte > 45:
+        pts -= 2.0
     return pts, _mk_reason("DTE", pts, f"{dte} days")
 
 # --- short flow scoring -------------------------------------------------------
 
 def _score_short_flow(side: str, f: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Teach the model to weigh short-volume & short-interest:
-      - Elevated short-volume ratio => mild credit to PUTs, caution for CALLs.
-      - Very low short-volume ratio => mild credit to CALLs, caution for PUTs.
-      - Short-interest (if present) => tiny squeeze-risk tilt:
-            small bonus to CALLs, small penalty to PUTs.
-    """
     pts = 0.0
     notes: List[str] = []
 
@@ -251,7 +268,6 @@ def _score_short_flow(side: str, f: Dict[str, Any]) -> Tuple[float, str]:
             pts += (SHORT_VOL_CALL_BONUS_LOW if side == "CALL" else SHORT_VOL_PUT_PEN_LOW)
             notes.append(f"SVR low {svr:.2f}")
 
-    # Short interest tiny squeeze-risk tilt (only if provided; magnitude not normalized)
     si = _f(f.get("short_interest"))
     if si is not None and si > 0:
         pts += (SHORT_INT_CALL_BONUS if side == "CALL" else SHORT_INT_PUT_PEN)
@@ -259,70 +275,44 @@ def _score_short_flow(side: str, f: Dict[str, Any]) -> Tuple[float, str]:
 
     return pts, _mk_reason("Short Flow", pts, ", ".join(notes) if notes else "neutral")
 
-# --- context scoring (prev-day, 5d avg, premarket, short vol) ----------------
+# --- context scoring ----------------------------------------------------------
 
 def _score_context(side: str, ul_price: Optional[float], f: Dict[str, Any]) -> Tuple[float, List[str]]:
-    """
-    Small, capped influence from recent context features:
-      - quote_change_pct vs prev close
-      - relation to 5-day avg PDH/PDL
-      - relation to premarket H/L
-      - short-volume ratio & short-interest (via _score_short_flow)
-    Total influence is scaled by W_CONTEXT (defaults to 10).
-    """
     pts = 0.0
     notes: List[str] = []
 
     chg = _f(f.get("quote_change_pct"))
     if chg is not None:
-        # modest momentum tilt
-        if side == "CALL":
-            pts += _clip(chg * 0.1, -2.0, 2.0)
-        else:
-            pts += _clip(-chg * 0.1, -2.0, 2.0)
+        pts += _clip((chg * 0.1) if side == "CALL" else (-chg * 0.1), -2.0, 2.0)
         notes.append(f"Δ% vs prev {chg:.2f}")
 
     avg_hi = _f(f.get("prev5_avg_high"))
     avg_lo = _f(f.get("prev5_avg_low"))
     if ul_price is not None:
         if avg_hi is not None and ul_price > avg_hi:
-            pts += (1.0 if side == "CALL" else -0.5)
-            notes.append(">5d avg high")
+            pts += (1.0 if side == "CALL" else -0.5); notes.append(">5d avg high")
         if avg_lo is not None and ul_price < avg_lo:
-            pts += (1.0 if side == "PUT" else -0.5)
-            notes.append("<5d avg low")
+            pts += (1.0 if side == "PUT" else -0.5); notes.append("<5d avg low")
 
     pm_hi = _f(f.get("premarket_high"))
     pm_lo = _f(f.get("premarket_low"))
     if ul_price is not None:
         if pm_hi is not None and ul_price > pm_hi:
-            pts += (0.7 if side == "CALL" else -0.3)
-            notes.append(">PM high")
+            pts += (0.7 if side == "CALL" else -0.3); notes.append(">PM high")
         if pm_lo is not None and ul_price < pm_lo:
-            pts += (0.7 if side == "PUT" else -0.3)
-            notes.append("<PM low")
+            pts += (0.7 if side == "PUT" else -0.3); notes.append("<PM low")
 
-    # short-flow contribution
     sf_pts, sf_note = _score_short_flow(side, f)
     pts += sf_pts
     notes.append(sf_note)
 
     return pts, ([_mk_reason("Context", pts, ", ".join(notes) if notes else "neutral")])
 
-# --- trade horizon inference (baseline) --------------------------------------
+# --- trade horizon inference --------------------------------------------------
 
 def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float, str]:
     """
-    Classify 'intraday' vs 'swing' with a simple score:
-      swing_score > 0 -> 'swing', else 'intraday'
-    Drivers:
-      + DTE 5..35 favors swing; 0-2 favors intraday
-      + Consistent EMA20/50/200 alignment favors swing
-      + ORB15 break favors intraday
-      + Large |VWAP distance| favors intraday scalps
-      + IV Rank mid favors swing; extreme high favors quick trades
-      + RSI mid-zone favors swing; extremes favor intraday mean-reversion
-      + Very wide spreads reduce intraday viability
+    UPDATED: Works even if strike/expiry/DTE are missing (equity-only alerts).
     """
     side = (alert.get("side") or "").upper()
     ul_price = _f(alert.get("underlying_price_from_alert"))
@@ -339,7 +329,6 @@ def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float
     swing = 0.0
     notes: List[str] = []
 
-    # DTE
     if dte is not None:
         if dte <= 2:
             swing -= 3.0; notes.append("short DTE → intraday bias")
@@ -347,15 +336,15 @@ def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float
             swing += 2.0; notes.append("5–35 DTE → swing friendly")
         elif dte > 45:
             swing += 1.0; notes.append(">45 DTE → swing tilt")
+    else:
+        notes.append("DTE missing → infer from TA/structure")
 
-    # EMA structure
     if ema20 and ema50 and ema200:
         if ema20 > ema50 > ema200:
             swing += (2.0 if side == "CALL" else 1.0); notes.append("EMA stack trend (bull)")
         elif ema20 < ema50 < ema200:
             swing += (2.0 if side == "PUT" else 1.0); notes.append("EMA stack trend (bear)")
 
-    # ORB and VWAP
     if ul_price is not None:
         if (orb_h and ul_price > orb_h) or (orb_l and ul_price < orb_l):
             swing -= 2.0; notes.append("ORB15 break → intraday")
@@ -365,21 +354,18 @@ def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float
         if dist is not None and abs(dist) >= 0.8:
             swing -= 1.0; notes.append("far from VWAP → intraday")
 
-    # IV Rank
     if iv_rank is not None:
         if 0.3 <= iv_rank <= 0.7:
             swing += 1.0; notes.append("mid IV rank → swing friendly")
         elif iv_rank > 0.85:
             swing -= 1.0; notes.append("high IV rank → quick move bias")
 
-    # RSI
     if rsi14 is not None:
         if 40 <= rsi14 <= 60:
             swing += 1.0; notes.append("RSI mid-zone")
         elif rsi14 < 30 or rsi14 > 70:
             swing -= 1.0; notes.append("RSI extreme → intraday")
 
-    # Spreads
     if spread is not None:
         if spread > 12:
             swing -= 0.5; notes.append("wide spread")
@@ -390,13 +376,12 @@ def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float
     reason = "; ".join(notes) or "neutral mix"
     return horizon, round(swing, 2), reason
 
-# --- rule-based blend (guardrails) -------------------------------------------
+# --- rule-based blend ---------------------------------------------------------
 
 def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     side = (alert.get("side") or "").upper()
     ul_price = _f(alert.get("underlying_price_from_alert"))
 
-    # Technical pillar
     rsi_pts,   rsi_note   = _score_rsi(side, _f(f.get("rsi14")))
     ema_pts,   ema_note   = _score_ema_stack(side, ul_price, _f(f.get("ema20")), _f(f.get("ema50")), _f(f.get("ema200")))
     macd_line = _f(f.get("macd_line")) if f.get("macd_line") is not None else _f(f.get("macd"))
@@ -406,36 +391,33 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     tech_raw    = rsi_pts + ema_pts + macd_pts + vwap_pts + boll_pts
     tech_scaled = _clip(tech_raw / 25.0 * W_TECH, -W_TECH, W_TECH)
 
-    # Structure (ORB + Regime/MTF)
     orb_pts,      orb_note    = _score_orb15(side, ul_price, _f(f.get("orb15_high")), _f(f.get("orb15_low")))
     struct_pts,   struct_note = _score_structure(f.get("mtf_align"), f.get("regime_flag"))
     struct_raw    = orb_pts + struct_pts
     struct_scaled = _clip(struct_raw / 10.0 * W_STRUCT, -W_STRUCT, W_STRUCT)
 
-    # Options (Delta + IV)
     delta_pts,   delta_note = _score_delta(side, _f(f.get("delta")))
     iv_pts,      iv_note    = _score_iv(side, _f(f.get("iv")), _f(f.get("iv_rank")))
     opt_raw    = delta_pts + iv_pts
     opt_scaled = _clip(opt_raw / 10.0 * W_OPTION, -W_OPTION, W_OPTION)
 
-    # Execution (spreads/OI/Vol & synthetic NBBO)
     liq_pts,     liq_note   = _score_liquidity(_f(f.get("option_spread_pct")), _f(f.get("oi")), _f(f.get("vol")), bool(f.get("synthetic_nbbo_used")))
     exec_scaled = _clip(liq_pts / 6.0 * W_EXEC, -W_EXEC, W_EXEC)
 
-    # Context (premarket, prev-day, short flow)
     ctx_pts, ctx_notes = _score_context(side, ul_price, f)
     ctx_scaled = _clip(ctx_pts / 4.0 * W_CONTEXT, -W_CONTEXT, W_CONTEXT)
 
-    # DTE soft governor
     dte_pts, dte_note = _score_dte(_f(f.get("dte")))
 
-    # Final score
     score = 50.0 + tech_scaled + struct_scaled + opt_scaled + exec_scaled + ctx_scaled + dte_pts
     score = _clip(score, 0.0, 100.0)
 
-    if score >= BUY_THRESHOLD:      decision = "buy"
-    elif score >= WAIT_THRESHOLD:   decision = "wait"
-    else:                           decision = "skip"
+    if score >= BUY_THRESHOLD:
+        decision = "buy"
+    elif score >= WAIT_THRESHOLD:
+        decision = "wait"
+    else:
+        decision = "skip"
 
     conf = 0.5 + abs(score - 50.0) / 100.0
     conf = round(_clip(conf, 0.5, 0.95), 2)
@@ -454,7 +436,6 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
         f"Watchouts: {', '.join(n.split('] ')[1] for n in negatives[:3]) or 'none'}."
     )
 
-    # horizon inference
     horizon, horizon_score, horizon_reason = _infer_horizon(alert, f)
 
     checklist = {
@@ -504,35 +485,43 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
 
 def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
-        # TA
         "rsi14","sma20","ema20","ema50","ema200",
         "macd_line","macd","macd_signal","macd_hist",
         "vwap","vwap_dist","bb_upper","bb_lower","bb_width",
         "orb15_high","orb15_low","mtf_align","regime_flag","dte",
-        # Options
         "delta","gamma","theta","vega","iv","iv_rank","oi","vol",
         "bid","ask","mid","option_spread_pct",
         "synthetic_nbbo_used","synthetic_nbbo_spread_est",
-        # Context
         "prev_open","prev_high","prev_low","prev_close",
         "quote_change_pct","prev5_avg_high","prev5_avg_low",
         "premarket_high","premarket_low",
         "short_volume","short_interest","short_volume_total","short_volume_ratio",
-        # Debug
-        "nbbo_http_status","nbbo_reason","ta_src"
+        "nbbo_http_status","nbbo_reason","ta_src",
     ]
     return {k: f[k] for k in keys if k in f}
 
+def _alert_payload(alert: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    UPDATED: strike/expiry are optional (equity-only alerts).
+    """
+    out = {
+        "side": alert.get("side"),
+        "symbol": alert.get("symbol"),
+        "underlying_price_from_alert": alert.get("underlying_price_from_alert"),
+    }
+    if alert.get("strike") is not None:
+        out["strike"] = alert.get("strike")
+    if alert.get("expiry"):
+        out["expiry"] = alert.get("expiry")
+    # pass-through if present
+    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
+        if alert.get(k) is not None:
+            out[k] = alert.get(k)
+    return out
+
 async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns: { decision, confidence, reason, checklist, ev_estimate, horizon, horizon_reason }
-    - Deterministic weighted blend (RSI/EMA(20/50/200)/MACD/VWAP/Bollinger/ORB15 + Greeks/IV + structure + execution + context).
-    - Strong default model (gpt-4.1) produces: human 'summary' + factor bullets + 'horizon' ('intraday'|'swing') with rationale.
-    - Missing NBBO never auto-skips; synthetic_nbbo_used=true is cautious-but-acceptable.
-    """
     baseline = _rule_blend(alert, features)
 
-    # If OpenAI missing/offline, return baseline (already human-friendly with horizon)
     if AsyncOpenAI is None or not os.getenv("OPENAI_API_KEY") or os.getenv("LLM_OFFLINE", "0") == "1":
         if "(offline rule-based)" not in baseline["reason"]:
             baseline["reason"] = (
@@ -547,25 +536,20 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         model = DEFAULT_MODEL
 
         system_msg = (
-            "You are an options-trading analyst. Produce a clear, human summary (2–4 sentences) explaining the trade call. "
+            "You are an options/intraday trading analyst. Produce a clear, human summary (2–4 sentences) explaining the trade call. "
             "Weigh: RSI(14), EMA(20/50/200) stack, MACD (line/signal/hist), VWAP distance, Bollinger(20,2σ), 15m ORB, "
-            "Greeks (Δ/Θ/ν) & IV/IV Rank, plus execution (spread, OI/Vol). "
-            "Include recent context (prev-day OHLC and %Δ, 5-day avg PDH/PDL, premarket H/L, SHORT VOLUME RATIO & SHORT INTEREST) when informative. "
+            "and execution (spread, liquidity). If options fields (strike/expiry/Greeks/IV/OI/Vol) are missing, DO NOT fail—"
+            "treat this as an equity-only alert and focus on technicals/structure/context. "
+            "Include context (prev-day OHLC and %Δ, 5-day avg PDH/PDL, premarket H/L, SHORT VOLUME RATIO & SHORT INTEREST) when informative. "
             "Use the provided baseline weighted score; you may adjust modestly (<= ±10 absolute points) only with strong justification. "
-            "Do NOT auto-skip just because NBBO is missing; if synthetic_nbbo_used=true, treat execution as cautious but acceptable. "
-            "You MUST classify the trade as 'intraday' or 'swing' and explain why, considering DTE, ORB/VWAP context, EMA structure, IV Rank, RSI, spreads, and short-flow context. "
+            "Do NOT auto-skip just because NBBO or options snapshot is missing; if synthetic_nbbo_used=true, treat execution as cautious but acceptable. "
+            "You MUST classify the trade as 'intraday' or 'swing' and explain why, using available evidence (DTE if present; else TA/structure). "
             "Return JSON with: decision, confidence (0..1), summary (string), factors (array of short bullet strings), "
             "horizon ('intraday'|'swing'), horizon_reason (string), checklist (object), ev_estimate (object)."
         )
 
         user_payload = {
-            "alert": {
-                "side": alert.get("side"),
-                "symbol": alert.get("symbol"),
-                "underlying_price_from_alert": alert.get("underlying_price_from_alert"),
-                "strike": alert.get("strike"),
-                "expiry": alert.get("expiry"),
-            },
+            "alert": _alert_payload(alert),
             "features": _slim_features(features),
             "baseline": {
                 "decision": baseline["decision"],
@@ -576,7 +560,7 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
                 "horizon": baseline.get("horizon"),
                 "horizon_reason": baseline.get("horizon_reason"),
             },
-            "boundaries": {"buy_threshold": BUY_THRESHOLD, "wait_threshold": WAIT_THRESHOLD, "max_adjust_abs_points": 10}
+            "boundaries": {"buy_threshold": BUY_THRESHOLD, "wait_threshold": WAIT_THRESHOLD, "max_adjust_abs_points": 10},
         }
 
         resp = await client.chat.completions.create(
@@ -589,18 +573,21 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
                     "role": "user",
                     "content": (
                         "Refine the baseline. Keep adjustments ≤ ±10 pts. "
-                        "Include a concise 'summary', 'factors' list, and a firm 'horizon' with 'horizon_reason'. "
-                        "Be conservative with liquidity penalties if synthetic_nbbo_used=true.\n\n"
+                        "If strike/expiry/Greeks are missing, treat as equity-only alert. "
+                        "Include concise 'summary', 'factors' list, and firm 'horizon' with 'horizon_reason'.\n\n"
                         + json.dumps(user_payload, ensure_ascii=False)
                     ),
                 },
             ],
         )
 
-        txt = resp.choices[0].message.content
-        parsed = json.loads(txt)
+        txt = (resp.choices[0].message.content or "").strip()
+        try:
+            parsed = json.loads(txt) if txt else {}
+        except Exception:
+            logger.warning("LLM returned non-JSON; falling back to baseline. txt=%r", txt[:500])
+            parsed = {}
 
-        # sanitize
         decision = str(parsed.get("decision") or baseline["decision"]).lower()
         if decision not in ("buy", "wait", "skip"):
             decision = baseline["decision"]
@@ -612,22 +599,23 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         except Exception:
             confidence = baseline["confidence"]
 
-        # human summary + bullets + horizon line
-        summary = parsed.get("summary") or baseline.get("base_summary") or ""
+        summary = (parsed.get("summary") or baseline.get("base_summary") or "").strip()
         factors = parsed.get("factors") or baseline.get("factor_lines") or []
         if isinstance(factors, list):
-            factors_block = "\n".join(factors)
+            factors_block = "\n".join(str(x) for x in factors)
         else:
             factors_block = str(factors)
+
         horizon = str(parsed.get("horizon") or baseline.get("horizon") or "intraday").lower()
         if horizon not in ("intraday", "swing"):
             horizon = baseline.get("horizon", "intraday")
-        horizon_reason = parsed.get("horizon_reason") or baseline.get("horizon_reason") or "neutral mix"
+
+        horizon_reason = (parsed.get("horizon_reason") or baseline.get("horizon_reason") or "neutral mix").strip()
 
         reason = (
-            f"🕒 Suggested trade: {str(horizon).upper()} — {horizon_reason}\n"
-            + (summary.strip() + ("\n" if summary else ""))  # 2–4 sentence summary
-            + factors_block                                     # bullet-style factors
+            f"🕒 Suggested trade: {horizon.upper()} — {horizon_reason}\n"
+            + (summary + ("\n" if summary else ""))
+            + factors_block
         ).strip()
 
         checklist = parsed.get("checklist") or baseline.get("checklist") or {}
@@ -636,7 +624,7 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         return {
             "decision": decision,
             "confidence": confidence,
-            "reason": reason,  # already includes horizon + human summary + bullets
+            "reason": reason,
             "checklist": checklist,
             "ev_estimate": ev_estimate,
             "horizon": horizon,
@@ -649,7 +637,7 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         add = f"(LLM refine error: {type(e).__name__}: {e})"
         out["reason"] = (
             f"🕒 Suggested trade: {out['horizon'].upper()} — {out['horizon_reason']}\n"
-            + out.get("reason","")
+            + out.get("reason", "")
             + ("\n" if out.get("reason") else "")
             + add
         ).strip()
