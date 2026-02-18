@@ -11,7 +11,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("trading_engine.llm")
 
-# --- thresholdsc (env overridable) --------------------------------------------
+# --- thresholds (env overridable) ---------------------------------------------
 BUY_THRESHOLD = float(os.getenv("LLM_BUY_THRESHOLD", "60"))
 WAIT_THRESHOLD = float(os.getenv("LLM_WAIT_THRESHOLD", "45"))
 
@@ -40,7 +40,6 @@ SHORT_INT_PUT_PEN    = float(os.getenv("LLM_SI_PUT_PEN",   "-0.2"))
 DEFAULT_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1"))
 
 # --- tiny helpers -------------------------------------------------------------
-
 def _f(v: Any) -> Optional[float]:
     try:
         return float(v) if v is not None else None
@@ -63,7 +62,6 @@ def _multiline(reasons: List[str]) -> str:
     return "\n".join(reasons)
 
 # --- indicator scoring --------------------------------------------------------
-
 def _score_rsi(side: str, rsi14: Optional[float]) -> Tuple[float, str]:
     if rsi14 is None:
         return 0.0, _mk_reason("RSI", 0, "missing")
@@ -88,7 +86,13 @@ def _price_vs(val: Optional[float], ref: Optional[float]) -> Optional[int]:
         return None
     return 1 if val > ref else (-1 if val < ref else 0)
 
-def _score_ema_stack(side: str, price: Optional[float], ema20: Optional[float], ema50: Optional[float], ema200: Optional[float]) -> Tuple[float, str]:
+def _score_ema_stack(
+    side: str,
+    price: Optional[float],
+    ema20: Optional[float],
+    ema50: Optional[float],
+    ema200: Optional[float],
+) -> Tuple[float, str]:
     pts = 0.0
     notes: List[str] = []
     if price is not None:
@@ -116,7 +120,12 @@ def _score_ema_stack(side: str, price: Optional[float], ema20: Optional[float], 
         return 0.0, _mk_reason("EMA stack", 0, "missing")
     return pts, _mk_reason("EMA stack", pts, ",".join(notes))
 
-def _score_macd(side: str, macd_line: Optional[float], macd_signal: Optional[float], macd_hist: Optional[float]) -> Tuple[float, str]:
+def _score_macd(
+    side: str,
+    macd_line: Optional[float],
+    macd_signal: Optional[float],
+    macd_hist: Optional[float],
+) -> Tuple[float, str]:
     if macd_line is None or macd_signal is None:
         return 0.0, _mk_reason("MACD", 0, "missing")
     pts = 0.0
@@ -150,7 +159,13 @@ def _score_vwap(side: str, price: Optional[float], vwap: Optional[float], vwap_d
     pts = _clip((dist if side == "CALL" else -dist) * 0.6, -3.0, 3.0)
     return pts, _mk_reason("VWAP", pts, f"dist≈{dist:.2f}%")
 
-def _score_bollinger(side: str, price: Optional[float], bb_upper: Optional[float], bb_lower: Optional[float], sma20: Optional[float]) -> Tuple[float, str]:
+def _score_bollinger(
+    side: str,
+    price: Optional[float],
+    bb_upper: Optional[float],
+    bb_lower: Optional[float],
+    sma20: Optional[float],
+) -> Tuple[float, str]:
     if price is None and sma20 is None and bb_upper is None and bb_lower is None:
         return 0.0, _mk_reason("Bollinger", 0, "missing")
     pts = 0.0
@@ -199,7 +214,12 @@ def _score_iv(side: str, iv: Optional[float], iv_rank: Optional[float]) -> Tuple
             pts -= 2.0
     return pts, _mk_reason("IV", pts, f"rank={iv_rank!r}")
 
-def _score_liquidity(spread_pct: Optional[float], oi: Optional[float], vol: Optional[float], synthetic_nbbo_used: bool) -> Tuple[float, str]:
+def _score_liquidity(
+    spread_pct: Optional[float],
+    oi: Optional[float],
+    vol: Optional[float],
+    synthetic_nbbo_used: bool,
+) -> Tuple[float, str]:
     pts = 0.0
     notes: List[str] = []
     if spread_pct is not None:
@@ -248,7 +268,6 @@ def _score_dte(dte: Optional[float]) -> Tuple[float, str]:
     return pts, _mk_reason("DTE", pts, f"{dte} days")
 
 # --- short flow scoring -------------------------------------------------------
-
 def _score_short_flow(side: str, f: Dict[str, Any]) -> Tuple[float, str]:
     pts = 0.0
     notes: List[str] = []
@@ -276,7 +295,6 @@ def _score_short_flow(side: str, f: Dict[str, Any]) -> Tuple[float, str]:
     return pts, _mk_reason("Short Flow", pts, ", ".join(notes) if notes else "neutral")
 
 # --- context scoring ----------------------------------------------------------
-
 def _score_context(side: str, ul_price: Optional[float], f: Dict[str, Any]) -> Tuple[float, List[str]]:
     pts = 0.0
     notes: List[str] = []
@@ -309,7 +327,6 @@ def _score_context(side: str, ul_price: Optional[float], f: Dict[str, Any]) -> T
     return pts, ([_mk_reason("Context", pts, ", ".join(notes) if notes else "neutral")])
 
 # --- trade horizon inference --------------------------------------------------
-
 def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float, str]:
     """
     UPDATED: Works even if strike/expiry/DTE are missing (equity-only alerts).
@@ -376,8 +393,62 @@ def _infer_horizon(alert: Dict[str, Any], f: Dict[str, Any]) -> Tuple[str, float
     reason = "; ".join(notes) or "neutral mix"
     return horizon, round(swing, 2), reason
 
-# --- rule-based blend ---------------------------------------------------------
+# --- NEW: TradingView meta incorporation -------------------------------------
+def _score_tv_meta(side: str, tv_meta: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Uses the metadata you attached in engine_processor.py under f['tv_meta'] and also
+    the convenience copies f['adx'], f['relVol'], f['chop'], f['level'].
 
+    Very light-touch by default; you can tune via env vars.
+    """
+    pts = 0.0
+    notes: List[str] = []
+
+    # Pull common keys regardless of naming
+    adx = _f(tv_meta.get("adx"))
+    relvol = _f(tv_meta.get("relVol") if tv_meta.get("relVol") is not None else tv_meta.get("relvol"))
+    chop = _f(tv_meta.get("chop"))
+    event = str(tv_meta.get("event") or tv_meta.get("alert_event") or "").lower().strip()
+
+    ADX_STRONG = float(os.getenv("LLM_META_ADX_STRONG", "22"))
+    RELVOL_STRONG = float(os.getenv("LLM_META_RELVOL_STRONG", "1.3"))
+    CHOP_MAX = float(os.getenv("LLM_META_CHOP_MAX", "55"))
+
+    # ADX: trending confirmation
+    if adx is not None:
+        if adx >= ADX_STRONG:
+            pts += 2.0
+            notes.append(f"ADX {adx:.1f} trending")
+        elif adx <= 15:
+            pts -= 1.0
+            notes.append(f"ADX {adx:.1f} weak")
+
+    # RelVol: demand/supply participation
+    if relvol is not None:
+        if relvol >= RELVOL_STRONG:
+            pts += 2.0
+            notes.append(f"RelVol {relvol:.2f} strong")
+        elif relvol < 1.0:
+            pts -= 0.5
+            notes.append(f"RelVol {relvol:.2f} soft")
+
+    # Chop: filter out noise (higher = choppy in many indicators)
+    if chop is not None:
+        if chop >= CHOP_MAX:
+            pts -= 2.0
+            notes.append(f"CHOP {chop:.1f} choppy")
+        elif chop <= 45:
+            pts += 0.5
+            notes.append(f"CHOP {chop:.1f} ok")
+
+    # Event handling: EXIT should never become a BUY.
+    if event == "exit":
+        pts -= 3.0
+        notes.append("EXIT event")
+
+    return pts, _mk_reason("TV Meta", pts, ", ".join(notes) if notes else "neutral")
+
+# --- rule-based blend ---------------------------------------------------------
 def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     side = (alert.get("side") or "").upper()
     ul_price = _f(alert.get("underlying_price_from_alert"))
@@ -409,8 +480,18 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
 
     dte_pts, dte_note = _score_dte(_f(f.get("dte")))
 
-    score = 50.0 + tech_scaled + struct_scaled + opt_scaled + exec_scaled + ctx_scaled + dte_pts
+    # NEW: TV meta
+    tv_meta = f.get("tv_meta") if isinstance(f.get("tv_meta"), dict) else {}
+    tv_pts, tv_note = _score_tv_meta(side, tv_meta)
+    tv_scaled = _clip(tv_pts / 4.0 * 6.0, -6.0, 6.0)  # small lane, not part of W_* totals
+
+    score = 50.0 + tech_scaled + struct_scaled + opt_scaled + exec_scaled + ctx_scaled + dte_pts + tv_scaled
     score = _clip(score, 0.0, 100.0)
+
+    # EXIT event safety: never recommend BUY on exit
+    event = str(tv_meta.get("event") or tv_meta.get("alert_event") or alert.get("event") or "").lower().strip()
+    if event == "exit" and score >= BUY_THRESHOLD:
+        score = min(score, BUY_THRESHOLD - 0.1)
 
     if score >= BUY_THRESHOLD:
         decision = "buy"
@@ -419,12 +500,17 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     else:
         decision = "skip"
 
+    # EXIT event semantics: keep as wait/skip, never buy
+    if event == "exit" and decision == "buy":
+        decision = "wait"
+
     conf = 0.5 + abs(score - 50.0) / 100.0
     conf = round(_clip(conf, 0.5, 0.95), 2)
 
     factor_lines = [
         rsi_note, ema_note, macd_note, vwap_note, boll_note,
-        orb_note, struct_note, delta_note, iv_note, dte_note, liq_note
+        orb_note, struct_note, delta_note, iv_note, dte_note, liq_note,
+        tv_note,
     ] + ctx_notes
 
     positives = [ln for ln in factor_lines if " +" in ln]
@@ -466,7 +552,8 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
             "premarket_high": _f(f.get("premarket_high")), "premarket_low": _f(f.get("premarket_low")),
             "short_volume_ratio": _f(f.get("short_volume_ratio")),
             "short_interest": _f(f.get("short_interest")),
-        }
+            "tv_meta": tv_meta,
+        },
     }
 
     return {
@@ -482,7 +569,6 @@ def _rule_blend(alert: Dict[str, Any], f: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # --- OpenAI wrapper (refine within guardrails) --------------------------------
-
 def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
         "rsi14","sma20","ema20","ema50","ema200",
@@ -497,6 +583,9 @@ def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
         "premarket_high","premarket_low",
         "short_volume","short_interest","short_volume_total","short_volume_ratio",
         "nbbo_http_status","nbbo_reason","ta_src",
+        # NEW
+        "tv_meta","adx","relVol","chop","level","alert_event","alert_model","alert_source",
+        "mtf","bars_meta","atr14_daily","atr14_pct",
     ]
     return {k: f[k] for k in keys if k in f}
 
@@ -513,8 +602,7 @@ def _alert_payload(alert: Dict[str, Any]) -> Dict[str, Any]:
         out["strike"] = alert.get("strike")
     if alert.get("expiry"):
         out["expiry"] = alert.get("expiry")
-    # pass-through if present
-    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
+    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level", "adx", "relVol", "chop"):
         if alert.get(k) is not None:
             out[k] = alert.get(k)
     return out
@@ -522,6 +610,7 @@ def _alert_payload(alert: Dict[str, Any]) -> Dict[str, Any]:
 async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
     baseline = _rule_blend(alert, features)
 
+    # If OPENAI not available, return baseline
     if AsyncOpenAI is None or not os.getenv("OPENAI_API_KEY") or os.getenv("LLM_OFFLINE", "0") == "1":
         if "(offline rule-based)" not in baseline["reason"]:
             baseline["reason"] = (
@@ -540,10 +629,12 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
             "Weigh: RSI(14), EMA(20/50/200) stack, MACD (line/signal/hist), VWAP distance, Bollinger(20,2σ), 15m ORB, "
             "and execution (spread, liquidity). If options fields (strike/expiry/Greeks/IV/OI/Vol) are missing, DO NOT fail—"
             "treat this as an equity-only alert and focus on technicals/structure/context. "
+            "Use TradingView meta (ADX/RelVol/CHOP/event/reason/confirm_tf) when provided to filter choppy signals and validate trend strength. "
             "Include context (prev-day OHLC and %Δ, 5-day avg PDH/PDL, premarket H/L, SHORT VOLUME RATIO & SHORT INTEREST) when informative. "
             "Use the provided baseline weighted score; you may adjust modestly (<= ±10 absolute points) only with strong justification. "
             "Do NOT auto-skip just because NBBO or options snapshot is missing; if synthetic_nbbo_used=true, treat execution as cautious but acceptable. "
             "You MUST classify the trade as 'intraday' or 'swing' and explain why, using available evidence (DTE if present; else TA/structure). "
+            "If event='exit', you MUST NOT recommend 'buy'—use 'wait' or 'skip' and focus on risk/position management. "
             "Return JSON with: decision, confidence (0..1), summary (string), factors (array of short bullet strings), "
             "horizon ('intraday'|'swing'), horizon_reason (string), checklist (object), ev_estimate (object)."
         )
@@ -591,6 +682,11 @@ async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -
         decision = str(parsed.get("decision") or baseline["decision"]).lower()
         if decision not in ("buy", "wait", "skip"):
             decision = baseline["decision"]
+
+        # hard safety on exit
+        event = str((features.get("tv_meta") or {}).get("event") or alert.get("event") or "").lower().strip()
+        if event == "exit" and decision == "buy":
+            decision = "wait"
 
         confidence = parsed.get("confidence")
         try:
