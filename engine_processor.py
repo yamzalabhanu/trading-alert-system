@@ -5,7 +5,7 @@ import logging
 import math
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Awaitable
 
 from engine_runtime import get_http_client
 from engine_common import (
@@ -107,16 +107,11 @@ def _last_close(bars: List[Dict[str, Any]]) -> Optional[float]:
 
 
 def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
-    """
-    Simple ATR(14) using daily bars with keys h/l/c, bars sorted asc.
-    Returns None if insufficient data.
-    """
     if not daily_bars or len(daily_bars) < 16:
         return None
 
     trs: List[float] = []
     prev_c: Optional[float] = None
-    # Use last ~16 to compute 14 TRs safely
     for b in daily_bars[-16:]:
         h = b.get("h")
         l = b.get("l")
@@ -135,7 +130,6 @@ def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
 
     if len(trs) < 15:
         return None
-    # last 14 TRs
     return sum(trs[-14:]) / 14.0
 
 
@@ -143,7 +137,6 @@ def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
 # Yahoo fallback features (unchanged)
 # =============================================================================
 async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
-    """Fallback market-data enricher using Yahoo 5m chart API."""
     cli = get_http_client()
     if cli is None:
         return {}
@@ -322,15 +315,13 @@ async def _fetch_polygon_features(
     if not pc.enabled:
         return {}
 
-    # Helper: if PolygonClient doesn't yet have get_aggs_window(), fallback to get_aggregates for minute/hour/day.
+    async def _empty_dict() -> Dict[str, Any]:
+        return {}
+
     async def _aggs_window(sym: str, multiplier: int, timespan: str, from_: str, to: str, limit: int) -> List[Dict[str, Any]]:
-        # Prefer native method if available
         if hasattr(pc, "get_aggs_window"):
             return await pc.get_aggs_window(sym, multiplier=multiplier, timespan=timespan, from_=from_, to=to, limit=limit)
-        # Fallback: polygon_client.get_aggregates likely uses a wide range internally; keep as backup
-        # Only safe for minute timespans in your current implementation.
         if timespan in ("minute", "hour", "day"):
-            # Best-effort: minute/hour/day with a limit (may not honor from/to)
             return await pc.get_aggregates(sym, multiplier=multiplier, timespan=timespan, limit=limit)
         return []
 
@@ -340,9 +331,15 @@ async def _fetch_polygon_features(
         trade_task = pc.get_last_trade(symbol)
         agg5m_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
         tech_task = pc.get_technicals_bundle(symbol)
-        opt_task = pc.get_targeted_option_context(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
 
-        # Multi-timeframe context
+        # ✅ Only fetch option context when we have option identifiers
+        if expiry_iso and side and (strike is not None):
+            opt_task: Awaitable[Dict[str, Any]] = pc.get_targeted_option_context(
+                symbol, expiry_iso=expiry_iso, side=side, strike=strike
+            )
+        else:
+            opt_task = _empty_dict()
+
         today = date.today()
         to_iso = (today + timedelta(days=2)).isoformat()
         daily_task = _aggs_window(symbol, 1, "day", (today - timedelta(days=220)).isoformat(), to_iso, limit=260)
@@ -401,7 +398,6 @@ async def _fetch_polygon_features(
     if isinstance(pd.get("c"), (int, float)):
         out["prev_close"] = float(pd.get("c"))
 
-    # 5m bars (execution context + VWAP/ORB)
     bars = aggs5m or []
     if bars:
         closes = [float(x.get("c")) for x in bars if isinstance(x.get("c"), (int, float))]
@@ -437,11 +433,9 @@ async def _fetch_polygon_features(
             except Exception:
                 pass
 
-    # Indicator bundle
     if isinstance(techs, dict):
         out.update({k: v for k, v in techs.items() if v is not None})
 
-    # Daily ATR/regime context (high-value for scalping risk + expectation)
     atr14 = _atr14_from_daily(daily_bars or [])
     if atr14 is not None:
         out["atr14_daily"] = atr14
@@ -454,7 +448,6 @@ async def _fetch_polygon_features(
         "m15_n": len(m15_bars or []),
         "m5_n": len(bars or []),
     }
-    # Keep MTF payload light: last close only
     out["mtf"] = {
         "daily_last": _last_close(daily_bars or []),
         "h1_last": _last_close(h1_bars or []),
@@ -462,7 +455,6 @@ async def _fetch_polygon_features(
         "m5_last": _last_close(bars or []),
     }
 
-    # Regime + alignment
     out["regime_flag"] = (
         "trending"
         if (
@@ -477,8 +469,8 @@ async def _fetch_polygon_features(
         lp = float(out["last"])
         out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
 
-    # Options context (if provided)
-    if opt_ctx and isinstance(opt_ctx, dict):
+    # ✅ Option context only if it was fetched
+    if opt_ctx and isinstance(opt_ctx, dict) and opt_ctx:
         out.update({k: v for k, v in opt_ctx.items() if v is not None})
         out["nbbo_provider"] = "polygon:options_snapshot"
 
@@ -495,11 +487,6 @@ async def _fetch_equity_features(
     side: Optional[str] = None,
     strike: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Provider policy:
-      - polygon (default): require Polygon; no silent Yahoo drift
-      - hybrid: polygon first, optional Yahoo fallback if USE_YAHOO_FALLBACK=1
-    """
     poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
     if poly:
         return poly
@@ -525,6 +512,14 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] bad alert payload: %s", e)
         return
 
+    # Pull extra TradingView metadata if present (from JSON passthrough)
+    tv_meta_keys = [
+        "source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange",
+        "level", "ats", "bp", "tp1", "tp2", "tp3", "trail", "relvol", "chop",
+        "fast_stop", "ason",
+    ]
+    tv_meta: Dict[str, Any] = {k: alert.get(k) for k in tv_meta_keys if alert.get(k) is not None}
+
     expiry = alert.get("expiry")
     dte: Optional[int] = None
     if expiry:
@@ -546,6 +541,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "mtf_align": True,
         "sr_headroom_ok": True,
         "nbbo_provider": "disabled",
+        # ✅ store meta on features too (helps LLM/scoring/telemetry)
+        "tv_meta": tv_meta,
     }
 
     live = await _fetch_equity_features(
@@ -560,7 +557,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     pf_ok, pf_checks = preflight_ok(f)
 
-    # LLM analysis (include MTF summaries in f; already included)
+    # LLM analysis (include meta in alert payload by attaching into alert)
     try:
         llm = await analyze_with_openai(alert, f)
         consume_llm()
@@ -573,7 +570,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "ev_estimate": {},
         }
 
+    # If this is an explicit EXIT event, keep decision semantics but log it clearly
+    event = str(alert.get("event") or "").lower().strip()
     decision_final = "buy" if llm.get("decision") == "buy" else ("skip" if llm.get("decision") == "skip" else "wait")
+    if event == "exit":
+        decision_final = f"{decision_final}_exit"
 
     try:
         score = compute_decision_score(f, llm)
@@ -585,10 +586,23 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     try:
         src = str(f.get("ta_src") or "unknown")
         provider = str(f.get("data_provider") or "unknown")
+
+        meta_bits = []
+        if tv_meta.get("event"):
+            meta_bits.append(f"event={tv_meta.get('event')}")
+        if tv_meta.get("confirm_tf"):
+            meta_bits.append(f"confirm={tv_meta.get('confirm_tf')}")
+        if tv_meta.get("model"):
+            meta_bits.append(f"model={tv_meta.get('model')}")
+        if tv_meta.get("reason"):
+            meta_bits.append(f"reason={tv_meta.get('reason')}")
+
+        meta_note = (" | " + ", ".join(meta_bits)) if meta_bits else ""
+
         if live:
-            data_note = f"📊 Data: {provider} ({src})"
+            data_note = f"📊 Data: {provider} ({src}){meta_note}"
         else:
-            data_note = "⚠️ Live data unavailable; using alert baseline"
+            data_note = f"⚠️ Live data unavailable; using alert baseline{meta_note}"
 
         tg_text = compose_telegram_text(
             alert=alert,
@@ -603,13 +617,20 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         )
 
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            logger.info("[tg] send attempt: chat_id=%s len=%d decision=%s",
-                        str(TELEGRAM_CHAT_ID), len(tg_text or ""), str(llm.get("decision")))
+            logger.info(
+                "[tg] send attempt: chat_id=%s len=%d decision=%s",
+                str(TELEGRAM_CHAT_ID),
+                len(tg_text or ""),
+                str(llm.get("decision")),
+            )
             await send_telegram(tg_text)
             logger.info("[tg] send done")
         else:
-            logger.warning("[tg] missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID (token=%s chat_id=%s)",
-                           bool(TELEGRAM_BOT_TOKEN), bool(TELEGRAM_CHAT_ID))
+            logger.warning(
+                "[tg] missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID (token=%s chat_id=%s)",
+                bool(TELEGRAM_BOT_TOKEN),
+                bool(TELEGRAM_CHAT_ID),
+            )
     except Exception as e:
         logger.exception("[worker] Telegram error: %s", e)
 
@@ -623,18 +644,19 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "timestamp_local": market_now(),
             "symbol": alert.get("symbol"),
             "side": alert.get("side"),
+            "event": alert.get("event"),
             "decision_final": decision_final,
             "llm": llm,
             "features": f,
             "preflight_ok": pf_ok,
             "preflight_checks": pf_checks,
             "ibkr": {"enabled": False, "attempted": False, "result": None},
+            "tv_meta": tv_meta,
         }
     )
 
 
 def _append_decision_log(entry: Dict[str, Any]) -> None:
-    """Append decision entry to in-memory log with local safety guard."""
     try:
         _DECISIONS_LOG.append(entry)
     except Exception as e:
