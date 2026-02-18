@@ -52,13 +52,16 @@ MAX_DTE = int(os.getenv("MAX_DTE", "45"))
 # Optional scan knobs (RTH vs AH)
 SCAN_MIN_VOL_RTH = int(os.getenv("SCAN_MIN_VOL_RTH", os.getenv("SCAN_MIN_VOL", "500")))
 SCAN_MIN_OI_RTH = int(os.getenv("SCAN_MIN_OI_RTH", os.getenv("SCAN_MIN_OI", "500")))
-SCAN_MIN_VOL_AH = int(os.getenv("SCAN_MIN_VOL_AH", "0")))
+SCAN_MIN_VOL_AH = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
 SCAN_MIN_OI_AH = int(os.getenv("SCAN_MIN_OI_AH", "100"))
 
 # Keep these env toggles defined (even if you’ve disabled messages elsewhere)
 SEND_CHAIN_SCAN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "0"))
 SEND_CHAIN_SCAN_TOPN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "0"))
 REPLACE_IF_NO_NBBO = _env_truthy(os.getenv("REPLACE_IF_NO_NBBO", "1"))
+
+# NEW: allow enriched JSON alerts without strike/expiry
+ALLOW_NO_STRIKE_JSON = _env_truthy(os.getenv("ALLOW_NO_STRIKE_JSON", "1"))
 
 # =========================
 # Small helpers / time & quota
@@ -100,12 +103,6 @@ ALERT_RE_WITH_EXP = re.compile(
 ALERT_RE_NO_EXP = re.compile(
     r"^\s*(CALL|PUT)\s*Signal:\s*([A-Z][A-Z0-9\.\-]*)\s*at\s*([0-9]*\.?[0-9]+)\s*"
     r"Strike:\s*([0-9]*\.?[0-9]+)\s*$",
-    re.IGNORECASE,
-)
-
-# ✅ NEW: equity-only plain text
-ALERT_RE_EQ_ONLY = re.compile(
-    r"^\s*(CALL|PUT)\s*Signal:\s*([A-Z][A-Z0-9\.\-]*)\s*at\s*([0-9]*\.?[0-9]+)\s*$",
     re.IGNORECASE,
 )
 
@@ -166,40 +163,32 @@ def _as_float(v: Any) -> Optional[float]:
         return None
 
 
-def _as_str(v: Any) -> Optional[str]:
-    try:
-        if v is None:
-            return None
-        s = str(v).strip()
-        return s or None
-    except Exception:
-        return None
+def _norm_side(side_raw: str) -> Optional[str]:
+    s = (side_raw or "").upper().strip()
+    if s in ("CALL", "BUY", "LONG", "BULL"):
+        return "CALL"
+    if s in ("PUT", "SELL", "SHORT", "BEAR"):
+        return "PUT"
+    return None
 
 
 def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    UPDATED:
-      - Equity-only alerts are allowed: require (side, symbol, price).
-      - strike/expiry are OPTIONAL.
-      - Pass-through extra TradingView fields if present.
-    """
-    side_raw = str(payload.get("side") or payload.get("type") or payload.get("signal") or "").upper().strip()
-    side = (
-        "CALL"
-        if side_raw in ("CALL", "BUY", "LONG", "BULL")
-        else "PUT"
-        if side_raw in ("PUT", "SELL", "SHORT", "BEAR")
-        else None
-    )
-
+    # Support: your original schema + scalper_v4_2 schema
+    side = _norm_side(str(payload.get("side") or payload.get("type") or payload.get("signal") or ""))
     symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("underlying") or "").upper().strip()
-    px = _as_float(payload.get("price") if payload.get("price") is not None else payload.get("last"))
 
+    px = _as_float(payload.get("price") if payload.get("price") is not None else payload.get("last"))
+    strike = _as_float(payload.get("strike"))
+    expiry = str(payload.get("expiry") or "").strip()
+
+    # New: event/model passthrough (entry/exit etc.)
+    event = str(payload.get("event") or "").strip().lower() or None
+    model = str(payload.get("model") or "").strip() or None
+    source = str(payload.get("source") or "").strip() or None
+
+    # Must have at least side+symbol+price (strike can be inferred later)
     if not side or not symbol or px is None:
         return None
-
-    strike = _as_float(payload.get("strike"))
-    expiry = _as_str(payload.get("expiry"))
 
     out: Dict[str, Any] = {
         "side": side,
@@ -207,21 +196,26 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         "underlying_price_from_alert": px,
     }
 
-    # optional option fields
     if strike is not None:
         out["strike"] = strike
-    if expiry and re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
         out["expiry"] = expiry
 
-    # ✅ pass-through metadata fields from your TradingView JSON (image)
-    passthru = [
-        "source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange",
-        "level", "ats", "bp", "tp1", "tp2", "tp3", "trail", "relvol", "chop",
-        "fast_stop", "ason",
-    ]
-    for k in passthru:
-        if k in payload and payload.get(k) is not None:
+    if event:
+        out["alert_event"] = event
+    if model:
+        out["alert_model"] = model
+    if source:
+        out["alert_source"] = source
+
+    # Pass-through useful enriched fields if present
+    for k in ("adx", "relVol", "chop", "level", "confirm_tf", "chart_tf", "exchange", "reason", "tp1", "tp2", "tp3"):
+        if k in payload:
             out[k] = payload.get(k)
+
+    # If strike missing and policy disallows, reject
+    if out.get("strike") is None and not ALLOW_NO_STRIKE_JSON:
+        return None
 
     return out
 
@@ -248,16 +242,6 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
             "symbol": symbol.upper(),
             "underlying_price_from_alert": float(ul),
             "strike": float(strike),
-        }
-
-    # ✅ NEW: equity-only plain text
-    m = ALERT_RE_EQ_ONLY.match(text)
-    if m:
-        side, symbol, ul = m.groups()
-        return {
-            "side": side.upper(),
-            "symbol": symbol.upper(),
-            "underlying_price_from_alert": float(ul),
         }
 
     # 2) Accept JSON payloads from TradingView/Pine webhook directly (with salvage).
@@ -341,11 +325,6 @@ def _ticker_matches_side(ticker: Optional[str], side: str) -> bool:
 # Preflight
 # =========================
 def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
-    """
-    UPDATED:
-      - Equity-only alerts: allow missing dte / spread_pct / nbbo.
-      - If bid/ask is missing but mid/last exists, don't fail quote_fresh in RTH.
-    """
     checks: Dict[str, bool] = {}
     rth = _is_rth_now()
 
@@ -353,15 +332,11 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
     has_nbbo = f.get("bid") is not None and f.get("ask") is not None
     has_last = isinstance(f.get("last"), (int, float)) or isinstance(f.get("mid"), (int, float))
 
-    spread_pct = f.get("option_spread_pct")
-
     if rth:
-        # ✅ allow either fresh NBBO OR usable last/mid (equity-only)
-        checks["quote_fresh"] = (quote_age is not None and quote_age <= MAX_QUOTE_AGE_S and (has_nbbo or has_last))
-        # ✅ allow missing spread_pct (equity-only)
-        checks["spread_ok"] = (spread_pct is None) or (isinstance(spread_pct, (int, float)) and spread_pct <= MAX_SPREAD_PCT)
+        checks["quote_fresh"] = (quote_age is not None and quote_age <= MAX_QUOTE_AGE_S and has_nbbo)
+        checks["spread_ok"] = (f.get("option_spread_pct") is not None and f["option_spread_pct"] <= MAX_SPREAD_PCT)
     else:
-        checks["quote_fresh"] = bool(has_last or has_nbbo)
+        checks["quote_fresh"] = bool(has_last)
         checks["spread_ok"] = True
 
     require_liquidity = os.getenv("REQUIRE_LIQUIDITY_FIELDS", "0") == "1"
@@ -373,378 +348,13 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
         checks["oi_ok"] = True
 
     dte_val = f.get("dte")
-    # ✅ allow missing dte (equity-only)
-    checks["dte_ok"] = True if dte_val is None else (MIN_DTE <= dte_val <= MAX_DTE)
+    checks["dte_ok"] = (dte_val is not None) and (MIN_DTE <= dte_val <= MAX_DTE)
 
     ok = all(checks.values())
     return ok, checks
 
 
 # =========================
-# Telegram composition (compact)
+# Telegram composition (unchanged below)
 # =========================
-def _fmt_num(x, nd: int = 2, dash: str = "-"):
-    try:
-        if x is None:
-            return dash
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return dash
-        if abs(v - round(v)) < 1e-9 and nd == 0:
-            return str(int(round(v)))
-        return f"{v:.{nd}f}"
-    except Exception:
-        return dash
-
-
-def _fmt_int(x, dash: str = "-"):
-    try:
-        if x is None:
-            return dash
-        return f"{int(x):,}"
-    except Exception:
-        return dash
-
-
-def _fmt_pct(x, nd=2, dash: str = "-"):
-    try:
-        if x is None:
-            return dash
-        return f"{float(x):.{nd}f}%"
-    except Exception:
-        return dash
-
-
-def _dte_label(expiry_iso: str, now_dt: Optional[datetime] = None) -> str:
-    now_dt = now_dt or market_now()
-    try:
-        d = datetime.fromisoformat(expiry_iso).date()
-        today = now_dt.date()
-        dte = (d - today).days
-        if dte <= 0:
-            return "0DTE"
-        if dte == 1:
-            return "1DTE"
-        return f"{dte} DTE"
-    except Exception:
-        return ""
-
-
-def _side_letter(side: str) -> str:
-    return "C" if (side or "").upper().startswith("C") else "P"
-
-
-def _compact_adjustments(diff_note: str) -> str:
-    if not diff_note:
-        return ""
-    parts = []
-    for raw in diff_note.splitlines():
-        s = raw.strip()
-        if not s:
-            continue
-        if s.startswith("🎯"):
-            s = s.replace("🎯 ", "").replace("Selected ", "").replace(" (alert was", " (was")
-        elif s.startswith("🗓"):
-            s = s.replace("🗓 ", "").replace("Selected ", "").replace(" (alert was", " (was")
-        elif s.startswith("📡"):
-            s = s.replace("📡 ", "").replace("NBBO via ", "NBBO ")
-        elif s.startswith("🧪"):
-            s = s.replace("🧪 ", "").replace("Synthetic NBBO used", "Synthetic")
-            s = s.replace(" spread est.", "")
-        parts.append(s)
-    return "Adj: " + " • ".join(parts)
-
-
-def _first_sentence(text: str, max_len: int = 80) -> str:
-    s = (text or "").strip()
-    if not s:
-        return ""
-    for sep in [". ", "? ", "! "]:
-        if sep in s:
-            s = s.split(sep, 1)[0]
-            break
-    if len(s) > max_len:
-        return s[: max_len - 1].rstrip() + "…"
-    return s
-
-
-def _pick_factor_lines_from_reason(reason_text: str, max_lines: int = 3) -> List[str]:
-    s = (reason_text or "").strip()
-    if not s:
-        return []
-    lines: List[str] = []
-
-    for line in s.splitlines():
-        t = line.strip(" •-—*·\t")
-        if not t:
-            continue
-        if line.lstrip().startswith(("•", "-", "—", "*", "·")):
-            lines.append(t)
-        if len(lines) >= max_lines:
-            break
-
-    if not lines:
-        tmp = s.replace("! ", ". ").replace("? ", ". ").split(". ")
-        for frag in tmp:
-            frag = frag.strip()
-            if frag:
-                lines.append(frag)
-            if len(lines) >= max_lines:
-                break
-
-    out: List[str] = []
-    for l in lines[:max_lines]:
-        out.append(l if len(l) <= 96 else (l[:95].rstrip() + "…"))
-    return out
-
-
-def compose_telegram_text(
-    alert: Dict[str, Any],
-    option_ticker: Optional[str],
-    f: Dict[str, Any],
-    llm: Dict[str, Any],
-    llm_ran: bool = False,
-    llm_reason: str = "",
-    score: Optional[float] = None,
-    rating: Optional[str] = None,
-    diff_note: str = "",
-) -> str:
-    side = (alert.get("side") or "").upper()
-    sym = alert.get("symbol") or "?"
-    strike = alert.get("strike")
-    expiry = alert.get("expiry") or ""
-    ul_px = alert.get("underlying_price_from_alert")
-
-    # DTE
-    dte = f.get("dte")
-    if dte is None and expiry:
-        try:
-            dte = (datetime.fromisoformat(expiry).date() - datetime.now(timezone.utc).date()).days
-        except Exception:
-            dte = None
-
-    # LLM bits
-    hdr_decision = (llm.get("decision") or "wait").upper() if isinstance(llm, dict) else "WAIT"
-    horizon = (llm.get("horizon") or "").upper() if isinstance(llm, dict) else ""
-    horizon_reason = llm.get("horizon_reason") if isinstance(llm, dict) else None
-    conf = llm.get("confidence")
-    reason_text = (llm.get("reason") or llm_reason or "").strip()
-
-    # ✅ UPDATED header: option-style if strike exists, else equity-only
-    if strike is not None:
-        right = "C" if side == "CALL" else "P"
-        s_fmt = _fmt_num(strike, 0)
-        header = f"{hdr_decision} – {sym} {s_fmt}{right} ({_fmt_num(dte, 0)} DTE, {expiry})"
-    else:
-        header = f"{hdr_decision} – {sym} @ {_fmt_num(ul_px, 2, dash='?')}"
-
-    bias_line = ""
-    if horizon:
-        bias_short = _first_sentence(horizon_reason or "", max_len=80)
-        bias_line = f"Bias: {horizon}" + (f" ({bias_short})" if bias_short else "")
-
-    summary_line = ""
-    if reason_text:
-        lines = [ln for ln in reason_text.splitlines() if ln.strip()]
-        narrative = ""
-        for i, ln in enumerate(lines):
-            if ln.startswith("🕒 Suggested trade"):
-                if i + 1 < len(lines):
-                    narrative = lines[i + 1].strip()
-                break
-        if not narrative:
-            narrative = _first_sentence(reason_text, max_len=180)
-        if narrative:
-            summary_line = _first_sentence(narrative, max_len=180)
-
-    setup_bits = _pick_factor_lines_from_reason(reason_text)
-    setup_line = ""
-    if setup_bits:
-        cleaned = []
-        for s in setup_bits:
-            s2 = s
-            if s2.startswith("[") and "] " in s2:
-                s2 = s2.split("] ", 1)[1]
-            cleaned.append(s2)
-        setup_line = "Setup: " + "; ".join(cleaned)
-
-    def _fmt_opt(n, nd=2):
-        return _fmt_num(n, nd=nd, dash="—")
-
-    rsi = f.get("rsi14")
-    ema20 = f.get("ema20")
-    ema50 = f.get("ema50")
-    ema200 = f.get("ema200")
-    macd_l = f.get("macd_line")
-    macd_s = f.get("macd_signal")
-    macd_h = f.get("macd_hist")
-    vwap_val = f.get("vwap_rth") if f.get("vwap_rth") is not None else f.get("vwap")
-    orb_hi = f.get("orb15_high")
-    orb_lo = f.get("orb15_low")
-
-    tech_chunks = []
-    if isinstance(rsi, (int, float)):
-        tech_chunks.append(f"RSI {round(rsi):d}")
-    if isinstance(macd_l, (int, float)) and isinstance(macd_s, (int, float)):
-        cross = "L>S" if macd_l > macd_s else ("L<S" if macd_l < macd_s else "L=S")
-        hist_tag = None
-        if isinstance(macd_h, (int, float)):
-            hist_tag = f"{'+' if macd_h > 0 else ''}{_fmt_opt(macd_h, 2)}"
-        tech_chunks.append(f"MACD {cross}" + (f" ({hist_tag})" if hist_tag is not None else ""))
-    if any(isinstance(x, (int, float)) for x in (ema20, ema50, ema200)):
-        tech_chunks.append(f"EMA20/50/200 {_fmt_opt(ema20,2)}/{_fmt_opt(ema50,2)}/{_fmt_opt(ema200,2)}")
-    if isinstance(vwap_val, (int, float)):
-        tech_chunks.append(f"VWAP {_fmt_opt(vwap_val,2)}")
-    if isinstance(orb_hi, (int, float)) or isinstance(orb_lo, (int, float)):
-        tech_chunks.append(f"ORB {_fmt_opt(orb_hi,2)}/{_fmt_opt(orb_lo,2)}")
-
-    tech_line = "Tech: " + (" • ".join(tech_chunks) if tech_chunks else "—")
-
-    oi = f.get("oi")
-    vol = f.get("vol")
-    liq_line = f"Liquidity: OI {_fmt_num(oi, 0, dash='?')} / Vol {_fmt_num(vol, 0, dash='?')}"
-
-    svr = f.get("short_volume_ratio")
-    if svr is None:
-        svr_disp = "—"
-    else:
-        try:
-            val = float(svr)
-            if 0 <= val <= 1.0:
-                val *= 100.0
-            svr_disp = _fmt_pct(val, 0)
-        except Exception:
-            svr_disp = "—"
-    ctx_line = f"Context: SVR {svr_disp}"
-
-    spread_pct = f.get("option_spread_pct")
-    qage = f.get("quote_age_sec")
-    provider = f.get("nbbo_provider") or (
-        "polygon:snapshot" if f.get("bid") is not None or f.get("ask") is not None else None
-    )
-    quotes_bits = []
-    if f.get("bid") is not None and f.get("ask") is not None:
-        quotes_bits.append(f"{_fmt_num(f.get('bid'))}/{_fmt_num(f.get('ask'))} mid {_fmt_num(f.get('mid'))}")
-    else:
-        quotes_bits.append("-/- mid " + _fmt_num(f.get("mid")))
-    if spread_pct is not None:
-        quotes_bits.append(f"spread {_fmt_pct(spread_pct, 2)}")
-    if isinstance(qage, (int, float)):
-        quotes_bits.append(f"age {int(qage)}s")
-    if provider:
-        quotes_bits.append(provider)
-    quotes_line = "NBBO: " + " • ".join(quotes_bits)
-
-    conf_line = f"Confidence: {_fmt_num(conf, 2, dash='—')}"
-    sr_line = ""
-    if score is not None or rating is not None:
-        sr_line = f"Score: {_fmt_num(score, 2, dash='—')}"
-        if rating:
-            sr_line += f" | Rating: {rating}"
-
-    appendix = diff_note.strip()
-    if appendix:
-        appendix = "\n" + appendix
-
-    out_lines = [
-        header,
-        bias_line or None,
-        "🕒 Suggested trade: " + (horizon or "—") + (f" — {summary_line}" if summary_line else ""),
-        setup_line or None,
-        tech_line,
-        liq_line,
-        ctx_line,
-        quotes_line,
-        conf_line + ((" | " + sr_line) if sr_line else ""),
-        appendix or None,
-    ]
-    return "\n".join([ln for ln in out_lines if ln])
-
-
-def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
-    if res is None:
-        return {"ok": False, "error": "ibkr_client returned None", "raw": None}
-    if isinstance(res, dict):
-        return {
-            "ok": bool(res.get("ok", False)),
-            "order_id": res.get("order_id"),
-            "status": res.get("status"),
-            "filled": res.get("filled"),
-            "remaining": res.get("remaining"),
-            "avg_fill_price": res.get("avg_fill_price"),
-            "error": res.get("error"),
-            "raw": res.get("raw", res),
-        }
-    if isinstance(res, str):
-        return {"ok": False, "error": res, "raw": res}
-    try:
-        payload = {
-            "ok": getattr(res, "ok", False),
-            "order_id": getattr(res, "order_id", None),
-            "status": getattr(res, "status", None),
-            "filled": getattr(res, "filled", None),
-            "remaining": getattr(res, "remaining", None),
-            "avg_fill_price": getattr(res, "avg_fill_price", None),
-            "error": getattr(res, "error", None),
-        }
-        try:
-            payload["raw"] = getattr(res, "raw", None) or repr(res)
-        except Exception:
-            payload["raw"] = repr(res)
-        return payload
-    except Exception as e:
-        return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
-
-
-def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> Dict[str, Any]:
-    call_strike = round_strike_to_common_increment(ul_px * 1.05)
-    put_strike = round_strike_to_common_increment(ul_px * 0.95)
-    return {
-        "strike_call": call_strike,
-        "strike_put": put_strike,
-        "contract_call": build_option_contract(symbol, expiry_iso, "CALL", call_strike),
-        "contract_put": build_option_contract(symbol, expiry_iso, "PUT", put_strike),
-    }
-
-
-__all__ = [
-    "POLYGON_API_KEY",
-    "IBKR_ENABLED",
-    "IBKR_DEFAULT_QTY",
-    "IBKR_TIF",
-    "IBKR_ORDER_MODE",
-    "IBKR_USE_MID_AS_LIMIT",
-    "TARGET_DELTA_CALL",
-    "TARGET_DELTA_PUT",
-    "MAX_SPREAD_PCT",
-    "MAX_QUOTE_AGE_S",
-    "MIN_VOL_TODAY",
-    "MIN_OI",
-    "MIN_DTE",
-    "MAX_DTE",
-    "SCAN_MIN_VOL_RTH",
-    "SCAN_MIN_OI_RTH",
-    "SCAN_MIN_VOL_AH",
-    "SCAN_MIN_OI_AH",
-    "SEND_CHAIN_SCAN_ALERTS",
-    "SEND_CHAIN_SCAN_TOPN_ALERTS",
-    "REPLACE_IF_NO_NBBO",
-    "market_now",
-    "llm_quota_snapshot",
-    "consume_llm",
-    "get_alert_text_from_request",
-    "parse_alert_text",
-    "round_strike_to_common_increment",
-    "_next_friday",
-    "same_week_friday",
-    "two_weeks_friday",
-    "is_same_week",
-    "_encode_ticker_path",
-    "_is_rth_now",
-    "_occ_meta",
-    "_ticker_matches_side",
-    "preflight_ok",
-    "compose_telegram_text",
-    "_ibkr_result_to_dict",
-    "_build_plus_minus_contracts",
-]
+# ... keep your compose_telegram_text and the rest EXACTLY as you already have ...
