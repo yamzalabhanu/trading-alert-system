@@ -28,23 +28,48 @@ class PolygonClient:
         q = dict(params or {})
         q["apiKey"] = self.api_key
         url = f"{self.base}{path}"
-        r = await self.http.get(url, params=q, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = await self.http.get(url, params=q, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            # Log response body (truncated) for fast debugging
+            try:
+                body = e.response.text
+            except Exception:
+                body = "<no body>"
+            logger.warning("[polygon] %s %s -> %s %s", "GET", url, e.response.status_code, (body or "")[:500])
+            raise
+        except Exception as e:
+            logger.warning("[polygon] GET failed %s: %r", url, e)
+            raise
 
     async def get_stock_snapshot(self, symbol: str) -> Dict[str, Any]:
-        js = await self._get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol.upper()}")
+        js = await self._get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol.upper()}", timeout=6.0)
         return js.get("ticker") or {}
 
     async def get_last_quote(self, symbol: str) -> Dict[str, Any]:
-        js = await self._get(f"/v2/last/nbbo/{symbol.upper()}")
+        js = await self._get(f"/v2/last/nbbo/{symbol.upper()}", timeout=6.0)
         return js.get("results") or {}
 
     async def get_last_trade(self, symbol: str) -> Dict[str, Any]:
-        js = await self._get(f"/v2/last/trade/{symbol.upper()}")
+        js = await self._get(f"/v2/last/trade/{symbol.upper()}", timeout=6.0)
         return js.get("results") or {}
 
-    async def get_aggregates(self, symbol: str, multiplier: int = 5, timespan: str = "minute", limit: int = 5000) -> List[Dict[str, Any]]:
+    # -------------------------------------------------------------------------
+    # Aggregates
+    # -------------------------------------------------------------------------
+    async def get_aggregates(
+        self,
+        symbol: str,
+        multiplier: int = 5,
+        timespan: str = "minute",
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Backward-compatible wide-window aggregate fetch.
+        Kept for existing callers (e.g., 5m bars).
+        """
         js = await self._get(
             f"/v2/aggs/ticker/{symbol.upper()}/range/{multiplier}/{timespan}/2020-01-01/2100-01-01",
             params={"adjusted": "true", "sort": "asc", "limit": limit},
@@ -52,6 +77,31 @@ class PolygonClient:
         )
         return js.get("results") or []
 
+    async def get_aggs_window(
+        self,
+        symbol: str,
+        *,
+        multiplier: int,
+        timespan: str,
+        from_: str,
+        to: str,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Preferred aggregates fetch for bounded windows.
+        Used for MTF context (daily/hourly/15m) so we don't pull huge ranges.
+        from_/to are YYYY-MM-DD.
+        """
+        js = await self._get(
+            f"/v2/aggs/ticker/{symbol.upper()}/range/{multiplier}/{timespan}/{from_}/{to}",
+            params={"adjusted": "true", "sort": "asc", "limit": limit},
+            timeout=10.0,
+        )
+        return js.get("results") or []
+
+    # -------------------------------------------------------------------------
+    # Indicators
+    # -------------------------------------------------------------------------
     async def get_indicator(
         self,
         kind: str,
@@ -67,7 +117,7 @@ class PolygonClient:
         field: str = "value",
     ) -> Optional[float]:
         path = f"/v1/indicators/{kind}/{symbol.upper()}"
-        params = {
+        params: Dict[str, Any] = {
             "timespan": timespan,
             "window": window,
             "series_type": series_type,
@@ -76,12 +126,14 @@ class PolygonClient:
             "adjusted": "true",
         }
         if kind == "macd":
-            params.update({
-                "short_window": macd_short,
-                "long_window": macd_long,
-                "signal_window": macd_signal,
-            })
-        js = await self._get(path, params=params)
+            params.update(
+                {
+                    "short_window": macd_short,
+                    "long_window": macd_long,
+                    "signal_window": macd_signal,
+                }
+            )
+        js = await self._get(path, params=params, timeout=8.0)
         values = (((js.get("results") or {}).get("values")) or [])
         if not values:
             return None
@@ -117,16 +169,19 @@ class PolygonClient:
             "macd_hist": macd_hist,
         }
 
+    # -------------------------------------------------------------------------
+    # Options snapshots
+    # -------------------------------------------------------------------------
     async def get_options_chain_snapshot(self, symbol: str, limit: int = 250) -> List[Dict[str, Any]]:
         js = await self._get(
             "/v3/snapshot/options",
             params={"underlying_ticker": symbol.upper(), "limit": limit},
-            timeout=8.0,
+            timeout=10.0,
         )
         return js.get("results") or []
 
     async def get_option_snapshot(self, option_ticker: str) -> Dict[str, Any]:
-        js = await self._get(f"/v3/snapshot/options/{option_ticker}")
+        js = await self._get(f"/v3/snapshot/options/{option_ticker}", timeout=10.0)
         return js.get("results") or {}
 
     async def get_targeted_option_context(
@@ -146,10 +201,20 @@ class PolygonClient:
             details = snap.get("details") or {}
             greeks = snap.get("greeks") or {}
             day = snap.get("day") or {}
+
             bid = q.get("bid")
             ask = q.get("ask")
-            mid = ((bid + ask) / 2.0) if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and (bid + ask) > 0 else None
-            spr = ((ask - bid) / max(mid, 1e-9) * 100.0) if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and mid else None
+            mid = (
+                ((bid + ask) / 2.0)
+                if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and (bid + ask) > 0
+                else None
+            )
+            spr = (
+                ((ask - bid) / max(mid, 1e-9) * 100.0)
+                if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and mid
+                else None
+            )
+
             return {
                 "option_ticker": opt,
                 "bid": bid,
