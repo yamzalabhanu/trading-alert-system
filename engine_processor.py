@@ -1,8 +1,9 @@
 # engine_processor.py
+import os
 import asyncio
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -27,6 +28,12 @@ except Exception:
 
 logger = logging.getLogger("trading_engine")
 NY_TZ = ZoneInfo("America/New_York")
+
+# -----------------------------------------------------------------------------
+# Provider policy (Polygon primary, Yahoo optional fallback)
+# -----------------------------------------------------------------------------
+DATA_PROVIDER = os.getenv("DATA_PROVIDER", "polygon").strip().lower()  # polygon|hybrid
+USE_YAHOO_FALLBACK = str(os.getenv("USE_YAHOO_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
 # =============================================================================
@@ -91,8 +98,49 @@ def _safe_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return None if (a is None or b is None or b == 0) else ((a - b) / b) * 100.0
 
 
+def _last_close(bars: List[Dict[str, Any]]) -> Optional[float]:
+    for b in reversed(bars or []):
+        c = b.get("c")
+        if isinstance(c, (int, float)):
+            return float(c)
+    return None
+
+
+def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
+    """
+    Simple ATR(14) using daily bars with keys h/l/c, bars sorted asc.
+    Returns None if insufficient data.
+    """
+    if not daily_bars or len(daily_bars) < 16:
+        return None
+
+    trs: List[float] = []
+    prev_c: Optional[float] = None
+    # Use last ~16 to compute 14 TRs safely
+    for b in daily_bars[-16:]:
+        h = b.get("h")
+        l = b.get("l")
+        c = b.get("c")
+        if not all(isinstance(x, (int, float)) for x in (h, l, c)):
+            continue
+        h = float(h)
+        l = float(l)
+        c = float(c)
+        if prev_c is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        trs.append(tr)
+        prev_c = c
+
+    if len(trs) < 15:
+        return None
+    # last 14 TRs
+    return sum(trs[-14:]) / 14.0
+
+
 # =============================================================================
-# Yahoo fallback features
+# Yahoo fallback features (unchanged)
 # =============================================================================
 async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
     """Fallback market-data enricher using Yahoo 5m chart API."""
@@ -257,7 +305,7 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Polygon primary features
+# Polygon primary features (+ MTF summaries)
 # =============================================================================
 async def _fetch_polygon_features(
     symbol: str,
@@ -274,16 +322,43 @@ async def _fetch_polygon_features(
     if not pc.enabled:
         return {}
 
+    # Helper: if PolygonClient doesn't yet have get_aggs_window(), fallback to get_aggregates for minute/hour/day.
+    async def _aggs_window(sym: str, multiplier: int, timespan: str, from_: str, to: str, limit: int) -> List[Dict[str, Any]]:
+        # Prefer native method if available
+        if hasattr(pc, "get_aggs_window"):
+            return await pc.get_aggs_window(sym, multiplier=multiplier, timespan=timespan, from_=from_, to=to, limit=limit)
+        # Fallback: polygon_client.get_aggregates likely uses a wide range internally; keep as backup
+        # Only safe for minute timespans in your current implementation.
+        if timespan in ("minute", "hour", "day"):
+            # Best-effort: minute/hour/day with a limit (may not honor from/to)
+            return await pc.get_aggregates(sym, multiplier=multiplier, timespan=timespan, limit=limit)
+        return []
+
     try:
         snap_task = pc.get_stock_snapshot(symbol)
         quote_task = pc.get_last_quote(symbol)
         trade_task = pc.get_last_trade(symbol)
-        agg_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
+        agg5m_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
         tech_task = pc.get_technicals_bundle(symbol)
         opt_task = pc.get_targeted_option_context(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
 
-        stock_snap, last_quote, last_trade, aggs, techs, opt_ctx = await asyncio.gather(
-            snap_task, quote_task, trade_task, agg_task, tech_task, opt_task
+        # Multi-timeframe context
+        today = date.today()
+        to_iso = (today + timedelta(days=2)).isoformat()
+        daily_task = _aggs_window(symbol, 1, "day", (today - timedelta(days=220)).isoformat(), to_iso, limit=260)
+        h1_task = _aggs_window(symbol, 1, "hour", (today - timedelta(days=30)).isoformat(), to_iso, limit=800)
+        m15_task = _aggs_window(symbol, 15, "minute", (today - timedelta(days=10)).isoformat(), to_iso, limit=1200)
+
+        stock_snap, last_quote, last_trade, aggs5m, techs, opt_ctx, daily_bars, h1_bars, m15_bars = await asyncio.gather(
+            snap_task,
+            quote_task,
+            trade_task,
+            agg5m_task,
+            tech_task,
+            opt_task,
+            daily_task,
+            h1_task,
+            m15_task,
         )
     except Exception as e:
         logger.warning("[features] polygon fetch failed for %s: %r", symbol, e)
@@ -326,7 +401,8 @@ async def _fetch_polygon_features(
     if isinstance(pd.get("c"), (int, float)):
         out["prev_close"] = float(pd.get("c"))
 
-    bars = aggs or []
+    # 5m bars (execution context + VWAP/ORB)
+    bars = aggs5m or []
     if bars:
         closes = [float(x.get("c")) for x in bars if isinstance(x.get("c"), (int, float))]
         highs = [float(x.get("h")) for x in bars if isinstance(x.get("h"), (int, float))]
@@ -361,9 +437,32 @@ async def _fetch_polygon_features(
             except Exception:
                 pass
 
+    # Indicator bundle
     if isinstance(techs, dict):
         out.update({k: v for k, v in techs.items() if v is not None})
 
+    # Daily ATR/regime context (high-value for scalping risk + expectation)
+    atr14 = _atr14_from_daily(daily_bars or [])
+    if atr14 is not None:
+        out["atr14_daily"] = atr14
+        if out.get("last") is not None:
+            out["atr14_pct"] = (atr14 / max(float(out["last"]), 1e-9)) * 100.0
+
+    out["bars_meta"] = {
+        "daily_n": len(daily_bars or []),
+        "h1_n": len(h1_bars or []),
+        "m15_n": len(m15_bars or []),
+        "m5_n": len(bars or []),
+    }
+    # Keep MTF payload light: last close only
+    out["mtf"] = {
+        "daily_last": _last_close(daily_bars or []),
+        "h1_last": _last_close(h1_bars or []),
+        "m15_last": _last_close(m15_bars or []),
+        "m5_last": _last_close(bars or []),
+    }
+
+    # Regime + alignment
     out["regime_flag"] = (
         "trending"
         if (
@@ -378,6 +477,7 @@ async def _fetch_polygon_features(
         lp = float(out["last"])
         out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
 
+    # Options context (if provided)
     if opt_ctx and isinstance(opt_ctx, dict):
         out.update({k: v for k, v in opt_ctx.items() if v is not None})
         out["nbbo_provider"] = "polygon:options_snapshot"
@@ -386,7 +486,7 @@ async def _fetch_polygon_features(
 
 
 # =============================================================================
-# Unified features fetch (Polygon → Yahoo)
+# Unified features fetch (Polygon → optional Yahoo fallback)
 # =============================================================================
 async def _fetch_equity_features(
     symbol: str,
@@ -395,11 +495,19 @@ async def _fetch_equity_features(
     side: Optional[str] = None,
     strike: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Fetch live market features using Polygon first, with Yahoo fallback."""
+    """
+    Provider policy:
+      - polygon (default): require Polygon; no silent Yahoo drift
+      - hybrid: polygon first, optional Yahoo fallback if USE_YAHOO_FALLBACK=1
+    """
     poly = await _fetch_polygon_features(symbol, expiry_iso=expiry_iso, side=side, strike=strike)
     if poly:
         return poly
-    return await _fetch_yahoo_features(symbol)
+
+    if DATA_PROVIDER == "hybrid" and USE_YAHOO_FALLBACK:
+        return await _fetch_yahoo_features(symbol)
+
+    return {}
 
 
 # =============================================================================
@@ -425,7 +533,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         except Exception:
             dte = None
 
-    # Start with alert baseline, then enrich with live ticker technicals.
+    # Baseline from alert, then enrich
     f: Dict[str, Any] = {
         "dte": dte,
         "last": alert.get("underlying_price_from_alert"),
@@ -452,6 +560,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
 
     pf_ok, pf_checks = preflight_ok(f)
 
+    # LLM analysis (include MTF summaries in f; already included)
     try:
         llm = await analyze_with_openai(alert, f)
         consume_llm()
@@ -472,9 +581,15 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         score, rating = None, None
 
+    # Telegram
     try:
         src = str(f.get("ta_src") or "unknown")
-        data_note = f"📊 TA source: {src}" if live else "⚠️ Live data unavailable; using alert baseline"
+        provider = str(f.get("data_provider") or "unknown")
+        if live:
+            data_note = f"📊 Data: {provider} ({src})"
+        else:
+            data_note = "⚠️ Live data unavailable; using alert baseline"
+
         tg_text = compose_telegram_text(
             alert=alert,
             option_ticker=None,
@@ -486,8 +601,15 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             rating=rating,
             diff_note=data_note,
         )
+
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            logger.info("[tg] send attempt: chat_id=%s len=%d decision=%s",
+                        str(TELEGRAM_CHAT_ID), len(tg_text or ""), str(llm.get("decision")))
             await send_telegram(tg_text)
+            logger.info("[tg] send done")
+        else:
+            logger.warning("[tg] missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID (token=%s chat_id=%s)",
+                           bool(TELEGRAM_BOT_TOKEN), bool(TELEGRAM_CHAT_ID))
     except Exception as e:
         logger.exception("[worker] Telegram error: %s", e)
 
@@ -520,12 +642,13 @@ def _append_decision_log(entry: Dict[str, Any]) -> None:
 
 
 async def net_debug_info() -> Dict[str, Any]:
+    md = "polygon_only" if (DATA_PROVIDER == "polygon") else f"hybrid(yahoo_fallback={USE_YAHOO_FALLBACK})"
     return {
         "integrations": {
             "ibkr": "disabled",
             "polygon": "enabled" if polygon_enabled() else "disabled",
             "perplexity": "disabled",
-            "market_data": "polygon_rest_with_yahoo_fallback",
+            "market_data": md,
         }
     }
 
