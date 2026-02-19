@@ -302,7 +302,6 @@ async def _fetch_polygon_features(
         agg5m_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
         tech_task = pc.get_technicals_bundle(symbol)
 
-        # Only fetch option context when we have option identifiers
         if expiry_iso and side and (strike is not None):
             opt_task: Awaitable[Dict[str, Any]] = pc.get_targeted_option_context(
                 symbol, expiry_iso=expiry_iso, side=side, strike=strike
@@ -379,9 +378,13 @@ async def _fetch_polygon_features(
             if len(vols) >= 20:
                 out["vol_avg20"] = sum(vols[-20:]) / 20.0
 
+            # ✅ FIXED VWAP block (removed extra ')')
             try:
-                tps = [
-                    (((float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0), float(x.get("v") or 0.0)))
+                tps: List[Tuple[float, float]] = [
+                    (
+                        (float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0,
+                        float(x.get("v") or 0.0),
+                    )
                     for x in bars
                     if all(isinstance(x.get(k), (int, float)) for k in ("h", "l", "c"))
                 ]
@@ -462,7 +465,6 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] bad alert payload: %s", e)
         return
 
-    # Meta extracted directly from alert (now consistent keys from engine_common.py)
     tv_meta_keys = [
         "source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange",
         "level", "ats", "bp", "tp1", "tp2", "tp3", "trail", "relvol", "relVol", "chop",
