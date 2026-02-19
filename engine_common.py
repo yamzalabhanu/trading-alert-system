@@ -124,6 +124,36 @@ def _extract_json_object(s: str) -> Optional[str]:
     return s[a : b + 1]
 
 
+def _maybe_unwrap_json_string(text: str) -> str:
+    """
+    If the payload is a JSON string containing JSON (double-encoded),
+    decode it once:
+      "\"{\\\"a\\\":1}\""  ->  "{\"a\":1}"
+    """
+    t = (text or "").strip()
+    if (len(t) >= 2) and ((t[0] == '"' and t[-1] == '"') or (t[0] == "'" and t[-1] == "'")):
+        try:
+            inner = json.loads(t)
+            if isinstance(inner, str):
+                return inner.strip()
+        except Exception:
+            pass
+    return t
+
+
+def _balance_braces(s: str) -> str:
+    """
+    Best-effort fix for truncated JSON missing one or more closing braces.
+    Only used as a last-resort before json.loads().
+    """
+    s = (s or "").strip()
+    o = s.count("{")
+    c = s.count("}")
+    if o > c:
+        s = s + ("}" * (o - c))
+    return s
+
+
 def _salvage_json_text(s: str) -> str:
     """
     Fix common TradingView/Pine JSON issues:
@@ -142,7 +172,6 @@ def _salvage_json_text(s: str) -> str:
     s = _NA_TOKEN_RE.sub(r": null\1", s)
 
     # Fix double commas anywhere
-    # Example: {"tp1":null,, "tp2":null}  -> {"tp1":null, "tp2":null}
     while True:
         s2 = _DOUBLE_COMMA_RE.sub(",", s)
         if s2 == s:
@@ -218,7 +247,6 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         out["expiry"] = expiry
 
     # IMPORTANT: keep meta keys in the same names your processor/llm expect
-    # (do NOT rename to alert_event/etc.)
     for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
         if payload.get(k) is not None:
             out[k] = payload.get(k)
@@ -235,6 +263,8 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
 
 
 def parse_alert_text(text: str) -> Dict[str, Any]:
+    # 0) unwrap if the payload is a JSON string containing JSON (double-encoded)
+    text = _maybe_unwrap_json_string(text)
     text = (text or "").strip()
 
     # 1) Plain-text patterns first
@@ -259,10 +289,17 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
         }
 
     # 2) Accept JSON payloads from TradingView/Pine webhook directly (with salvage).
-    if "{" in text and "}" in text:
+    # NOTE: don't require '}' because some payloads are double-encoded or truncated in logs.
+    if "{" in text:
         try:
-            fixed = _salvage_json_text(text)
+            fixed = _salvage_json_text(_balance_braces(text))
             payload = json.loads(fixed)
+
+            # If we got a JSON string (double-encoded) even after unwrap, decode once more.
+            if isinstance(payload, str):
+                payload2 = json.loads(_salvage_json_text(_balance_braces(payload)))
+                payload = payload2
+
             if isinstance(payload, dict):
                 parsed = _parse_alert_json_payload(payload)
                 if parsed:
