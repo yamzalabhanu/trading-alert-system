@@ -1,5 +1,4 @@
 # polygon_client.py
-import os
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
@@ -30,6 +29,9 @@ class PolygonClient:
         params: Optional[Dict[str, Any]] = None,
         timeout: float = 6.0,
     ) -> Dict[str, Any]:
+        """
+        Hard-fail request (raise_for_status). Use _get_soft() for plan-blocked endpoints.
+        """
         if not self.enabled:
             raise RuntimeError("POLYGON_API_KEY is not set")
 
@@ -41,44 +43,60 @@ class PolygonClient:
         r.raise_for_status()
         return r.json()
 
+    async def _get_soft(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 6.0,
+        *,
+        log_prefix: str = "[polygon]",
+        symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Soft-fail for endpoints that can be blocked by plan (403/401) or missing (404).
+        Returns {} on those, re-raises on other unexpected errors.
+        """
+        try:
+            return await self._get(path, params=params, timeout=timeout)
+        except httpx.HTTPStatusError as e:
+            code = getattr(e.response, "status_code", None)
+            sym = (symbol or "").upper()
+            # Common "not available / not entitled / not found" cases
+            if code in (401, 403, 404, 429):
+                if code in (401, 403):
+                    logger.warning("%s blocked for %s (HTTP %s) path=%s", log_prefix, sym, code, path)
+                elif code == 404:
+                    logger.warning("%s not found for %s (HTTP 404) path=%s", log_prefix, sym, path)
+                elif code == 429:
+                    logger.warning("%s rate-limited for %s (HTTP 429) path=%s", log_prefix, sym, path)
+                return {}
+            logger.warning("%s failed for %s (HTTP %s) path=%s err=%r", log_prefix, sym, code, path, e)
+            raise
+        except Exception as e:
+            logger.warning("%s exception for %s path=%s err=%r", log_prefix, (symbol or "").upper(), path, e)
+            return {}
+
     # -----------------------------
     # Stocks
     # -----------------------------
     async def get_stock_snapshot(self, symbol: str) -> Dict[str, Any]:
-        js = await self._get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol.upper()}")
+        sym = symbol.upper()
+        js = await self._get_soft(f"/v2/snapshot/locale/us/markets/stocks/tickers/{sym}", symbol=sym, log_prefix="[polygon] snapshot")
         return js.get("ticker") or {}
 
     async def get_last_quote(self, symbol: str) -> Dict[str, Any]:
+        """
+        ✅ Correct endpoint for last quote is NBBO:
+          /v2/last/nbbo/{ticker}
+        (There is no /v2/last/quote/{ticker} — that caused your 404s.)
+        """
         sym = symbol.upper()
-        try:
-            js = await self._get(f"/v2/last/quote/{sym}")
-            return js.get("results") or {}
-        except httpx.HTTPStatusError as e:
-            code = getattr(e.response, "status_code", None)
-            if code in (401, 403):
-                logger.warning("[polygon] last/quote blocked for %s (HTTP %s)", sym, code)
-            else:
-                logger.warning("[polygon] last/quote failed for %s: %r", sym, e)
-        except Exception as e:
-            logger.warning("[polygon] last/quote exception for %s: %r", sym, e)
-
-        # fallback NBBO (often blocked by plan)
-        try:
-            js = await self._get(f"/v2/last/nbbo/{sym}")
-            return js.get("results") or {}
-        except httpx.HTTPStatusError as e:
-            code = getattr(e.response, "status_code", None)
-            if code in (401, 403):
-                logger.warning("[polygon] nbbo blocked for %s (HTTP %s)", sym, code)
-            else:
-                logger.warning("[polygon] nbbo failed for %s: %r", sym, e)
-            return {}
-        except Exception as e:
-            logger.warning("[polygon] nbbo exception for %s: %r", sym, e)
-            return {}
+        js = await self._get_soft(f"/v2/last/nbbo/{sym}", symbol=sym, log_prefix="[polygon] nbbo")
+        return js.get("results") or {}
 
     async def get_last_trade(self, symbol: str) -> Dict[str, Any]:
-        js = await self._get(f"/v2/last/trade/{symbol.upper()}")
+        sym = symbol.upper()
+        js = await self._get_soft(f"/v2/last/trade/{sym}", symbol=sym, log_prefix="[polygon] last/trade")
         return js.get("results") or {}
 
     async def get_aggregates(
@@ -88,10 +106,34 @@ class PolygonClient:
         timespan: str = "minute",
         limit: int = 5000,
     ) -> List[Dict[str, Any]]:
+        sym = symbol.upper()
         js = await self._get(
-            f"/v2/aggs/ticker/{symbol.upper()}/range/{multiplier}/{timespan}/2020-01-01/2100-01-01",
+            f"/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}/2020-01-01/2100-01-01",
             params={"adjusted": "true", "sort": "asc", "limit": limit},
             timeout=8.0,
+        )
+        return js.get("results") or []
+
+    async def get_aggs_window(
+        self,
+        symbol: str,
+        *,
+        multiplier: int,
+        timespan: str,
+        from_: str,
+        to: str,
+        limit: int = 5000,
+        adjusted: bool = True,
+        sort: str = "asc",
+    ) -> List[Dict[str, Any]]:
+        """
+        More precise aggregate fetch for a window (helps daily/weekly context without the wide 2020-2100 range).
+        """
+        sym = symbol.upper()
+        js = await self._get(
+            f"/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}/{from_}/{to}",
+            params={"adjusted": "true" if adjusted else "false", "sort": sort, "limit": limit},
+            timeout=10.0 if timespan == "day" else 8.0,
         )
         return js.get("results") or []
 
@@ -114,7 +156,7 @@ class PolygonClient:
     ) -> Optional[float]:
         path = f"/v1/indicators/{kind}/{symbol.upper()}"
         params: Dict[str, Any] = {
-            "timespan": timespan,        # ✅ IMPORTANT: "day" for daily chart signals
+            "timespan": timespan,        # "minute" (intraday) or "day" (daily bias)
             "window": window,
             "series_type": series_type,
             "order": "desc",
@@ -193,9 +235,10 @@ class PolygonClient:
     # Options snapshots
     # -----------------------------
     async def get_options_chain_snapshot(self, symbol: str, limit: int = 250) -> List[Dict[str, Any]]:
+        sym = symbol.upper()
         js = await self._get(
             "/v3/snapshot/options",
-            params={"underlying_ticker": symbol.upper(), "limit": limit},
+            params={"underlying_ticker": sym, "limit": limit},
             timeout=8.0,
         )
         return js.get("results") or []
@@ -215,8 +258,9 @@ class PolygonClient:
         if not expiry_iso or strike is None:
             return {}
 
+        sym = symbol.upper()
         try:
-            opt = build_option_contract(symbol, expiry_iso, side or "CALL", float(strike))
+            opt = build_option_contract(sym, expiry_iso, side or "CALL", float(strike))
             snap = await self.get_option_snapshot(opt)
 
             q = snap.get("last_quote") or {}
@@ -254,12 +298,12 @@ class PolygonClient:
             }
         except httpx.HTTPStatusError as e:
             code = getattr(e.response, "status_code", None)
-            logger.debug("[polygon] option ctx blocked/failed for %s (HTTP %s): %r", symbol, code, e)
+            logger.debug("[polygon] option ctx blocked/failed for %s (HTTP %s): %r", sym, code, e)
             return {}
         except Exception as e:
-            logger.debug("[polygon] targeted option context failed: %r", e)
+            logger.debug("[polygon] targeted option context failed for %s: %r", sym, e)
             return {}
 
 
 def polygon_enabled() -> bool:
-    return bool(POLYGON_API_KEY)
+    return bool((POLYGON_API_KEY or "").strip())
