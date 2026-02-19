@@ -103,6 +103,10 @@ def _alert_payload(alert: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = alert.get(k)
     return out
 
+# llm_client.py
+
+async def analyze_with_openai(alert: dict, features: dict) -> dict:
+    return await analyze_alert(alert, features)
 
 # keep analyze_with_openai() exactly as you pasted, no logic changes needed
 # (it already supports equity-only alerts and missing options fields)
