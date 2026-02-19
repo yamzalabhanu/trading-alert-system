@@ -79,6 +79,7 @@ def _slim_features(f: Dict[str, Any]) -> Dict[str, Any]:
         "premarket_high","premarket_low",
         "short_volume","short_interest","short_volume_total","short_volume_ratio",
         "nbbo_http_status","nbbo_reason","ta_src",
+        "sma20_d","ema20_d","ema50_d","rsi14_d","macd_line_d","macd_signal_d","macd_hist_d",
         "tv_meta",
     ]
     return {k: f[k] for k in keys if k in f}
