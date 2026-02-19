@@ -406,9 +406,154 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
 
 
 # =========================
-# Telegram composition (keep unchanged)
+# Telegram composition (restored)
 # =========================
-# ... keep your compose_telegram_text and the rest EXACTLY as you already have ...
+def _fmt(v: Any, nd: int = 2) -> str:
+    if v is None:
+        return "n/a"
+    try:
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, float):
+            return f"{v:.{nd}f}"
+        return str(v)
+    except Exception:
+        return str(v)
+
+
+def _fmt_pct(v: Any, nd: int = 2) -> str:
+    if v is None:
+        return "n/a"
+    try:
+        return f"{float(v):.{nd}f}%"
+    except Exception:
+        return "n/a"
+
+
+def compose_telegram_text(
+    *,
+    alert: Dict[str, Any],
+    option_ticker: Optional[str],
+    f: Dict[str, Any],
+    llm: Dict[str, Any],
+    llm_ran: bool,
+    llm_reason: str,
+    score: Optional[float] = None,
+    rating: Optional[str] = None,
+    diff_note: str = "",
+) -> str:
+    """
+    Backward-compatible Telegram composer expected by engine_logic/engine_processor.
+
+    Works for:
+      - option alerts (strike/expiry present)
+      - equity-only alerts (strike/expiry missing)
+      - enriched TV JSON (event/model/reason/etc.)
+    """
+    sym = str(alert.get("symbol") or alert.get("ticker") or "").upper()
+    side = str(alert.get("side") or "").upper()
+    event = str(alert.get("event") or alert.get("alert_event") or "").strip().lower()
+    model = str(alert.get("model") or alert.get("alert_model") or "").strip()
+
+    ul_px = alert.get("underlying_price_from_alert") or alert.get("price") or f.get("last") or f.get("mid")
+    strike = alert.get("strike")
+    expiry = alert.get("expiry")
+
+    decision = str(llm.get("decision") or "wait").upper()
+    conf = llm.get("confidence")
+    reason = (llm.get("reason") or llm_reason or "").strip()
+
+    # Core header
+    hdr_bits = [decision, sym, side]
+    if event:
+        hdr_bits.append(f"({event})")
+    if rating:
+        hdr_bits.append(f"[{rating}]")
+    header = " ".join([x for x in hdr_bits if x])
+
+    # Price/contract line
+    contract_bits = [f"Price: {_fmt(ul_px, 2)}"]
+    if strike is not None:
+        contract_bits.append(f"Strike: {_fmt(strike, 2)}")
+    if expiry:
+        contract_bits.append(f"Exp: {expiry}")
+    if option_ticker:
+        contract_bits.append(f"OCC: {option_ticker}")
+    contract_line = " | ".join(contract_bits)
+
+    # Market/TA snippets (best effort)
+    last_ = f.get("last", ul_px)
+    bid = f.get("bid")
+    ask = f.get("ask")
+    mid = f.get("mid")
+    spr = f.get("option_spread_pct")
+    chg = f.get("quote_change_pct")
+    rsi = f.get("rsi14")
+    ema20, ema50 = f.get("ema20"), f.get("ema50")
+    vwap = f.get("vwap")
+    vwap_dist = f.get("vwap_dist")
+    orb_h, orb_l = f.get("orb15_high"), f.get("orb15_low")
+    mtf = f.get("mtf_align")
+    regime = f.get("regime_flag")
+
+    mkt_parts = []
+    if bid is not None and ask is not None:
+        mkt_parts.append(f"Bid/Ask: {_fmt(bid,2)}/{_fmt(ask,2)}")
+    if mid is not None:
+        mkt_parts.append(f"Mid: {_fmt(mid,2)}")
+    if spr is not None:
+        mkt_parts.append(f"Spr: {_fmt_pct(spr,2)}")
+    if chg is not None:
+        mkt_parts.append(f"Δ%: {_fmt(chg,2)}")
+    mkt_line = " | ".join(mkt_parts) if mkt_parts else ""
+
+    ta_parts = []
+    if rsi is not None:
+        ta_parts.append(f"RSI14: {_fmt(rsi,1)}")
+    if ema20 is not None and ema50 is not None and last_ is not None:
+        ta_parts.append(f"EMA20/50: {_fmt(ema20,2)}/{_fmt(ema50,2)}")
+    if vwap is not None:
+        ta_parts.append(f"VWAP: {_fmt(vwap,2)}")
+    if vwap_dist is not None:
+        ta_parts.append(f"VWAPΔ: {_fmt(vwap_dist,2)}%")
+    if orb_h is not None or orb_l is not None:
+        ta_parts.append(f"ORB15 H/L: {_fmt(orb_h,2)}/{_fmt(orb_l,2)}")
+    if isinstance(mtf, bool):
+        ta_parts.append(f"MTF: {'OK' if mtf else 'NO'}")
+    if regime:
+        ta_parts.append(f"Regime: {regime}")
+    ta_line = " | ".join(ta_parts) if ta_parts else ""
+
+    # Score line (optional)
+    score_line = ""
+    if score is not None or conf is not None or model:
+        bits = []
+        if score is not None:
+            bits.append(f"Score: {_fmt(score,1)}")
+        if conf is not None:
+            bits.append(f"Conf: {_fmt(conf,2)}")
+        if model:
+            bits.append(f"Model: {model}")
+        score_line = " | ".join(bits)
+
+    note = diff_note.strip()
+    if note:
+        note = f"\n{note}"
+
+    lines = [header, contract_line]
+    if score_line:
+        lines.append(score_line)
+    if mkt_line:
+        lines.append(mkt_line)
+    if ta_line:
+        lines.append(ta_line)
+    if reason:
+        lines.append(reason)
+
+    return ("\n".join([ln for ln in lines if ln.strip()])).strip() + note
+
 
 __all__ = [
     "POLYGON_API_KEY",
@@ -448,4 +593,5 @@ __all__ = [
     "_occ_meta",
     "_ticker_matches_side",
     "preflight_ok",
+    "compose_telegram_text",  
 ]
