@@ -103,10 +103,29 @@ def _alert_payload(alert: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = alert.get(k)
     return out
 
+
 # llm_client.py
 
+# If older code refers to analyze_alert, keep a compatibility alias.
+# Make sure ONE of these exists (analyze_alert or analyze_with_openai).
+
 async def analyze_with_openai(alert: dict, features: dict) -> dict:
-    return await analyze_alert(alert, features)
+    # If you already have an implementation named analyze_alert(), delegate to it.
+    if "analyze_alert" in globals() and callable(globals()["analyze_alert"]):
+        return await globals()["analyze_alert"](alert, features)
+
+    # Otherwise: return a safe fallback so the system never crashes
+    return {
+        "decision": "wait",
+        "confidence": 0.0,
+        "reason": "LLM disabled/misconfigured: analyze_alert not found",
+        "checklist": {},
+        "ev_estimate": {},
+    }
+
+# Backward compat: if some modules call analyze_alert() directly
+async def analyze_alert(alert: dict, features: dict) -> dict:
+    return await analyze_with_openai(alert, features)
 
 # keep analyze_with_openai() exactly as you pasted, no logic changes needed
 # (it already supports equity-only alerts and missing options fields)
