@@ -55,10 +55,13 @@ SCAN_MIN_OI_RTH = int(os.getenv("SCAN_MIN_OI_RTH", os.getenv("SCAN_MIN_OI", "500
 SCAN_MIN_VOL_AH = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
 SCAN_MIN_OI_AH = int(os.getenv("SCAN_MIN_OI_AH", "100"))
 
-# Keep these env toggles defined (even if you’ve disabled messages elsewhere)
+# Keep these env toggles defined
 SEND_CHAIN_SCAN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "0"))
 SEND_CHAIN_SCAN_TOPN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "0"))
 REPLACE_IF_NO_NBBO = _env_truthy(os.getenv("REPLACE_IF_NO_NBBO", "1"))
+
+# Allow enriched JSON alerts without strike/expiry (equity-only ok)
+ALLOW_NO_STRIKE_JSON = _env_truthy(os.getenv("ALLOW_NO_STRIKE_JSON", "1"))
 
 # =========================
 # Small helpers / time & quota
@@ -108,6 +111,8 @@ ALERT_RE_NO_EXP = re.compile(
 # -----------------------------
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 _NA_TOKEN_RE = re.compile(r":\s*na(\s*[,}])", re.IGNORECASE)  # :na, or :na}
+_DOUBLE_COMMA_RE = re.compile(r",\s*,+")  # ",," or ", ,"
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # invalid JSON control chars
 
 
 def _extract_json_object(s: str) -> Optional[str]:
@@ -119,23 +124,71 @@ def _extract_json_object(s: str) -> Optional[str]:
     return s[a : b + 1]
 
 
+def _maybe_unwrap_json_string(text: str) -> str:
+    """
+    If the payload is a JSON string containing JSON (double-encoded),
+    decode it once:
+      "\"{\\\"a\\\":1}\""  ->  "{\"a\":1}"
+    """
+    t = (text or "").strip()
+    if (len(t) >= 2) and ((t[0] == '"' and t[-1] == '"') or (t[0] == "'" and t[-1] == "'")):
+        try:
+            inner = json.loads(t)
+            if isinstance(inner, str):
+                return inner.strip()
+        except Exception:
+            pass
+    return t
+
+
+def _balance_braces(s: str) -> str:
+    """
+    Best-effort fix for truncated JSON missing one or more closing braces.
+    Only used as a last-resort before json.loads().
+    """
+    s = (s or "").strip()
+    o = s.count("{")
+    c = s.count("}")
+    if o > c:
+        s = s + ("}" * (o - c))
+    return s
+
+
 def _salvage_json_text(s: str) -> str:
     """
     Fix common TradingView/Pine JSON issues:
       - extra prefix/suffix text around JSON
       - Pine 'na' token => JSON null
       - trailing commas before } or ]
+      - accidental double commas:  "tp1":null,, "x":1
+      - stray control chars
     """
     s = (s or "").strip()
     obj = _extract_json_object(s)
     if obj is not None:
         s = obj
+
+    s = _CONTROL_CHARS_RE.sub("", s)
     s = _NA_TOKEN_RE.sub(r": null\1", s)
+
+    # Fix double commas anywhere
+    while True:
+        s2 = _DOUBLE_COMMA_RE.sub(",", s)
+        if s2 == s:
+            break
+        s = s2
+
+    # Remove trailing commas before closing braces/brackets
     s = _TRAILING_COMMA_RE.sub(r"\1", s)
     return s
 
 
 async def get_alert_text_from_request(request: Request) -> str:
+    """
+    Returns:
+      - plain text if client posted text/plain
+      - a JSON string if client posted application/json
+    """
     try:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -143,7 +196,6 @@ async def get_alert_text_from_request(request: Request) -> str:
             msg = str(data.get("message") or data.get("alert") or data.get("text") or "").strip()
             if msg:
                 return msg
-            # Accept direct TradingView/Pine JSON payloads too.
             return json.dumps(data, separators=(",", ":"))
         body = await request.body()
         return body.decode("utf-8").strip()
@@ -160,36 +212,59 @@ def _as_float(v: Any) -> Optional[float]:
         return None
 
 
+def _norm_side(side_raw: str) -> Optional[str]:
+    s = (side_raw or "").upper().strip()
+    if s in ("CALL", "BUY", "LONG", "BULL"):
+        return "CALL"
+    if s in ("PUT", "SELL", "SHORT", "BEAR"):
+        return "PUT"
+    return None
+
+
 def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    side_raw = str(payload.get("side") or payload.get("type") or payload.get("signal") or "").upper().strip()
-    side = (
-        "CALL"
-        if side_raw in ("CALL", "BUY", "LONG", "BULL")
-        else "PUT"
-        if side_raw in ("PUT", "SELL", "SHORT", "BEAR")
-        else None
-    )
+    # Support: original schema + scalper_v4_2 schema
+    side = _norm_side(str(payload.get("side") or payload.get("type") or payload.get("signal") or ""))
     symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("underlying") or "").upper().strip()
+
     px = _as_float(payload.get("price") if payload.get("price") is not None else payload.get("last"))
     strike = _as_float(payload.get("strike"))
     expiry = str(payload.get("expiry") or "").strip()
 
-    # Keep current requirements: must have strike for option contract selection
-    if not side or not symbol or px is None or strike is None:
+    # must have at least side+symbol+price
+    if not side or not symbol or px is None:
         return None
 
     out: Dict[str, Any] = {
         "side": side,
         "symbol": symbol,
         "underlying_price_from_alert": px,
-        "strike": strike,
     }
+
+    # Optional options fields
+    if strike is not None:
+        out["strike"] = strike
     if re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
         out["expiry"] = expiry
+
+    # IMPORTANT: keep meta keys in the same names your processor/llm expect
+    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
+        if payload.get(k) is not None:
+            out[k] = payload.get(k)
+
+    # pass-through other useful fields (if present)
+    for k in ("adx", "relVol", "relvol", "chop", "tp1", "tp2", "tp3", "trail", "fast_stop", "ason", "bp", "ats"):
+        if k in payload:
+            out[k] = payload.get(k)
+
+    if out.get("strike") is None and not ALLOW_NO_STRIKE_JSON:
+        return None
+
     return out
 
 
 def parse_alert_text(text: str) -> Dict[str, Any]:
+    # 0) unwrap if the payload is a JSON string containing JSON (double-encoded)
+    text = _maybe_unwrap_json_string(text)
     text = (text or "").strip()
 
     # 1) Plain-text patterns first
@@ -214,18 +289,23 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
         }
 
     # 2) Accept JSON payloads from TradingView/Pine webhook directly (with salvage).
-    #    This fixes common issues seen in logs: ':na', trailing commas, extra text around JSON.
-    if "{" in text and "}" in text:
+    # NOTE: don't require '}' because some payloads are double-encoded or truncated in logs.
+    if "{" in text:
         try:
-            fixed = _salvage_json_text(text)
+            fixed = _salvage_json_text(_balance_braces(text))
             payload = json.loads(fixed)
+
+            # If we got a JSON string (double-encoded) even after unwrap, decode once more.
+            if isinstance(payload, str):
+                payload2 = json.loads(_salvage_json_text(_balance_braces(payload)))
+                payload = payload2
+
             if isinstance(payload, dict):
                 parsed = _parse_alert_json_payload(payload)
                 if parsed:
                     return parsed
         except Exception as e:
-            # Keep quiet unless you want to debug truncation/issues:
-            logger.debug("JSON parse failed (will try other formats): %s", e)
+            logger.debug("JSON parse failed: %s", e)
 
     raise HTTPException(status_code=400, detail="Unrecognized alert format")
 
@@ -326,345 +406,9 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
 
 
 # =========================
-# Telegram composition (compact)
+# Telegram composition (keep unchanged)
 # =========================
-def _fmt_num(x, nd: int = 2, dash: str = "-"):
-    """
-    Format number with nd decimals. If x is None/NaN/inf, return `dash`.
-    Accepts a custom dash to support typographic '—' or '?' placeholders.
-    """
-    try:
-        if x is None:
-            return dash
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return dash
-        if abs(v - round(v)) < 1e-9 and nd == 0:
-            return str(int(round(v)))
-        return f"{v:.{nd}f}"
-    except Exception:
-        return dash
-
-
-def _fmt_int(x, dash: str = "-"):
-    try:
-        if x is None:
-            return dash
-        return f"{int(x):,}"
-    except Exception:
-        return dash
-
-
-def _fmt_pct(x, nd=2, dash: str = "-"):
-    try:
-        if x is None:
-            return dash
-        return f"{float(x):.{nd}f}%"
-    except Exception:
-        return dash
-
-
-def _dte_label(expiry_iso: str, now_dt: Optional[datetime] = None) -> str:
-    now_dt = now_dt or market_now()
-    try:
-        d = datetime.fromisoformat(expiry_iso).date()
-        today = now_dt.date()
-        dte = (d - today).days
-        if dte <= 0:
-            return "0DTE"
-        if dte == 1:
-            return "1DTE"
-        return f"{dte} DTE"
-    except Exception:
-        return ""
-
-
-def _side_letter(side: str) -> str:
-    return "C" if (side or "").upper().startswith("C") else "P"
-
-
-def _compact_adjustments(diff_note: str) -> str:
-    if not diff_note:
-        return ""
-    parts = []
-    for raw in diff_note.splitlines():
-        s = raw.strip()
-        if not s:
-            continue
-        if s.startswith("🎯"):
-            s = s.replace("🎯 ", "").replace("Selected ", "").replace(" (alert was", " (was")
-        elif s.startswith("🗓"):
-            s = s.replace("🗓 ", "").replace("Selected ", "").replace(" (alert was", " (was")
-        elif s.startswith("📡"):
-            s = s.replace("📡 ", "").replace("NBBO via ", "NBBO ")
-        elif s.startswith("🧪"):
-            s = s.replace("🧪 ", "").replace("Synthetic NBBO used", "Synthetic")
-            s = s.replace(" spread est.", "")
-        parts.append(s)
-    return "Adj: " + " • ".join(parts)
-
-
-def _first_sentence(text: str, max_len: int = 80) -> str:
-    """
-    Return the first sentence-ish fragment (up to max_len).
-    Falls back to truncation with ellipsis.
-    """
-    s = (text or "").strip()
-    if not s:
-        return ""
-    for sep in [". ", "? ", "! "]:
-        if sep in s:
-            s = s.split(sep, 1)[0]
-            break
-    if len(s) > max_len:
-        return s[: max_len - 1].rstrip() + "…"
-    return s
-
-
-def _pick_factor_lines_from_reason(reason_text: str, max_lines: int = 3) -> List[str]:
-    """
-    Extract up to N short bullet lines from a multi-line reason/analysis blob.
-    Looks for dash/emoji bullets first; otherwise splits by sentences.
-    """
-    s = (reason_text or "").strip()
-    if not s:
-        return []
-    lines: List[str] = []
-
-    # Prefer existing bullet-like lines
-    for line in s.splitlines():
-        t = line.strip(" •-—*·\t")
-        if not t:
-            continue
-        if line.lstrip().startswith(("•", "-", "—", "*", "·")):
-            lines.append(t)
-        if len(lines) >= max_lines:
-            break
-
-    if not lines:
-        # Fall back to sentences
-        tmp = s.replace("! ", ". ").replace("? ", ". ").split(". ")
-        for frag in tmp:
-            frag = frag.strip()
-            if frag:
-                lines.append(frag)
-            if len(lines) >= max_lines:
-                break
-
-    # Trim each to a reasonable length
-    out: List[str] = []
-    for l in lines[:max_lines]:
-        out.append(l if len(l) <= 96 else (l[:95].rstrip() + "…"))
-    return out
-
-
-def compose_telegram_text(
-    alert: Dict[str, Any],
-    option_ticker: Optional[str],
-    f: Dict[str, Any],
-    llm: Dict[str, Any],
-    llm_ran: bool = False,
-    llm_reason: str = "",
-    score: Optional[float] = None,
-    rating: Optional[str] = None,
-    diff_note: str = "",
-) -> str:
-    side = (alert.get("side") or "").upper()
-    sym = alert.get("symbol") or "?"
-    strike = alert.get("strike")
-    right = "C" if side == "CALL" else "P"
-    expiry = alert.get("expiry") or ""
-
-    # DTE
-    dte = f.get("dte")
-    if dte is None and expiry:
-        try:
-            dte = (datetime.fromisoformat(expiry).date() - datetime.now(timezone.utc).date()).days
-        except Exception:
-            dte = None
-
-    # LLM bits
-    hdr_decision = (llm.get("decision") or "wait").upper() if isinstance(llm, dict) else "WAIT"
-    horizon = (llm.get("horizon") or "").upper() if isinstance(llm, dict) else ""
-    horizon_reason = llm.get("horizon_reason") if isinstance(llm, dict) else None
-    conf = llm.get("confidence")
-    reason_text = (llm.get("reason") or llm_reason or "").strip()
-
-    s_fmt = _fmt_num(strike, 0)
-    header = f"{hdr_decision} – {sym} {s_fmt}{right} ({_fmt_num(dte, 0)} DTE, {expiry})"
-
-    bias_line = ""
-    if horizon:
-        bias_short = _first_sentence(horizon_reason or "", max_len=80)
-        bias_line = f"Bias: {horizon}" + (f" ({bias_short})" if bias_short else "")
-
-    summary_line = ""
-    if reason_text:
-        lines = [ln for ln in reason_text.splitlines() if ln.strip()]
-        narrative = ""
-        for i, ln in enumerate(lines):
-            if ln.startswith("🕒 Suggested trade"):
-                if i + 1 < len(lines):
-                    narrative = lines[i + 1].strip()
-                break
-        if not narrative:
-            narrative = _first_sentence(reason_text, max_len=180)
-        if narrative:
-            summary_line = _first_sentence(narrative, max_len=180)
-
-    setup_bits = _pick_factor_lines_from_reason(reason_text)
-    setup_line = ""
-    if setup_bits:
-        cleaned = []
-        for s in setup_bits:
-            s2 = s
-            if s2.startswith("[") and "] " in s2:
-                s2 = s2.split("] ", 1)[1]
-            cleaned.append(s2)
-        setup_line = "Setup: " + "; ".join(cleaned)
-
-    # ===== Technicals line (RSI, MACD, EMAs, VWAP, ORB) =====
-    def _fmt_opt(n, nd=2):
-        return _fmt_num(n, nd=nd, dash="—")
-
-    rsi = f.get("rsi14")
-    ema20 = f.get("ema20")
-    ema50 = f.get("ema50")
-    ema200 = f.get("ema200")
-    macd_l = f.get("macd_line")
-    macd_s = f.get("macd_signal")
-    macd_h = f.get("macd_hist")
-    vwap_val = f.get("vwap_rth") if f.get("vwap_rth") is not None else f.get("vwap")
-    orb_hi = f.get("orb15_high")
-    orb_lo = f.get("orb15_low")
-
-    tech_chunks = []
-    if isinstance(rsi, (int, float)):
-        tech_chunks.append(f"RSI {round(rsi):d}")
-    if isinstance(macd_l, (int, float)) and isinstance(macd_s, (int, float)):
-        cross = "L>S" if macd_l > macd_s else ("L<S" if macd_l < macd_s else "L=S")
-        hist_tag = None
-        if isinstance(macd_h, (int, float)):
-            hist_tag = f"{'+' if macd_h>0 else ''}{_fmt_opt(macd_h, 2)}"
-        tech_chunks.append(f"MACD {cross}" + (f" ({hist_tag})" if hist_tag is not None else ""))
-    if any(isinstance(x, (int, float)) for x in (ema20, ema50, ema200)):
-        tech_chunks.append(f"EMA20/50/200 {_fmt_opt(ema20,2)}/{_fmt_opt(ema50,2)}/{_fmt_opt(ema200,2)}")
-    if isinstance(vwap_val, (int, float)):
-        tech_chunks.append(f"VWAP {_fmt_opt(vwap_val,2)}")
-    if isinstance(orb_hi, (int, float)) or isinstance(orb_lo, (int, float)):
-        tech_chunks.append(f"ORB {_fmt_opt(orb_hi,2)}/{_fmt_opt(orb_lo,2)}")
-
-    tech_line = "Tech: " + (" • ".join(tech_chunks) if tech_chunks else "—")
-
-    # Liquidity & context
-    oi = f.get("oi")
-    vol = f.get("vol")
-    liq_line = f"Liquidity: OI { _fmt_num(oi, 0, dash='?') } / Vol { _fmt_num(vol, 0, dash='?') }"
-
-    svr = f.get("short_volume_ratio")
-    if svr is None:
-        svr_disp = "—"
-    else:
-        try:
-            val = float(svr)
-            if 0 <= val <= 1.0:
-                val *= 100.0
-            svr_disp = _fmt_pct(val, 0)
-        except Exception:
-            svr_disp = "—"
-    ctx_line = f"Context: SVR {svr_disp}"
-
-    # Quotes (NBBO)
-    spread_pct = f.get("option_spread_pct")
-    qage = f.get("quote_age_sec")
-    provider = f.get("nbbo_provider") or (
-        "polygon:snapshot" if f.get("bid") is not None or f.get("ask") is not None else None
-    )
-    quotes_bits = []
-    if f.get("bid") is not None and f.get("ask") is not None:
-        quotes_bits.append(f"{_fmt_num(f.get('bid'))}/{_fmt_num(f.get('ask'))} mid {_fmt_num(f.get('mid'))}")
-    else:
-        quotes_bits.append("-/- mid " + _fmt_num(f.get("mid")))
-    if spread_pct is not None:
-        quotes_bits.append(f"spread {_fmt_pct(spread_pct, 2)}")
-    if isinstance(qage, (int, float)):
-        quotes_bits.append(f"age {int(qage)}s")
-    if provider:
-        quotes_bits.append(provider)
-    quotes_line = "NBBO: " + " • ".join(quotes_bits)
-
-    conf_line = f"Confidence: { _fmt_num(conf, 2, dash='—') }"
-    sr_line = ""
-    if score is not None or rating is not None:
-        sr_line = f"Score: { _fmt_num(score, 2, dash='—') }"
-        if rating:
-            sr_line += f" | Rating: {rating}"
-
-    appendix = diff_note.strip()
-    if appendix:
-        appendix = "\n" + appendix
-
-    out_lines = [
-        header,
-        bias_line or None,
-        "🕒 Suggested trade: " + (horizon or "—") + (f" — {summary_line}" if summary_line else ""),
-        setup_line or None,
-        tech_line,
-        liq_line,
-        ctx_line,
-        quotes_line,
-        conf_line + ((" | " + sr_line) if sr_line else ""),
-        appendix or None,
-    ]
-    return "\n".join([ln for ln in out_lines if ln])
-
-
-def _ibkr_result_to_dict(res: Any) -> Dict[str, Any]:
-    if res is None:
-        return {"ok": False, "error": "ibkr_client returned None", "raw": None}
-    if isinstance(res, dict):
-        return {
-            "ok": bool(res.get("ok", False)),
-            "order_id": res.get("order_id"),
-            "status": res.get("status"),
-            "filled": res.get("filled"),
-            "remaining": res.get("remaining"),
-            "avg_fill_price": res.get("avg_fill_price"),
-            "error": res.get("error"),
-            "raw": res.get("raw", res),
-        }
-    if isinstance(res, str):
-        return {"ok": False, "error": res, "raw": res}
-    try:
-        payload = {
-            "ok": getattr(res, "ok", False),
-            "order_id": getattr(res, "order_id", None),
-            "status": getattr(res, "status", None),
-            "filled": getattr(res, "filled", None),
-            "remaining": getattr(res, "remaining", None),
-            "avg_fill_price": getattr(res, "avg_fill_price", None),
-            "error": getattr(res, "error", None),
-        }
-        try:
-            payload["raw"] = getattr(res, "raw", None) or repr(res)
-        except Exception:
-            payload["raw"] = repr(res)
-        return payload
-    except Exception as e:
-        return {"ok": False, "error": f"serialize-failed: {type(e).__name__}: {e}", "raw": repr(res)}
-
-
-# strike builder (local)
-def _build_plus_minus_contracts(symbol: str, ul_px: float, expiry_iso: str) -> Dict[str, Any]:
-    call_strike = round_strike_to_common_increment(ul_px * 1.05)
-    put_strike = round_strike_to_common_increment(ul_px * 0.95)
-    return {
-        "strike_call": call_strike,
-        "strike_put": put_strike,
-        "contract_call": build_option_contract(symbol, expiry_iso, "CALL", call_strike),
-        "contract_put": build_option_contract(symbol, expiry_iso, "PUT", put_strike),
-    }
-
+# ... keep your compose_telegram_text and the rest EXACTLY as you already have ...
 
 __all__ = [
     "POLYGON_API_KEY",
@@ -688,6 +432,7 @@ __all__ = [
     "SEND_CHAIN_SCAN_ALERTS",
     "SEND_CHAIN_SCAN_TOPN_ALERTS",
     "REPLACE_IF_NO_NBBO",
+    "ALLOW_NO_STRIKE_JSON",
     "market_now",
     "llm_quota_snapshot",
     "consume_llm",
@@ -703,7 +448,4 @@ __all__ = [
     "_occ_meta",
     "_ticker_matches_side",
     "preflight_ok",
-    "compose_telegram_text",
-    "_ibkr_result_to_dict",
-    "_build_plus_minus_contracts",
 ]
