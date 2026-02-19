@@ -10,7 +10,7 @@ from engine_common import (
     get_alert_text_from_request, parse_alert_text,
     round_strike_to_common_increment, _next_friday, same_week_friday, two_weeks_friday, is_same_week,
     _encode_ticker_path, _is_rth_now, _occ_meta, _ticker_matches_side,
-    preflight_ok, compose_telegram_text, _ibkr_result_to_dict, _build_plus_minus_contracts,
+    preflight_ok, compose_telegram_text, _build_plus_minus_contracts,
 )
 
 from engine_processor import process_tradingview_job, net_debug_info
