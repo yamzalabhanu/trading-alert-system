@@ -30,11 +30,6 @@ class PolygonClient:
         params: Optional[Dict[str, Any]] = None,
         timeout: float = 6.0,
     ) -> Dict[str, Any]:
-        """
-        NOTE:
-        - Never log full URLs (apiKey would leak in logs).
-        - Let caller decide how to handle HTTPStatusError.
-        """
         if not self.enabled:
             raise RuntimeError("POLYGON_API_KEY is not set")
 
@@ -54,23 +49,7 @@ class PolygonClient:
         return js.get("ticker") or {}
 
     async def get_last_quote(self, symbol: str) -> Dict[str, Any]:
-        """
-        Quote endpoint selection:
-
-        Many Polygon plans block NBBO:
-          /v2/last/nbbo/{symbol}  -> 403
-
-        Prefer:
-          /v2/last/quote/{symbol}
-
-        Fallback:
-          /v2/last/nbbo/{symbol}
-
-        Returns {} if neither is available.
-        """
         sym = symbol.upper()
-
-        # 1) Try last/quote first (less restricted on many plans)
         try:
             js = await self._get(f"/v2/last/quote/{sym}")
             return js.get("results") or {}
@@ -83,7 +62,7 @@ class PolygonClient:
         except Exception as e:
             logger.warning("[polygon] last/quote exception for %s: %r", sym, e)
 
-        # 2) Fallback to NBBO (some plans allow it; many don't)
+        # fallback NBBO (often blocked by plan)
         try:
             js = await self._get(f"/v2/last/nbbo/{sym}")
             return js.get("results") or {}
@@ -135,7 +114,7 @@ class PolygonClient:
     ) -> Optional[float]:
         path = f"/v1/indicators/{kind}/{symbol.upper()}"
         params: Dict[str, Any] = {
-            "timespan": timespan,
+            "timespan": timespan,        # ✅ IMPORTANT: "day" for daily chart signals
             "window": window,
             "series_type": series_type,
             "order": "desc",
@@ -159,33 +138,55 @@ class PolygonClient:
         val = item.get(field)
         return float(val) if isinstance(val, (int, float)) else None
 
-    async def get_technicals_bundle(self, symbol: str) -> Dict[str, Optional[float]]:
+    async def get_technicals_bundle(
+        self,
+        symbol: str,
+        *,
+        timespan: str = "minute",
+    ) -> Dict[str, Optional[float]]:
+        """
+        Returns a standard indicator bundle for the given timespan.
+        - timespan="minute" => intraday signal context
+        - timespan="day"    => daily-chart bias/context for higher precision
+        """
         async def _safe(kind: str, **kwargs: Any) -> Optional[float]:
             try:
-                return await self.get_indicator(kind, symbol, **kwargs)
+                return await self.get_indicator(kind, symbol, timespan=timespan, **kwargs)
             except Exception:
                 return None
 
-        sma20, ema20, ema50, rsi14, adx14, macd, macd_sig, macd_hist = await asyncio.gather(
+        sma20, ema20, ema50, rsi14, macd, macd_sig, macd_hist = await asyncio.gather(
             _safe("sma", window=20),
             _safe("ema", window=20),
             _safe("ema", window=50),
             _safe("rsi", window=14),
-            _safe("adx", window=14),
             _safe("macd", field="value"),
             _safe("macd", field="signal"),
             _safe("macd", field="histogram"),
         )
-
         return {
             "sma20": sma20,
             "ema20": ema20,
             "ema50": ema50,
             "rsi14": rsi14,
-            "adx14": adx14,
             "macd_line": macd,
             "macd_signal": macd_sig,
             "macd_hist": macd_hist,
+        }
+
+    async def get_technicals_daily_bundle(self, symbol: str) -> Dict[str, Optional[float]]:
+        """
+        ✅ Daily chart indicators, names suffixed with _d to avoid collisions.
+        """
+        d = await self.get_technicals_bundle(symbol, timespan="day")
+        return {
+            "sma20_d": d.get("sma20"),
+            "ema20_d": d.get("ema20"),
+            "ema50_d": d.get("ema50"),
+            "rsi14_d": d.get("rsi14"),
+            "macd_line_d": d.get("macd_line"),
+            "macd_signal_d": d.get("macd_signal"),
+            "macd_hist_d": d.get("macd_hist"),
         }
 
     # -----------------------------
@@ -211,11 +212,6 @@ class PolygonClient:
         side: Optional[str],
         strike: Optional[float],
     ) -> Dict[str, Any]:
-        """
-        Uses OCC option ticker (O:SYMBOLYYMMDDC/P########) and fetches /v3 snapshot.
-
-        Returns: bid/ask/mid/spread%, OI/vol, greeks, iv when available.
-        """
         if not expiry_iso or strike is None:
             return {}
 
