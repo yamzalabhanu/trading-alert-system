@@ -1,6 +1,7 @@
 # polygon_client.py
 import asyncio
 import logging
+import random
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -31,6 +32,8 @@ class PolygonClient:
     ) -> Dict[str, Any]:
         """
         Hard-fail request (raise_for_status). Use _get_soft() for plan-blocked endpoints.
+
+        ✅ 429-safe: retries with exponential backoff + jitter; respects Retry-After header.
         """
         if not self.enabled:
             raise RuntimeError("POLYGON_API_KEY is not set")
@@ -39,9 +42,58 @@ class PolygonClient:
         q["apiKey"] = self.api_key
         url = f"{self.base}{path}"
 
-        r = await self.http.get(url, params=q, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
+        max_retries = int((os.getenv("POLYGON_429_RETRIES", "3") or "3").strip())
+        base_sleep = float((os.getenv("POLYGON_429_BASE_SLEEP", "0.6") or "0.6").strip())
+
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                r = await self.http.get(url, params=q, timeout=timeout)
+
+                if r.status_code == 429:
+                    # Retry-After may be present
+                    ra = r.headers.get("Retry-After")
+                    if ra:
+                        try:
+                            sleep_s = float(ra)
+                        except Exception:
+                            sleep_s = base_sleep * (2 ** attempt)
+                    else:
+                        sleep_s = base_sleep * (2 ** attempt)
+
+                    # add small jitter
+                    sleep_s = sleep_s + random.uniform(0.0, 0.25)
+
+                    logger.warning(
+                        "[polygon] 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs",
+                        attempt + 1,
+                        max_retries + 1,
+                        path,
+                        sleep_s,
+                    )
+
+                    # If this was the last attempt, raise
+                    if attempt >= max_retries:
+                        r.raise_for_status()
+
+                    await asyncio.sleep(sleep_s)
+                    continue
+
+                r.raise_for_status()
+                return r.json()
+
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                raise
+            except Exception as e:
+                last_exc = e
+                raise
+
+        # Should never get here, but keep a safe raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Polygon request failed unexpectedly")
 
     async def _get_soft(
         self,
@@ -54,14 +106,14 @@ class PolygonClient:
     ) -> Dict[str, Any]:
         """
         Soft-fail for endpoints that can be blocked by plan (403/401) or missing (404).
-        Returns {} on those, re-raises on other unexpected errors.
+        Returns {} on those (and 429 after retries), re-raises on other unexpected errors.
         """
         try:
             return await self._get(path, params=params, timeout=timeout)
         except httpx.HTTPStatusError as e:
             code = getattr(e.response, "status_code", None)
             sym = (symbol or "").upper()
-            # Common "not available / not entitled / not found" cases
+
             if code in (401, 403, 404, 429):
                 if code in (401, 403):
                     logger.warning("%s blocked for %s (HTTP %s) path=%s", log_prefix, sym, code, path)
@@ -70,6 +122,7 @@ class PolygonClient:
                 elif code == 429:
                     logger.warning("%s rate-limited for %s (HTTP 429) path=%s", log_prefix, sym, path)
                 return {}
+
             logger.warning("%s failed for %s (HTTP %s) path=%s err=%r", log_prefix, sym, code, path, e)
             raise
         except Exception as e:
@@ -81,14 +134,17 @@ class PolygonClient:
     # -----------------------------
     async def get_stock_snapshot(self, symbol: str) -> Dict[str, Any]:
         sym = symbol.upper()
-        js = await self._get_soft(f"/v2/snapshot/locale/us/markets/stocks/tickers/{sym}", symbol=sym, log_prefix="[polygon] snapshot")
+        js = await self._get_soft(
+            f"/v2/snapshot/locale/us/markets/stocks/tickers/{sym}",
+            symbol=sym,
+            log_prefix="[polygon] snapshot",
+        )
         return js.get("ticker") or {}
 
     async def get_last_quote(self, symbol: str) -> Dict[str, Any]:
         """
         ✅ Correct endpoint for last quote is NBBO:
           /v2/last/nbbo/{ticker}
-        (There is no /v2/last/quote/{ticker} — that caused your 404s.)
         """
         sym = symbol.upper()
         js = await self._get_soft(f"/v2/last/nbbo/{sym}", symbol=sym, log_prefix="[polygon] nbbo")
@@ -127,7 +183,7 @@ class PolygonClient:
         sort: str = "asc",
     ) -> List[Dict[str, Any]]:
         """
-        More precise aggregate fetch for a window (helps daily/weekly context without the wide 2020-2100 range).
+        More precise aggregate fetch for a window (helps daily/weekly context without wide 2020-2100 range).
         """
         sym = symbol.upper()
         js = await self._get(
@@ -156,7 +212,7 @@ class PolygonClient:
     ) -> Optional[float]:
         path = f"/v1/indicators/{kind}/{symbol.upper()}"
         params: Dict[str, Any] = {
-            "timespan": timespan,        # "minute" (intraday) or "day" (daily bias)
+            "timespan": timespan,  # "minute" (intraday) or "day" (daily bias)
             "window": window,
             "series_type": series_type,
             "order": "desc",
@@ -191,6 +247,7 @@ class PolygonClient:
         - timespan="minute" => intraday signal context
         - timespan="day"    => daily-chart bias/context for higher precision
         """
+
         async def _safe(kind: str, **kwargs: Any) -> Optional[float]:
             try:
                 return await self.get_indicator(kind, symbol, timespan=timespan, **kwargs)
