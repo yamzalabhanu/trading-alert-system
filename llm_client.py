@@ -105,27 +105,33 @@ def _alert_payload(alert: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # llm_client.py
+from typing import Dict, Any
 
-# If older code refers to analyze_alert, keep a compatibility alias.
-# Make sure ONE of these exists (analyze_alert or analyze_with_openai).
-
-async def analyze_with_openai(alert: dict, features: dict) -> dict:
-    # If you already have an implementation named analyze_alert(), delegate to it.
-    if "analyze_alert" in globals() and callable(globals()["analyze_alert"]):
-        return await globals()["analyze_alert"](alert, features)
-
-    # Otherwise: return a safe fallback so the system never crashes
+async def _analyze_impl(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Put your REAL LLM logic here (OpenAI call, prompt, parsing, etc).
+    If you already have a working function, move/call it here.
+    """
+    # TODO: replace with your actual implementation
     return {
         "decision": "wait",
         "confidence": 0.0,
-        "reason": "LLM disabled/misconfigured: analyze_alert not found",
+        "reason": "LLM not wired yet",
         "checklist": {},
         "ev_estimate": {},
     }
 
-# Backward compat: if some modules call analyze_alert() directly
-async def analyze_alert(alert: dict, features: dict) -> dict:
-    return await analyze_with_openai(alert, features)
+# Canonical function name used by engine_processor.py
+async def analyze_with_openai(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
+    return await _analyze_impl(alert, features)
+
+# Backwards compatible name (if older code calls analyze_alert)
+async def analyze_alert(alert: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
+    return await _analyze_impl(alert, features)
+
+__all__ = ["analyze_with_openai", "analyze_alert"]
+
+
 
 # keep analyze_with_openai() exactly as you pasted, no logic changes needed
 # (it already supports equity-only alerts and missing options fields)
