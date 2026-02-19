@@ -5,7 +5,7 @@ import logging
 import math
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional, Tuple, Awaitable
+from typing import Dict, Any, List, Optional, Tuple, Awaitable, Callable
 
 from engine_runtime import get_http_client
 from engine_common import (
@@ -229,7 +229,9 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
             else "choppy"
         )
 
-        mtf_align = bool(ema20 is not None and ema50 is not None and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50)))
+        mtf_align = bool(
+            ema20 is not None and ema50 is not None and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50))
+        )
 
         return {
             "last": last_px,
@@ -288,11 +290,13 @@ async def _fetch_polygon_features(
     if not pc.enabled:
         return {}
 
+    sym = (symbol or "").upper()
+
     async def _empty_dict() -> Dict[str, Any]:
         return {}
 
     async def _aggs_window(
-        sym: str,
+        sym_: str,
         multiplier: int,
         timespan: str,
         from_: str,
@@ -300,49 +304,72 @@ async def _fetch_polygon_features(
         limit: int,
     ) -> List[Dict[str, Any]]:
         if hasattr(pc, "get_aggs_window"):
-            return await pc.get_aggs_window(sym, multiplier=multiplier, timespan=timespan, from_=from_, to=to, limit=limit)
+            return await pc.get_aggs_window(sym_, multiplier=multiplier, timespan=timespan, from_=from_, to=to, limit=limit)
         if timespan in ("minute", "hour", "day"):
-            return await pc.get_aggregates(sym, multiplier=multiplier, timespan=timespan, limit=limit)
+            return await pc.get_aggregates(sym_, multiplier=multiplier, timespan=timespan, limit=limit)
         return []
 
-    try:
-        snap_task = pc.get_stock_snapshot(symbol)
-        quote_task = pc.get_last_quote(symbol)
-        trade_task = pc.get_last_trade(symbol)
-        agg5m_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
+    async def _safe_call(name: str, coro: Awaitable[Any], default: Any) -> Any:
+        """
+        ✅ Prevent one Polygon error (429/403/etc) from wiping out ALL feature collection.
+        """
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning("[features] polygon subcall failed (%s) for %s: %r", name, sym, e)
+            return default
 
-        # ✅ intraday + daily technical indicators (Polygon Indicators API)
-        tech_task = pc.get_technicals_bundle(symbol, timespan="minute")
-        tech_d_task = pc.get_technicals_daily_bundle(symbol)
+    today = date.today()
+    to_iso = (today + timedelta(days=2)).isoformat()
 
-        # Only fetch option context when we have option identifiers
-        if expiry_iso and side and (strike is not None):
-            opt_task: Awaitable[Dict[str, Any]] = pc.get_targeted_option_context(
-                symbol, expiry_iso=expiry_iso, side=side, strike=strike
-            )
-        else:
-            opt_task = _empty_dict()
+    # Build tasks (each is independently guarded)
+    snap_task = _safe_call("snapshot", pc.get_stock_snapshot(sym), {})
+    quote_task = _safe_call("last_quote", pc.get_last_quote(sym), {})
+    trade_task = _safe_call("last_trade", pc.get_last_trade(sym), {})
+    agg5m_task = _safe_call("aggs_5m", pc.get_aggregates(sym, multiplier=5, timespan="minute", limit=600), [])
+    tech_task = _safe_call("techs_m", pc.get_technicals_bundle(sym, timespan="minute"), {})
+    tech_d_task = _safe_call("techs_d", pc.get_technicals_daily_bundle(sym), {})
 
-        today = date.today()
-        to_iso = (today + timedelta(days=2)).isoformat()
-        daily_task = _aggs_window(symbol, 1, "day", (today - timedelta(days=220)).isoformat(), to_iso, limit=260)
-        h1_task = _aggs_window(symbol, 1, "hour", (today - timedelta(days=30)).isoformat(), to_iso, limit=800)
-        m15_task = _aggs_window(symbol, 15, "minute", (today - timedelta(days=10)).isoformat(), to_iso, limit=1200)
-
-        stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars = await asyncio.gather(
-            snap_task,
-            quote_task,
-            trade_task,
-            agg5m_task,
-            tech_task,
-            tech_d_task,
-            opt_task,
-            daily_task,
-            h1_task,
-            m15_task,
+    if expiry_iso and side and (strike is not None):
+        opt_task: Awaitable[Dict[str, Any]] = _safe_call(
+            "opt_ctx",
+            pc.get_targeted_option_context(sym, expiry_iso=expiry_iso, side=side, strike=strike),
+            {},
         )
-    except Exception as e:
-        logger.warning("[features] polygon fetch failed for %s: %r", symbol, e)
+    else:
+        opt_task = _empty_dict()
+
+    daily_task = _safe_call(
+        "aggs_daily",
+        _aggs_window(sym, 1, "day", (today - timedelta(days=220)).isoformat(), to_iso, limit=260),
+        [],
+    )
+    h1_task = _safe_call(
+        "aggs_h1",
+        _aggs_window(sym, 1, "hour", (today - timedelta(days=30)).isoformat(), to_iso, limit=800),
+        [],
+    )
+    m15_task = _safe_call(
+        "aggs_m15",
+        _aggs_window(sym, 15, "minute", (today - timedelta(days=10)).isoformat(), to_iso, limit=1200),
+        [],
+    )
+
+    stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars = await asyncio.gather(
+        snap_task,
+        quote_task,
+        trade_task,
+        agg5m_task,
+        tech_task,
+        tech_d_task,
+        opt_task,
+        daily_task,
+        h1_task,
+        m15_task,
+    )
+
+    # If literally everything failed, return {}
+    if not any([stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars]):
         return {}
 
     out: Dict[str, Any] = {
@@ -355,12 +382,12 @@ async def _fetch_polygon_features(
         "mtf_align": True,
     }
 
-    q = stock_snap.get("lastQuote") or {}
-    d = stock_snap.get("day") or {}
-    pd = stock_snap.get("prevDay") or {}
+    q = (stock_snap or {}).get("lastQuote") or {}
+    d = (stock_snap or {}).get("day") or {}
+    pd = (stock_snap or {}).get("prevDay") or {}
 
-    bid = q.get("p") or last_quote.get("p")
-    ask = q.get("P") or last_quote.get("P")
+    bid = q.get("p") or (last_quote or {}).get("p")
+    ask = q.get("P") or (last_quote or {}).get("P")
 
     if isinstance(bid, (int, float)):
         out["bid"] = float(bid)
@@ -369,7 +396,7 @@ async def _fetch_polygon_features(
     if isinstance(out.get("bid"), float) and isinstance(out.get("ask"), float):
         out["mid"] = (out["bid"] + out["ask"]) / 2.0
 
-    last_trade_px = (stock_snap.get("lastTrade") or {}).get("p") or last_trade.get("p")
+    last_trade_px = ((stock_snap or {}).get("lastTrade") or {}).get("p") or (last_trade or {}).get("p")
     if isinstance(last_trade_px, (int, float)):
         out["last"] = float(last_trade_px)
 
@@ -401,7 +428,6 @@ async def _fetch_polygon_features(
             if len(vols) >= 20:
                 out["vol_avg20"] = sum(vols[-20:]) / 20.0
 
-            # ✅ FIXED VWAP block (removed extra ')')
             try:
                 tps: List[Tuple[float, float]] = [
                     (
@@ -419,11 +445,11 @@ async def _fetch_polygon_features(
                 pass
 
     # ✅ merge intraday indicators
-    if isinstance(techs, dict):
+    if isinstance(techs, dict) and techs:
         out.update({k: v for k, v in techs.items() if v is not None})
 
     # ✅ merge daily indicators (suffixed with _d)
-    if isinstance(techs_d, dict):
+    if isinstance(techs_d, dict) and techs_d:
         out.update({k: v for k, v in techs_d.items() if v is not None})
 
     # Optional: computed daily bias to help LLM
