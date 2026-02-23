@@ -2,59 +2,27 @@
 import os
 import asyncio
 import logging
-from typing import Optional
+import json
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta, date as dt_date
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from config import CDT_TZ
-
+from config import CDT_TZ, MARKET_TZ
 import trading_engine as engine
+
 from volume_scanner import run_scanner_loop, get_state as uvscan_state
 from daily_reporter import build_daily_report, send_daily_report_to_telegram
 
 
+# ---------------- Env helpers ----------------
 def _truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
 
 
-# Daily report scheduler knobs (overridable via env)
-ENABLE_DAILY_REPORT_SCHED = _truthy(os.getenv("ENABLE_DAILY_REPORT_SCHED", "1"))
-DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "14"))        # 14:xx = 2:xx pm CDT
-DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "45"))    # default 2:45 pm CDT
-SEND_EMPTY_REPORT = _truthy(os.getenv("DR_SEND_EMPTY", "1"))         # send even if no rows
-
-# TradingView alert window knobs (CDT)
-ALERT_ENFORCE_WINDOW = _truthy(os.getenv("ALERT_ENFORCE_WINDOW", "1"))
-ALERT_WEEKDAYS_ONLY = _truthy(os.getenv("ALERT_WEEKDAYS_ONLY", "1"))
-ALERT_MORNING_START = os.getenv("ALERT_WINDOW_MORNING_START", "08:30")
-ALERT_MORNING_END = os.getenv("ALERT_WINDOW_MORNING_END", "10:30")
-ALERT_PM_START = os.getenv("ALERT_WINDOW_PM_START", "14:00")
-ALERT_PM_END = os.getenv("ALERT_WINDOW_PM_END", "15:00")
-
-
-def _hhmm_to_minutes(s: str) -> int:
-    hh, mm = s.split(":")
-    return int(hh) * 60 + int(mm)
-
-
-_ALERT_M_START_MIN = _hhmm_to_minutes(ALERT_MORNING_START)
-_ALERT_M_END_MIN = _hhmm_to_minutes(ALERT_MORNING_END)
-_ALERT_P_START_MIN = _hhmm_to_minutes(ALERT_PM_START)
-_ALERT_P_END_MIN = _hhmm_to_minutes(ALERT_PM_END)
-
-
-def _in_alert_window_cdt(now: Optional[datetime] = None) -> bool:
-    now = now or datetime.now(CDT_TZ)
-    if ALERT_WEEKDAYS_ONLY and now.weekday() > 4:
-        return False
-    minutes = now.hour * 60 + now.minute
-    in_morning = _ALERT_M_START_MIN <= minutes < _ALERT_M_END_MIN
-    in_afternoon = _ALERT_P_START_MIN <= minutes < _ALERT_P_END_MIN
-    return in_morning or in_afternoon
-
-
+# ---------------- Logging ----------------
 log = logging.getLogger("trading_engine.routes")
 if not log.handlers:
     _h = logging.StreamHandler()
@@ -64,11 +32,20 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
+# ---------------- Background tasks ----------------
 _scanner_task: Optional[asyncio.Task] = None
 _uvscan_controller_task: Optional[asyncio.Task] = None
 _daily_task: Optional[asyncio.Task] = None
 
 
+# ---------------- Daily report scheduler knobs ----------------
+ENABLE_DAILY_REPORT_SCHED = _truthy(os.getenv("ENABLE_DAILY_REPORT_SCHED", "1"))
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "14"))       # 14:xx CDT default
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "45"))   # 14:45 CDT default
+SEND_EMPTY_REPORT = _truthy(os.getenv("DR_SEND_EMPTY", "1"))
+
+
+# ---------------- UV-scan window gating (CDT) ----------------
 def _in_uvscan_window_cdt(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(CDT_TZ)
     if os.getenv("UVSCAN_WEEKDAYS_ONLY", "1") == "1" and now.weekday() > 4:
@@ -86,7 +63,7 @@ async def _stop_uvscan_task():
         except Exception:
             pass
         _scanner_task = None
-        log.info("[routes] uv-scan task stopped")
+    log.info("[routes] uv-scan task stopped")
 
 
 def _start_uvscan_task():
@@ -122,6 +99,7 @@ async def _uvscan_window_controller_loop():
             await asyncio.sleep(5)
 
 
+# ---------------- Daily report scheduler ----------------
 def _next_report_run_from(now_cdt: datetime) -> datetime:
     tgt = now_cdt.replace(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE, second=0, microsecond=0)
     if now_cdt >= tgt:
@@ -138,8 +116,7 @@ async def _daily_report_dispatcher_loop():
             now_cdt = datetime.now(CDT_TZ)
             next_run = _next_report_run_from(now_cdt)
             sleep_s = max(1, int((next_run - now_cdt).total_seconds()))
-            log.info("[reports] next daily report at %s CDT (in %ss)",
-                     next_run.strftime("%Y-%m-%d %H:%M:%S"), sleep_s)
+            log.info("[reports] next daily report at %s CDT (in %ss)", next_run.strftime("%Y-%m-%d %H:%M:%S"), sleep_s)
             await asyncio.sleep(sleep_s)
 
             report_date = next_run.date()
@@ -155,6 +132,7 @@ async def _daily_report_dispatcher_loop():
                     log.info("[reports] sent for %s: %s", report_date, res)
             except Exception as e:
                 log.exception("[reports] exception while sending for %s: %r", report_date, e)
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -162,6 +140,7 @@ async def _daily_report_dispatcher_loop():
             await asyncio.sleep(5)
 
 
+# ---------------- App lifecycle ----------------
 def bind_lifecycle(app: FastAPI):
     @app.on_event("startup")
     async def _startup():
@@ -208,13 +187,125 @@ def bind_lifecycle(app: FastAPI):
 
         await engine.shutdown()
 
+    return app
+
 
 def mount(app: FastAPI):
     return bind_lifecycle(app)
 
 
+# ============================================================================
+# WEBHOOK QUALITY GATES (NEW)
+# ============================================================================
+
+# 1) RTH-only windows (MARKET_TZ, default New York)
+ENFORCE_RTH_ONLY = _truthy(os.getenv("ENFORCE_RTH_ONLY", "1"))
+RTH1 = os.getenv("RTH_WINDOW_1", "09:35-11:30")
+RTH2 = os.getenv("RTH_WINDOW_2", "13:30-15:45")
+RTH_WEEKDAYS_ONLY = _truthy(os.getenv("RTH_WEEKDAYS_ONLY", "1"))
+
+# 2) Event filtering (reduce spam)
+ALLOW_EVENTS = {e.strip() for e in os.getenv("ALLOW_EVENTS", "entry").split(",") if e.strip()}
+ALLOW_PRE_ENTRY = _truthy(os.getenv("ALLOW_PRE_ENTRY", "0"))
+DROP_MANAGEMENT_EVENTS = _truthy(os.getenv("DROP_MANAGEMENT_EVENTS", "1"))
+
+# 3) Allowlist tickers
+ALLOWED_TICKERS = {t.strip().upper() for t in os.getenv("ALLOWED_TICKERS", "").split(",") if t.strip()}
+
+# 4) Webhook cooldown (extra anti-spam)
+WEBHOOK_COOLDOWN_SECONDS = int(os.getenv("WEBHOOK_COOLDOWN_SECONDS", "240"))
+
+# 5) Top-N per day intake limiter
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
+
+# in-memory state (per process)
+_state_day: Optional[dt_date] = None
+_day_count: int = 0
+_last_seen: Dict[str, datetime] = {}
+
+
+def _parse_hhmm_range(s: str) -> Tuple[int, int, int, int]:
+    # "HH:MM-HH:MM" -> (sh, sm, eh, em)
+    a, b = s.split("-")
+    sh, sm = [int(x) for x in a.split(":")]
+    eh, em = [int(x) for x in b.split(":")]
+    return sh, sm, eh, em
+
+
+_R1 = _parse_hhmm_range(RTH1)
+_R2 = _parse_hhmm_range(RTH2)
+
+
+def _in_rth_window_market(now: Optional[datetime] = None) -> bool:
+    if not ENFORCE_RTH_ONLY:
+        return True
+    now = now or datetime.now(MARKET_TZ)
+    if RTH_WEEKDAYS_ONLY and now.weekday() > 4:
+        return False
+    m = now.hour * 60 + now.minute
+
+    def in_win(r):
+        sh, sm, eh, em = r
+        return (sh * 60 + sm) <= m < (eh * 60 + em)
+
+    return in_win(_R1) or in_win(_R2)
+
+
+def _reset_day_if_needed(now_market: Optional[datetime] = None) -> None:
+    global _state_day, _day_count, _last_seen
+    now_market = now_market or datetime.now(MARKET_TZ)
+    d = now_market.date()
+    if _state_day != d:
+        _state_day = d
+        _day_count = 0
+        _last_seen = {}
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _score_payload(p: Dict[str, Any]) -> float:
+    """
+    Lightweight priority score (0..100) based on Pine JSON fields:
+    - higher adx, higher relVol
+    - chop=false gets a boost
+    - entry > pre_entry
+    """
+    adx = _safe_float(p.get("adx"))
+    rv = _safe_float(p.get("relVol") if p.get("relVol") is not None else p.get("relvol"))
+    chop = p.get("chop")
+    event = str(p.get("event") or "").lower()
+
+    score = 0.0
+    if adx is not None:
+        score += max(0.0, min(1.0, (adx - 18.0) / 20.0)) * 45.0  # ~18..38 -> 0..1
+    if rv is not None:
+        score += max(0.0, min(1.0, (rv - 1.2) / 1.5)) * 45.0     # ~1.2..2.7 -> 0..1
+    if chop is False:
+        score += 10.0
+    if event == "entry":
+        score += 5.0
+    return float(score)
+
+
+def _fingerprint(p: Dict[str, Any]) -> str:
+    # cooldown key: ticker|side|event
+    t = str(p.get("symbol") or p.get("ticker") or "").upper()
+    s = str(p.get("side") or "").upper()
+    e = str(p.get("event") or "").lower()
+    return f"{t}|{s}|{e}"
+
+
+# ---------------- Health / status ----------------
 @router.get("/healthz")
 async def healthz():
+    _reset_day_if_needed()
     return {
         "ok": True,
         "workers": engine.get_worker_stats(),
@@ -224,8 +315,12 @@ async def healthz():
         "uvscan_in_window_now_cdt": _in_uvscan_window_cdt(),
         "daily_sched_running": bool(_daily_task and not _daily_task.done()),
         "next_daily_cdt": _next_report_run_from(datetime.now(CDT_TZ)).isoformat() if ENABLE_DAILY_REPORT_SCHED else None,
-        "alerts_in_window_now_cdt": _in_alert_window_cdt(),
-        "alerts_window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
+        "rth_only": ENFORCE_RTH_ONLY,
+        "in_rth_now_market_tz": _in_rth_window_market(),
+        "market_tz": str(MARKET_TZ),
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "day_count": _day_count,
+        "allowed_events": sorted(list(ALLOW_EVENTS | ({"pre_entry"} if ALLOW_PRE_ENTRY else set()))),
     }
 
 
@@ -241,54 +336,130 @@ async def engine_quota():
 
 @router.get("/alerts/window")
 async def alerts_window_status():
-    now = datetime.now(CDT_TZ)
+    now_m = datetime.now(MARKET_TZ)
     return {
-        "in_window_now_cdt": _in_alert_window_cdt(now),
-        "now_cdt": now.isoformat(),
-        "window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
-        "weekdays_only": ALERT_WEEKDAYS_ONLY,
-        "enforced": ALERT_ENFORCE_WINDOW,
+        "market_tz": str(MARKET_TZ),
+        "now_market": now_m.isoformat(),
+        "enforce_rth_only": ENFORCE_RTH_ONLY,
+        "rth_windows": [RTH1, RTH2],
+        "in_rth_now": _in_rth_window_market(now_m),
+        "allowed_tickers_count": len(ALLOWED_TICKERS),
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "day_count": _day_count,
     }
 
 
+# ---------------- Webhook (TradingView) ----------------
 @router.post("/webhook")
 async def webhook(
     request: Request,
     force: bool = False,
     qty: int = 1,
-    bypass_window: bool = False,  # current name
-    bypass: bool = False,         # ✅ compat: older/shorter name
+    bypass_window: bool = False,   # manual testing
 ):
-    # ✅ treat either flag as bypass
-    bypass_effective = bool(bypass_window or bypass)
-    log.info("webhook received; force=%s qty=%s bypass=%s", force, qty, bypass_effective)
+    _reset_day_if_needed()
+    log.info("webhook received; force=%s qty=%s bypass=%s", force, qty, bypass_window)
 
-    if ALERT_ENFORCE_WINDOW and not bypass_effective and not _in_alert_window_cdt():
+    # RTH gating (market tz)
+    if not bypass_window and not _in_rth_window_market():
         return JSONResponse(
             {
                 "queued": False,
-                "reason": "outside_alert_window",
-                "window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
-                "now_cdt": datetime.now(CDT_TZ).isoformat(),
-                "hint": "Use ?bypass_window=1 (or ?bypass=1) for manual testing",
+                "reason": "outside_rth_window",
+                "market_tz": str(MARKET_TZ),
+                "rth_windows": [RTH1, RTH2],
+                "now_market": datetime.now(MARKET_TZ).isoformat(),
             },
             status_code=200,
         )
 
+    # Get raw text (supports application/json and text/plain)
     text = await engine.get_alert_text_from_request(request)
     if not text:
         raise HTTPException(status_code=400, detail="Empty alert payload")
 
+    # Parse into normalized dict (handles your Pine JSON as a string, plus plaintext formats)
+    parsed = engine.parse_alert_text(text)
+
+    # Pull key fields (support both schemas)
+    ticker = str(parsed.get("symbol") or parsed.get("ticker") or "").upper().strip()
+    side = str(parsed.get("side") or "").upper().strip()
+    event = str(parsed.get("event") or "").lower().strip()
+
+    # Enforce allowlist (if configured)
+    if ALLOWED_TICKERS and ticker not in ALLOWED_TICKERS:
+        return JSONResponse(
+            {"queued": False, "reason": "ticker_not_allowed", "ticker": ticker},
+            status_code=200,
+        )
+
+    # Filter events to reduce noise
+    if not event:
+        # If no event in plaintext alerts, treat as "entry" (backward compatible)
+        event = "entry"
+        parsed["event"] = "entry"
+
+    if event == "pre_entry" and not ALLOW_PRE_ENTRY:
+        return JSONResponse({"queued": False, "reason": "pre_entry_disabled"}, status_code=200)
+
+    mgmt_events = {"tp1", "tp2", "tp3", "exit", "exit_fast_1m", "trail", "time", "opposite", "fast_stop"}
+    if DROP_MANAGEMENT_EVENTS and event in mgmt_events:
+        return JSONResponse({"queued": False, "reason": "management_event_dropped", "event": event}, status_code=200)
+
+    allowed = set(ALLOW_EVENTS)
+    if ALLOW_PRE_ENTRY:
+        allowed.add("pre_entry")
+    if event not in allowed:
+        return JSONResponse({"queued": False, "reason": "event_not_allowed", "event": event}, status_code=200)
+
+    # Webhook cooldown per (ticker, side, event)
+    fp = _fingerprint({"symbol": ticker, "side": side, "event": event})
+    now = datetime.now(MARKET_TZ)
+    last = _last_seen.get(fp)
+    if last and (now - last).total_seconds() < WEBHOOK_COOLDOWN_SECONDS:
+        return JSONResponse(
+            {"queued": False, "reason": "webhook_cooldown", "cooldown_s": WEBHOOK_COOLDOWN_SECONDS},
+            status_code=200,
+        )
+
+    # Daily max trades guard (Top 5/day)
+    if _day_count >= MAX_TRADES_PER_DAY:
+        return JSONResponse(
+            {
+                "queued": False,
+                "reason": "daily_limit_reached",
+                "max_trades_per_day": MAX_TRADES_PER_DAY,
+                "day_count": _day_count,
+            },
+            status_code=200,
+        )
+
+    # Priority score (optional; included in flags for engine / telegram)
+    score = _score_payload(parsed)
+
     ok = engine.enqueue_webhook_job(
         alert_text=text,
-        flags={"qty": int(qty), "force_buy": bool(force)},
+        flags={
+            "qty": int(qty),
+            "force_buy": bool(force),
+            "event": event,
+            "ticker": ticker,
+            "side": side,
+            "priority_score": score,
+        },
     )
     if not ok:
         raise HTTPException(status_code=503, detail="Queue is full")
 
+    _day_count += 1
+    _last_seen[fp] = now
+
     return JSONResponse(
         {
             "queued": True,
+            "priority_score": score,
+            "day_count": _day_count,
+            "max_trades_per_day": MAX_TRADES_PER_DAY,
             "queue_stats": engine.get_worker_stats(),
             "llm_quota": engine.llm_quota_snapshot(),
         }
@@ -301,11 +472,11 @@ async def webhook_tradingview(
     force: bool = False,
     qty: int = 1,
     bypass_window: bool = False,
-    bypass: bool = False,  # ✅ compat
 ):
-    return await webhook(request=request, force=force, qty=qty, bypass_window=bypass_window, bypass=bypass)
+    return await webhook(request=request, force=force, qty=qty, bypass_window=bypass_window)
 
 
+# ---------------- uv-scan control & status ----------------
 @router.get("/uvscan/status")
 async def uvscan_status():
     running = bool(_scanner_task and not _scanner_task.done())
@@ -334,11 +505,13 @@ async def uvscan_stop():
     return {"stopped": True}
 
 
+# ---------------- Diagnostics ----------------
 @router.get("/net/debug")
 async def net_debug():
     return await engine.net_debug_info()
 
 
+# ---------------- Daily EOD Report ----------------
 @router.get("/reports/daily")
 async def get_daily_report(date: Optional[str] = None):
     if date:
