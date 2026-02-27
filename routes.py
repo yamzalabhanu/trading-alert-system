@@ -24,10 +24,16 @@ def _truthy(s: str) -> bool:
 
 # ---------------- Logging ----------------
 log = logging.getLogger("trading_engine.routes")
+
+# ✅ Prevent double logging via root logger handlers
+log.propagate = False
+
+# ✅ Add handler only once for this logger
 if not log.handlers:
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
     log.addHandler(_h)
+
 log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
@@ -357,6 +363,9 @@ async def webhook(
     qty: int = 1,
     bypass_window: bool = False,   # manual testing
 ):
+    # ✅ Fix UnboundLocalError: we mutate _day_count in this function
+    global _day_count, _last_seen
+
     _reset_day_if_needed()
     log.info("webhook received; force=%s qty=%s bypass=%s", force, qty, bypass_window)
 
@@ -451,6 +460,7 @@ async def webhook(
     if not ok:
         raise HTTPException(status_code=503, detail="Queue is full")
 
+    # ✅ Mutations now safe (global declared)
     _day_count += 1
     _last_seen[fp] = now
 
