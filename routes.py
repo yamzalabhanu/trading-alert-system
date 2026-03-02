@@ -2,65 +2,23 @@
 import os
 import asyncio
 import logging
-from typing import Optional
-from datetime import datetime, timezone, timedelta, date as dt_date
+from contextlib import suppress
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# Timezone
-from config import CDT_TZ
-
-# Orchestrator (trading engine) module
+# ---- Project imports (match your repo) ----
+# If any of these module names differ in your tree, adjust the import line(s) only.
+from config import CDT_TZ, allowed_now_cdt
 import trading_engine as engine
-# Unusual-activity scanner (runs in background)
+
 from volume_scanner import run_scanner_loop, get_state as uvscan_state
-# Daily reporter
 from daily_reporter import build_daily_report, send_daily_report_to_telegram
 
-# ---------------- Env helpers ----------------
-def _truthy(s: str) -> bool:
-    return str(s).strip().lower() in ("1", "true", "yes", "on")
 
-# Daily report scheduler knobs (overridable via env)
-ENABLE_DAILY_REPORT_SCHED = _truthy(os.getenv("ENABLE_DAILY_REPORT_SCHED", "1"))
-DAILY_REPORT_HOUR   = int(os.getenv("DAILY_REPORT_HOUR", "14"))    # 14:xx = 2:xx pm CDT
-DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "45"))  # default 2:45 pm CDT
-SEND_EMPTY_REPORT   = _truthy(os.getenv("DR_SEND_EMPTY", "1"))     # send even if no rows
-
-# TradingView alert window knobs (CDT)
-ALERT_ENFORCE_WINDOW = _truthy(os.getenv("ALERT_ENFORCE_WINDOW", "1"))
-ALERT_WEEKDAYS_ONLY  = _truthy(os.getenv("ALERT_WEEKDAYS_ONLY", "1"))
-ALERT_MORNING_START  = os.getenv("ALERT_WINDOW_MORNING_START", "08:30")
-ALERT_MORNING_END    = os.getenv("ALERT_WINDOW_MORNING_END",   "10:30")
-ALERT_PM_START       = os.getenv("ALERT_WINDOW_PM_START",      "14:00")
-ALERT_PM_END         = os.getenv("ALERT_WINDOW_PM_END",        "15:00")
-
-def _hhmm_to_minutes(s: str) -> int:
-    hh, mm = s.split(":")
-    return int(hh) * 60 + int(mm)
-
-_ALERT_M_START_MIN = _hhmm_to_minutes(ALERT_MORNING_START)
-_ALERT_M_END_MIN   = _hhmm_to_minutes(ALERT_MORNING_END)
-_ALERT_P_START_MIN = _hhmm_to_minutes(ALERT_PM_START)
-_ALERT_P_END_MIN   = _hhmm_to_minutes(ALERT_PM_END)
-
-def _in_alert_window_cdt(now: Optional[datetime] = None) -> bool:
-    """
-    Allow TradingView alerts only during:
-      - Morning: 08:30–10:30 CDT
-      - Afternoon: 14:00–15:00 CDT
-    (Weekdays only by default; configurable via env.)
-    """
-    now = now or datetime.now(CDT_TZ)
-    if ALERT_WEEKDAYS_ONLY and now.weekday() > 4:
-        return False
-    minutes = now.hour * 60 + now.minute
-    in_morning = _ALERT_M_START_MIN <= minutes < _ALERT_M_END_MIN
-    in_afternoon = _ALERT_P_START_MIN <= minutes < _ALERT_P_END_MIN
-    return in_morning or in_afternoon
-
-# Logger
+# ---------------- Logging ----------------
 log = logging.getLogger("trading_engine.routes")
 if not log.handlers:
     _h = logging.StreamHandler()
@@ -70,326 +28,241 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
-# Background tasks
-_scanner_task: Optional[asyncio.Task] = None
-_uvscan_controller_task: Optional[asyncio.Task] = None  # manages the time window
-_daily_task: Optional[asyncio.Task] = None              # daily report scheduler
+# ---------------- Background task handles ----------------
+_scanner_task: asyncio.Task | None = None
+_scanner_ctrl_task: asyncio.Task | None = None
+_daily_task: asyncio.Task | None = None
 
-# ---------- UV-scan window gating (10:30–14:00 CDT) ----------
-def _in_uvscan_window_cdt(now: Optional[datetime] = None) -> bool:
-    """
-    Only allow UV-scan between 10:30 and 14:00 CDT.
-    Optional weekday restriction with UVSCAN_WEEKDAYS_ONLY=1 (default).
-    """
-    now = now or datetime.now(CDT_TZ)
-    if os.getenv("UVSCAN_WEEKDAYS_ONLY", "1") == "1" and now.weekday() > 4:
-        return False
-    minutes = now.hour * 60 + now.minute
-    return (10 * 60 + 30) <= minutes < (14 * 60)
 
-async def _stop_uvscan_task():
-    global _scanner_task
-    if _scanner_task:
-        _scanner_task.cancel()
-        try:
-            await _scanner_task
-        except Exception:
-            pass
-        _scanner_task = None
-        log.info("[routes] uv-scan task stopped")
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
-def _start_uvscan_task():
+
+def _bypass_requested(request: Request) -> bool:
+    qp = request.query_params
+    return _truthy(qp.get("bypass_window")) or _truthy(qp.get("bypass"))
+
+
+# =========================
+# UV Scanner task control
+# =========================
+async def _start_uvscan_task() -> None:
     global _scanner_task
     if _scanner_task and not _scanner_task.done():
         return
+    _scanner_task = asyncio.create_task(run_scanner_loop(), name="uvscan")
+    log.info("uvscan task started")
+
+
+async def _stop_uvscan_task() -> None:
+    global _scanner_task
+    if not _scanner_task:
+        return
+
+    task = _scanner_task
+    _scanner_task = None  # clear first to avoid double-stop races
+
+    if task.done():
+        with suppress(Exception):
+            task.result()
+        log.info("uvscan task already done")
+        return
+
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+    log.info("uvscan task stopped")
+
+
+async def _scanner_window_controller() -> None:
+    """
+    Starts/stops uvscan based on a CDT window.
+    Defaults: 10:30–14:00 CDT (env overridable).
+    """
+    tz = CDT_TZ if isinstance(CDT_TZ, ZoneInfo) else ZoneInfo("America/Chicago")
+
+    start_h = int(os.getenv("UVSCAN_START_HOUR", "10"))
+    start_m = int(os.getenv("UVSCAN_START_MINUTE", "30"))
+    end_h = int(os.getenv("UVSCAN_END_HOUR", "14"))
+    end_m = int(os.getenv("UVSCAN_END_MINUTE", "0"))
+
+    start_t = dt_time(start_h, start_m)
+    end_t = dt_time(end_h, end_m)
+
+    enforce = _truthy(os.getenv("ENFORCE_UVSCAN_WINDOW", "1"))
+    poll_s = int(os.getenv("UVSCAN_WINDOW_POLL_SECONDS", "10"))
+
+    log.info(
+        "uvscan controller started enforce=%s window=%02d:%02d-%02d:%02d CDT",
+        enforce, start_h, start_m, end_h, end_m
+    )
+
     try:
-        _scanner_task = asyncio.create_task(run_scanner_loop(), name="uv-scan")
-    except TypeError:
-        _scanner_task = asyncio.create_task(run_scanner_loop())
-    log.info("[routes] uv-scan task started")
+        while True:
+            now = datetime.now(tz).time()
+            in_window = (start_t <= now <= end_t)
+            should_run = (not enforce) or in_window
 
-async def _uvscan_window_controller_loop():
+            if should_run:
+                await _start_uvscan_task()
+            else:
+                await _stop_uvscan_task()
+
+            await asyncio.sleep(poll_s)
+    except asyncio.CancelledError:
+        # controller cancelled at shutdown: stop scanner
+        with suppress(asyncio.CancelledError):
+            await _stop_uvscan_task()
+        raise
+
+
+# =========================
+# Daily report scheduler
+# =========================
+async def _daily_report_scheduler() -> None:
     """
-    Enforces the 10:30–14:00 CDT window. Checks every 30s by default.
-    Disable enforcement by UVSCAN_ENFORCE_WINDOW=0 (for debugging).
+    Sends daily report at configured time (CDT).
+    Default: 14:45 CDT (env overridable).
     """
-    enforce = os.getenv("UVSCAN_ENFORCE_WINDOW", "1") == "1"
-    poll = int(os.getenv("UVSCAN_WINDOW_POLL_SECONDS", "30"))
-    if not enforce:
-        log.info("[routes] uv-scan window enforcement disabled")
-    while True:
-        try:
-            if enforce:
-                in_window = _in_uvscan_window_cdt()
-                running = bool(_scanner_task and not _scanner_task.done())
-                if in_window and not running:
-                    _start_uvscan_task()
-                elif not in_window and running:
-                    await _stop_uvscan_task()
-            await asyncio.sleep(poll)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.warning("[routes] uv-scan controller loop error: %r", e)
-            await asyncio.sleep(5)
+    tz = CDT_TZ if isinstance(CDT_TZ, ZoneInfo) else ZoneInfo("America/Chicago")
+    hour = int(os.getenv("DAILY_REPORT_HOUR", "14"))
+    minute = int(os.getenv("DAILY_REPORT_MINUTE", "45"))
+    poll_s = int(os.getenv("DAILY_REPORT_POLL_SECONDS", "20"))
+    enabled = _truthy(os.getenv("DAILY_REPORT_ENABLED", "1"))
 
-# ---------- Daily report scheduler ----------
-def _next_report_run_from(now_cdt: datetime) -> datetime:
-    """
-    Compute the next CDT run time; skip weekends.
-    """
-    tgt = now_cdt.replace(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE, second=0, microsecond=0)
-    if now_cdt >= tgt:
-        tgt = tgt + timedelta(days=1)
-    while tgt.weekday() >= 5:  # 5=Sat, 6=Sun
-        tgt += timedelta(days=1)
-    return tgt
+    log.info("daily reporter started enabled=%s time=%02d:%02d CDT", enabled, hour, minute)
 
-async def _daily_report_dispatcher_loop():
-    log.info("[reports] scheduler loop started (enabled=%s)", ENABLE_DAILY_REPORT_SCHED)
-    while True:
-        try:
-            now_cdt = datetime.now(CDT_TZ)
-            next_run = _next_report_run_from(now_cdt)
-            sleep_s = max(1, int((next_run - now_cdt).total_seconds()))
-            log.info("[reports] next daily report at %s CDT (in %ss)",
-                     next_run.strftime("%Y-%m-%d %H:%M:%S"), sleep_s)
-            await asyncio.sleep(sleep_s)
+    last_sent_key: str | None = None
 
-            report_date = next_run.date()
-            try:
-                res = await send_daily_report_to_telegram(report_date)
-                ok = bool(res.get("ok"))
-                # daily_reporter returns {'ok': bool, 'error': str, 'count': int}
-                count = int(res.get("count", 0)) if isinstance(res.get("count", 0), (int, float)) else 0
-                if not ok:
-                    log.warning("[reports] send failed for %s: %s", report_date, res)
-                elif count == 0 and not SEND_EMPTY_REPORT:
-                    log.info("[reports] no rows for %s (SEND_EMPTY_REPORT=0) — skipped", report_date)
-                else:
-                    log.info("[reports] sent for %s: %s", report_date, res)
-            except Exception as e:
-                log.exception("[reports] exception while sending for %s: %r", report_date, e)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.warning("[reports] scheduler loop error: %r", e)
-            await asyncio.sleep(5)
+    try:
+        while True:
+            if not enabled:
+                await asyncio.sleep(poll_s)
+                continue
 
-# ---------- App lifecycle ----------
-def bind_lifecycle(app: FastAPI):
-    @app.on_event("startup")
-    async def _startup():
-        global _uvscan_controller_task, _daily_task
-        await engine.startup()
+            now = datetime.now(tz)
+            key = now.strftime("%Y-%m-%d")
 
-        # Start UV-scan controller; it will start/stop the scan task inside the window.
-        if _uvscan_controller_task is None or _uvscan_controller_task.done():
-            try:
-                _uvscan_controller_task = asyncio.create_task(_uvscan_window_controller_loop(), name="uv-scan-ctl")
-            except TypeError:
-                _uvscan_controller_task = asyncio.create_task(_uvscan_window_controller_loop())
-            log.info("[routes] uv-scan controller started")
+            # send once per day when we cross HH:MM
+            if now.hour == hour and now.minute == minute and last_sent_key != key:
+                try:
+                    report = await build_daily_report()
+                    await send_daily_report_to_telegram(report)
+                    last_sent_key = key
+                    log.info("daily report sent for %s", key)
+                except Exception:
+                    log.exception("daily report failed")
 
-        # Start daily-report scheduler
-        if ENABLE_DAILY_REPORT_SCHED and (_daily_task is None or _daily_task.done()):
-            try:
-                _daily_task = asyncio.create_task(_daily_report_dispatcher_loop(), name="daily-report")
-            except TypeError:
-                _daily_task = asyncio.create_task(_daily_report_dispatcher_loop())
-            log.info("[routes] daily-report scheduler started")
+            await asyncio.sleep(poll_s)
+    except asyncio.CancelledError:
+        raise
 
-    @app.on_event("shutdown")
-    async def _shutdown():
-        global _uvscan_controller_task, _daily_task
-        # Stop controller first so it doesn't restart uv-scan mid-shutdown
-        if _uvscan_controller_task:
-            _uvscan_controller_task.cancel()
-            try:
-                await _uvscan_controller_task
-            except Exception:
-                pass
-            _uvscan_controller_task = None
-            log.info("[routes] uv-scan controller stopped")
-        # Then stop the scan task if running
-        await _stop_uvscan_task()
 
-        # Stop daily scheduler
-        if _daily_task:
-            _daily_task.cancel()
-            try:
-                await _daily_task
-            except Exception:
-                pass
-            _daily_task = None
-            log.info("[routes] daily-report scheduler stopped")
-
-        await engine.shutdown()
-
-# Optional alternative name
-def mount(app: FastAPI):
-    return bind_lifecycle(app)
-
-# ---------- Health / status ----------
+# =========================
+# Routes
+# =========================
 @router.get("/healthz")
-async def healthz():
+async def healthz() -> dict:
+    st = {}
+    try:
+        st = uvscan_state() or {}
+    except Exception:
+        st = {"ok": False, "error": "uvscan_state failed"}
+
     return {
         "ok": True,
-        "workers": engine.get_worker_stats(),
-        "llm_quota": engine.llm_quota_snapshot(),
-        "uvscan_running": bool(_scanner_task and not _scanner_task.done()),
-        "uvscan_controller_running": bool(_uvscan_controller_task and not _uvscan_controller_task.done()),
-        "uvscan_in_window_now_cdt": _in_uvscan_window_cdt(),
-        "daily_sched_running": bool(_daily_task and not _daily_task.done()),
-        "next_daily_cdt": _next_report_run_from(datetime.now(CDT_TZ)).isoformat() if ENABLE_DAILY_REPORT_SCHED else None,
-        "alerts_in_window_now_cdt": _in_alert_window_cdt(),
-        "alerts_window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
+        "now_cdt": datetime.now(CDT_TZ).isoformat() if CDT_TZ else datetime.now().isoformat(),
+        "allowed_now_cdt": bool(allowed_now_cdt()),
+        "scanner": st,
+        "tasks": {
+            "uvscan_running": bool(_scanner_task and not _scanner_task.done()),
+            "uvscan_controller_running": bool(_scanner_ctrl_task and not _scanner_ctrl_task.done()),
+            "daily_scheduler_running": bool(_daily_task and not _daily_task.done()),
+        },
     }
 
-@router.get("/engine/stats")
-async def engine_stats():
-    return {"workers": engine.get_worker_stats()}
 
-@router.get("/engine/quota")
-async def engine_quota():
-    return engine.llm_quota_snapshot()
-
-# Quick status to check alert window
-@router.get("/alerts/window")
-async def alerts_window_status():
-    now = datetime.now(CDT_TZ)
-    return {
-        "in_window_now_cdt": _in_alert_window_cdt(now),
-        "now_cdt": now.isoformat(),
-        "window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
-        "weekdays_only": ALERT_WEEKDAYS_ONLY,
-        "enforced": ALERT_ENFORCE_WINDOW,
-    }
-
-# ---------- Webhook (TradingView) ----------
-@router.post("/webhook")
-async def webhook(
-    request: Request,
-    force: bool = False,
-    qty: int = 1,
-    bypass_window: bool = False,  # for manual testing of the alert window guard
-):
-    log.info("webhook received; force=%s qty=%s bypass=%s", force, qty, bypass_window)
-
-    # Enforce TradingView alert windows unless bypassed
-    if ALERT_ENFORCE_WINDOW and not bypass_window and not _in_alert_window_cdt():
-        return JSONResponse({
-            "queued": False,
-            "reason": "outside_alert_window",
-            "window_cdt": f"{ALERT_MORNING_START}–{ALERT_MORNING_END}, {ALERT_PM_START}–{ALERT_PM_END}",
-            "now_cdt": datetime.now(CDT_TZ).isoformat(),
-        }, status_code=200)  # 200 so TradingView doesn't retry
-
-    text = await engine.get_alert_text_from_request(request)
-    if not text:
-        raise HTTPException(status_code=400, detail="Empty alert payload")
-
-    ok = engine.enqueue_webhook_job(
-        alert_text=text,
-        flags={"qty": int(qty), "force_buy": bool(force)},
-    )
-    if not ok:
-        raise HTTPException(status_code=503, detail="Queue is full")
-
-    return JSONResponse({
-        "queued": True,
-        "queue_stats": engine.get_worker_stats(),
-        "llm_quota": engine.llm_quota_snapshot(),
-    })
-
-@router.post("/webhook/tradingview")
-async def webhook_tradingview(
-    request: Request,
-    force: bool = False,
-    qty: int = 1,
-    bypass_window: bool = False,
-):
-    return await webhook(request=request, force=force, qty=qty, bypass_window=bypass_window)
-
-# ---------- uv-scan control & status ----------
 @router.get("/uvscan/status")
-async def uvscan_status():
-    running = bool(_scanner_task and not _scanner_task.done())
-    ctl_running = bool(_uvscan_controller_task and not _uvscan_controller_task.done())
-    in_window = _in_uvscan_window_cdt()
-    return {
-        "running": running,
-        "controller_running": ctl_running,
-        "in_window_now_cdt": in_window,
-        "window_cdt": "10:30–14:00",
-        "state": uvscan_state(),
-    }
+async def uvscan_status() -> dict:
+    return uvscan_state()
 
-@router.post("/uvscan/start")
-async def uvscan_start():
-    # Respect the enforced window
-    if not _in_uvscan_window_cdt() and os.getenv("UVSCAN_ENFORCE_WINDOW", "1") == "1":
-        return {"started": False, "reason": "outside_uvscan_window", "window_cdt": "10:30–14:00"}
-    _start_uvscan_task()
-    return {"started": True}
 
-@router.post("/uvscan/stop")
-async def uvscan_stop():
-    await _stop_uvscan_task()
-    return {"stopped": True}
-
-# ---------- Diagnostics ----------
-@router.get("/net/debug")
-async def net_debug():
-    return await engine.net_debug_info()
-
-# ---------- Daily EOD Report ----------
-@router.get("/reports/daily")
-async def get_daily_report(date: Optional[str] = None):
+@router.post("/webhook")
+@router.post("/webhook/tradingview")
+async def webhook_tradingview(request: Request) -> JSONResponse:
     """
-    Returns JSON + a monospace table for the given date (CDT).
-    date format: YYYY-MM-DD (defaults to today in CDT)
+    Accepts TradingView webhook. Supports either JSON payload or raw text.
+    Enforces CDT alert window via config.allowed_now_cdt() unless bypass_window=1.
     """
-    if date:
-        try:
-            y, m, d = [int(x) for x in date.split("-")]
-            target = dt_date(y, m, d)
-        except Exception:
-            raise HTTPException(400, "Invalid date; use YYYY-MM-DD")
-    else:
-        target = None
-    rep = await build_daily_report(target)
-    return rep
+    bypass = _bypass_requested(request)
 
-@router.post("/reports/daily/send")
-async def send_daily_report(date: Optional[str] = None):
-    """
-    Sends the daily report to Telegram.
-    """
-    if date:
-        try:
-            y, m, d = [int(x) for x in date.split("-")]
-            target = dt_date(y, m, d)
-        except Exception:
-            raise HTTPException(400, "Invalid date; use YYYY-MM-DD")
-    else:
-        target = None
-    res = await send_daily_report_to_telegram(target)
-    if not res.get("ok"):
-        raise HTTPException(500, res.get("error", "send failed"))
-    return res
+    if (not bypass) and (not allowed_now_cdt()):
+        raise HTTPException(status_code=403, detail="Outside allowed alert window (CDT). Use ?bypass_window=1 to test.")
 
-# Convenience: send today's report now (for smoke testing)
-@router.post("/reports/daily/test_send")
-async def reports_test_send():
-    target = datetime.now(CDT_TZ).date()
-    return await send_daily_report_to_telegram(target)
+    # Try JSON first; fallback to raw body text
+    payload = None
+    body_text = ""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
 
-# Convenience: show next scheduled run time
-@router.get("/reports/daily/next")
-async def reports_next():
-    return {
-        "enabled": ENABLE_DAILY_REPORT_SCHED,
-        "next_cdt": _next_report_run_from(datetime.now(CDT_TZ)).isoformat() if ENABLE_DAILY_REPORT_SCHED else None,
-        "running": bool(_daily_task and not _daily_task.done()),
-    }
+    if payload is None:
+        raw = await request.body()
+        body_text = (raw or b"").decode("utf-8", errors="ignore").strip()
+        payload = {"text": body_text} if body_text else {}
+
+    # Hand off to your engine. Your engine can decide how to parse this.
+    try:
+        await engine.enqueue_alert(payload)
+    except AttributeError:
+        # If your engine uses a different entrypoint, replace this line.
+        # In your repo, you may have engine.process_webhook(payload) or similar.
+        await engine.process_webhook(payload)
+
+    return JSONResponse({"ok": True, "bypass_window": bypass})
+
+
+# =========================
+# Lifecycle wiring
+# =========================
+def bind_lifecycle(app: FastAPI) -> None:
+    @app.on_event("startup")
+    async def _startup() -> None:
+        # engine startup
+        with suppress(Exception):
+            await engine.startup()
+
+        # background tasks
+        global _scanner_ctrl_task, _daily_task
+        _scanner_ctrl_task = asyncio.create_task(_scanner_window_controller(), name="uvscan-controller")
+        _daily_task = asyncio.create_task(_daily_report_scheduler(), name="daily-reporter")
+
+        log.info("startup complete")
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        # Cancel controllers first (they will stop scanner)
+        global _scanner_ctrl_task, _daily_task
+        for t in (_daily_task, _scanner_ctrl_task):
+            if t and not t.done():
+                t.cancel()
+
+        # Await tasks (CancelledError is expected)
+        for t in (_daily_task, _scanner_ctrl_task):
+            if t:
+                with suppress(asyncio.CancelledError):
+                    await t
+
+        _daily_task = None
+        _scanner_ctrl_task = None
+
+        # Ensure scanner is stopped even if controller didn’t run
+        with suppress(asyncio.CancelledError):
+            await _stop_uvscan_task()
+
+        # engine shutdown
+        with suppress(Exception):
+            await engine.shutdown()
+
+        log.info("shutdown complete")
