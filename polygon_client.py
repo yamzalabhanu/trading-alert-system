@@ -8,11 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from config import POLYGON_API_KEY
-from engine_common import build_option_contract
+log = logging.getLogger("trading_engine.data")
 
-logger = logging.getLogger("trading_engine")
+POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
+POLYGON_BASE_URL = (os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/"))
 
+MASSIVE_API_KEY = (os.getenv("MASSIVE_API_KEY", "") or "").strip()
+MASSIVE_BASE_URL = (os.getenv("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/"))
 
 @dataclass
 class _CacheItem:
@@ -438,7 +440,25 @@ class PolygonClient:
         except Exception as e:
             logger.debug("[polygon] targeted option context failed for %s: %r", sym, e)
             return {}
+        p = dict(params or {})
+        p["apiKey"] = MASSIVE_API_KEY
+        url = f"{MASSIVE_BASE_URL}{path}"
+        r = await self.http.get(url, params=p, timeout=timeout)
+        r.raise_for_status()
+        js = r.json()
+        return js if isinstance(js, dict) else {}
 
+    async def get_last_trade(self, symbol: str) -> Dict[str, Any]:
+        # Example (you already tried):
+        # GET /v2/last/trade/NVDA?apiKey=...
+        js = await self._get(f"/v2/last/trade/{symbol}")
+        # Normalize
+        # Try common shapes:
+        # { "symbol":"NVDA","price":..., "timestamp":... } OR { "results": { "p": ... } }
+        if "price" in js:
+            return {"price": js.get("price"), "ts": js.get("timestamp")}
+        res = js.get("results") or js.get("result") or {}
+        return {"price": res.get("p") or res.get("price"), "ts": res.get("t")}
 
 def polygon_enabled() -> bool:
     return bool((POLYGON_API_KEY or "").strip())
