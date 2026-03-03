@@ -9,22 +9,28 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from engine_common import build_option_contract  # uses your existing helper
-
-# Use BOTH names so existing code that expects logger/log works
-logger = logging.getLogger("trading_engine.polygon")
-log = logger
+log = logging.getLogger("trading_engine.polygon")
 
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
 POLYGON_BASE_URL = (os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/"))
 
-# Endpoint toggles (set in Render env to silence blocked endpoints)
-POLYGON_ENABLE_SNAPSHOT = os.getenv("POLYGON_ENABLE_SNAPSHOT", "1") == "1"
-POLYGON_ENABLE_NBBO = os.getenv("POLYGON_ENABLE_NBBO", "1") == "1"
-POLYGON_ENABLE_LAST_TRADE = os.getenv("POLYGON_ENABLE_LAST_TRADE", "0") == "1"
-POLYGON_ENABLE_INDICATORS = os.getenv("POLYGON_ENABLE_INDICATORS", "1") == "1"
-POLYGON_ENABLE_AGGS = os.getenv("POLYGON_ENABLE_AGGS", "1") == "1"
-POLYGON_ENABLE_OPTIONS = os.getenv("POLYGON_ENABLE_OPTIONS", "1") == "1"
+# -----------------------------
+# Endpoint toggles (env)
+# -----------------------------
+def _truthy(v: str) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+POLYGON_ENABLE_SNAPSHOT = _truthy(os.getenv("POLYGON_ENABLE_SNAPSHOT", "1"))
+POLYGON_ENABLE_NBBO = _truthy(os.getenv("POLYGON_ENABLE_NBBO", "1"))
+POLYGON_ENABLE_LAST_TRADE = _truthy(os.getenv("POLYGON_ENABLE_LAST_TRADE", "1"))
+POLYGON_ENABLE_AGGS = _truthy(os.getenv("POLYGON_ENABLE_AGGS", "1"))
+POLYGON_ENABLE_INDICATORS = _truthy(os.getenv("POLYGON_ENABLE_INDICATORS", "1"))
+POLYGON_ENABLE_OPTIONS = _truthy(os.getenv("POLYGON_ENABLE_OPTIONS", "1"))
+
+# If you’re on a plan that blocks snapshot/last/nbbo, set these to 0 in Render env:
+#   POLYGON_ENABLE_SNAPSHOT=0
+#   POLYGON_ENABLE_NBBO=0
+#   POLYGON_ENABLE_LAST_TRADE=0
 
 
 @dataclass
@@ -38,10 +44,10 @@ class PolygonClient:
     Thin async Polygon.io REST client with:
       - soft-fail for blocked/missing endpoints (401/403/404)
       - 429 retry w/ exponential backoff + jitter
-      - in-memory TTL caching to reduce rate limit pressure
+      - in-memory TTL caching
       - per-client concurrency limiting (semaphore)
       - "blocked endpoint cooldown" so we don't spam 403 endpoints
-      - in-flight de-dupe so concurrent identical requests share one await
+      - inflight de-dupe: same cache_key => await the same Task
     """
 
     def __init__(self, http_client: httpx.AsyncClient, api_key: Optional[str] = None) -> None:
@@ -49,29 +55,25 @@ class PolygonClient:
         self.api_key = (api_key or POLYGON_API_KEY or "").strip()
         self.base = POLYGON_BASE_URL
 
-        # keep calls under control
-        self._sem = asyncio.Semaphore(int(os.getenv("POLYGON_MAX_CONCURRENCY", "2").strip() or 2))
+        self._sem = asyncio.Semaphore(int(os.getenv("POLYGON_MAX_CONCURRENCY", "3")) or 3)
 
-        # simple in-memory cache (per process)
         self._cache: Dict[str, _CacheItem] = {}
-
-        # in-flight de-dupe
-        self._inflight: Dict[str, asyncio.Task] = {}
-
-        # cooldown for plan-blocked endpoints (403/401)
         self._blocked_until: Dict[str, float] = {}
 
-        # retry config
-        self._max_429_retries = int(os.getenv("POLYGON_429_RETRIES", "4").strip() or 4)
-        self._base_backoff = float(os.getenv("POLYGON_429_BACKOFF", "0.7").strip() or 0.7)
-        self._block_cooldown_s = float(os.getenv("POLYGON_403_COOLDOWN", "1800").strip() or 1800.0)
+        self._max_429_retries = int(os.getenv("POLYGON_429_RETRIES", "4") or 4)
+        self._base_backoff = float(os.getenv("POLYGON_429_BACKOFF", "0.7") or 0.7)
+        self._block_cooldown_s = float(os.getenv("POLYGON_403_COOLDOWN", "1800") or 1800.0)
+
+        # inflight de-dupe
+        self._inflight: Dict[str, asyncio.Task] = {}
+        self._inflight_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
         return bool(self.api_key)
 
     # -----------------------------
-    # tiny cache helpers
+    # cache helpers
     # -----------------------------
     def _cache_get(self, key: str) -> Optional[Any]:
         it = self._cache.get(key)
@@ -86,6 +88,9 @@ class PolygonClient:
         self._cache[key] = _CacheItem(exp=time.time() + ttl_s, val=val)
         return val
 
+    # -----------------------------
+    # block cooldown
+    # -----------------------------
     def _blocked_key(self, path: str, symbol: Optional[str]) -> str:
         sym = (symbol or "").upper()
         return f"{sym}:{path}"
@@ -100,14 +105,33 @@ class PolygonClient:
         self._blocked_until[k] = time.time() + self._block_cooldown_s
 
     # -----------------------------
+    # inflight de-dupe
+    # -----------------------------
+    async def _dedupe(self, key: str, coro_factory) -> Any:
+        """
+        If same key is already in-flight, await the existing task.
+        Otherwise create a task, store it, await it, then remove.
+        """
+        async with self._inflight_lock:
+            t = self._inflight.get(key)
+            if t and not t.done():
+                return await t
+
+            task = asyncio.create_task(coro_factory())
+            self._inflight[key] = task
+
+        try:
+            return await task
+        finally:
+            async with self._inflight_lock:
+                cur = self._inflight.get(key)
+                if cur is task:
+                    self._inflight.pop(key, None)
+
+    # -----------------------------
     # core request
     # -----------------------------
-    async def _get(
-        self,
-        path: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout: float = 6.0,
-    ) -> Dict[str, Any]:
+    async def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: float = 6.0) -> Dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("POLYGON_API_KEY is not set")
 
@@ -133,104 +157,63 @@ class PolygonClient:
         cache_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Soft-fail for common entitlement/missing/rate limit issues.
-        Returns {} on 401/403/404 or final 429 failure.
+        Soft-fail on 401/403/404 and final 429 exhaustion.
+        Returns {} on failure.
         """
         sym = (symbol or "").upper()
 
-        # blocked cooldown (avoid spamming known-403 endpoints)
         if self._is_blocked(path, sym):
             return {}
 
+        # cache hit
         if cache_ttl_s > 0 and cache_key:
             hit = self._cache_get(cache_key)
             if hit is not None:
                 return hit
 
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                js = await self._get(path, params=params, timeout=timeout)
-                if cache_ttl_s > 0 and cache_key:
-                    return self._cache_set(cache_key, js, cache_ttl_s)
-                return js
+        async def _runner() -> Dict[str, Any]:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    js = await self._get(path, params=params, timeout=timeout)
+                    if cache_ttl_s > 0 and cache_key:
+                        return self._cache_set(cache_key, js, cache_ttl_s)
+                    return js
 
-            except httpx.HTTPStatusError as e:
-                code = getattr(e.response, "status_code", None)
+                except httpx.HTTPStatusError as e:
+                    code = getattr(e.response, "status_code", None)
 
-                # plan blocked / not entitled
-                if code in (401, 403):
-                    logger.warning("%s blocked for %s (HTTP %s) path=%s", log_prefix, sym, code, path)
-                    self._mark_blocked(path, sym)
-                    return {}
-
-                # not found (bad endpoint / ticker not supported)
-                if code == 404:
-                    logger.warning("%s not found for %s (HTTP 404) path=%s", log_prefix, sym, path)
-                    return {}
-
-                # rate limit retry
-                if code == 429:
-                    if attempt >= self._max_429_retries:
-                        logger.warning(
-                            "%s 429 rate limited (attempt=%d/%d) path=%s",
-                            log_prefix, attempt, self._max_429_retries, path,
-                        )
+                    if code in (401, 403):
+                        log.warning("%s blocked for %s (HTTP %s) path=%s", log_prefix, sym, code, path)
+                        self._mark_blocked(path, sym)
                         return {}
-                    sleep_s = (self._base_backoff * (2 ** (attempt - 1))) + random.uniform(0.0, 0.35)
-                    logger.warning(
-                        "%s 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs",
-                        log_prefix, attempt, self._max_429_retries, path, sleep_s,
-                    )
-                    await asyncio.sleep(sleep_s)
-                    continue
 
-                logger.warning("%s failed for %s (HTTP %s) path=%s err=%r", log_prefix, sym, code, path, e)
-                return {}
+                    if code == 404:
+                        log.warning("%s not found for %s (HTTP 404) path=%s", log_prefix, sym, path)
+                        return {}
 
-            except Exception as e:
-                logger.warning("%s exception for %s path=%s err=%r", log_prefix, sym, path, e)
-                return {}
+                    if code == 429:
+                        if attempt >= self._max_429_retries:
+                            log.warning("%s 429 rate limited (attempt=%d/%d) path=%s", log_prefix, attempt, self._max_429_retries, path)
+                            return {}
+                        sleep_s = (self._base_backoff * (2 ** (attempt - 1))) + random.uniform(0.0, 0.35)
+                        log.warning("%s 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs", log_prefix, attempt, self._max_429_retries, path, sleep_s)
+                        await asyncio.sleep(sleep_s)
+                        continue
 
-    async def _get_soft_dedup(
-        self,
-        *,
-        inflight_key: str,
-        path: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout: float = 6.0,
-        log_prefix: str = "[polygon]",
-        symbol: Optional[str] = None,
-        cache_ttl_s: float = 0.0,
-        cache_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        In-flight de-dupe: if an identical request is already in progress,
-        await it instead of issuing a second HTTP call.
-        """
-        t = self._inflight.get(inflight_key)
-        if t and not t.done():
-            return await t
+                    log.warning("%s failed for %s (HTTP %s) path=%s err=%r", log_prefix, sym, code, path, e)
+                    return {}
 
-        async def _run() -> Dict[str, Any]:
-            return await self._get_soft(
-                path,
-                params=params,
-                timeout=timeout,
-                log_prefix=log_prefix,
-                symbol=symbol,
-                cache_ttl_s=cache_ttl_s,
-                cache_key=cache_key,
-            )
+                except Exception as e:
+                    log.warning("%s exception for %s path=%s err=%r", log_prefix, sym, path, e)
+                    return {}
 
-        task = asyncio.create_task(_run(), name=f"polygon:{inflight_key}")
-        self._inflight[inflight_key] = task
-        try:
-            return await task
-        finally:
-            if self._inflight.get(inflight_key) is task:
-                self._inflight.pop(inflight_key, None)
+        # inflight de-dupe if cache_key provided
+        if cache_key:
+            return await self._dedupe(f"inflight:{cache_key}", _runner)
+
+        return await _runner()
 
     # -----------------------------
     # Stocks
@@ -240,9 +223,8 @@ class PolygonClient:
             return {}
         sym = symbol.upper()
         path = f"/v2/snapshot/locale/us/markets/stocks/tickers/{sym}"
-        js = await self._get_soft_dedup(
-            inflight_key=f"snap:{sym}",
-            path=path,
+        js = await self._get_soft(
+            path,
             symbol=sym,
             log_prefix="[polygon] snapshot",
             cache_ttl_s=8.0,
@@ -251,17 +233,12 @@ class PolygonClient:
         return js.get("ticker") or {}
 
     async def get_last_quote(self, symbol: str) -> Dict[str, Any]:
-        """
-        Correct endpoint for last quote is NBBO:
-          /v2/last/nbbo/{ticker}
-        """
         if not POLYGON_ENABLE_NBBO:
             return {}
         sym = symbol.upper()
         path = f"/v2/last/nbbo/{sym}"
-        js = await self._get_soft_dedup(
-            inflight_key=f"nbbo:{sym}",
-            path=path,
+        js = await self._get_soft(
+            path,
             symbol=sym,
             log_prefix="[polygon] nbbo",
             cache_ttl_s=3.0,
@@ -274,9 +251,8 @@ class PolygonClient:
             return {}
         sym = symbol.upper()
         path = f"/v2/last/trade/{sym}"
-        js = await self._get_soft_dedup(
-            inflight_key=f"trade:{sym}",
-            path=path,
+        js = await self._get_soft(
+            path,
             symbol=sym,
             log_prefix="[polygon] last/trade",
             cache_ttl_s=3.0,
@@ -304,16 +280,14 @@ class PolygonClient:
             return []
         sym = symbol.upper()
         path = f"/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}/{from_}/{to}"
-        key = f"aggs:{sym}:{multiplier}:{timespan}:{from_}:{to}:{limit}"
-        js = await self._get_soft_dedup(
-            inflight_key=key,
-            path=path,
+        js = await self._get_soft(
+            path,
             params={"adjusted": "true" if adjusted else "false", "sort": sort, "limit": limit},
             timeout=10.0 if timespan == "day" else 8.0,
             symbol=sym,
             log_prefix="[polygon] aggs",
             cache_ttl_s=cache_ttl_s,
-            cache_key=key if cache_ttl_s > 0 else None,
+            cache_key=f"aggs:{sym}:{multiplier}:{timespan}:{from_}:{to}:{limit}",
         )
         return js.get("results") or []
 
@@ -349,16 +323,13 @@ class PolygonClient:
         if kind == "macd":
             params.update({"short_window": macd_short, "long_window": macd_long, "signal_window": macd_signal})
 
-        inflight_key = f"ind:{sym}:{kind}:{timespan}:{window}:{series_type}:{limit}:{macd_short}:{macd_long}:{macd_signal}"
-
-        return await self._get_soft_dedup(
-            inflight_key=inflight_key,
-            path=path,
+        return await self._get_soft(
+            path,
             params=params,
             symbol=sym,
             log_prefix=f"[polygon] indicators/{kind}",
             cache_ttl_s=cache_ttl_s,
-            cache_key=inflight_key if cache_ttl_s > 0 else None,
+            cache_key=f"ind:{sym}:{kind}:{timespan}:{window}:{series_type}:{limit}:{macd_short}:{macd_long}:{macd_signal}",
         )
 
     @staticmethod
@@ -370,13 +341,8 @@ class PolygonClient:
         return float(v) if isinstance(v, (int, float)) else None
 
     async def get_technicals_bundle(self, symbol: str, *, timespan: str = "minute") -> Dict[str, Optional[float]]:
-        """
-        Indicator bundle.
-        MACD is fetched ONCE and we extract (value, signal, histogram) from the same response.
-        """
         if not POLYGON_ENABLE_INDICATORS:
             return {}
-
         ttl = 60.0 if timespan == "minute" else 900.0
 
         sma_js, ema20_js, ema50_js, rsi_js, macd_js = await asyncio.gather(
@@ -399,6 +365,8 @@ class PolygonClient:
 
     async def get_technicals_daily_bundle(self, symbol: str) -> Dict[str, Optional[float]]:
         d = await self.get_technicals_bundle(symbol, timespan="day")
+        if not d:
+            return {}
         return {
             "sma20_d": d.get("sma20"),
             "ema20_d": d.get("ema20"),
@@ -416,88 +384,29 @@ class PolygonClient:
         if not POLYGON_ENABLE_OPTIONS:
             return []
         sym = symbol.upper()
-        key = f"optchain:{sym}:{limit}"
-        js = await self._get_soft_dedup(
-            inflight_key=key,
-            path="/v3/snapshot/options",
+        js = await self._get_soft(
+            "/v3/snapshot/options",
             params={"underlying_ticker": sym, "limit": limit},
             timeout=8.0,
             symbol=sym,
             log_prefix="[polygon] options/chain",
             cache_ttl_s=20.0,
-            cache_key=key,
+            cache_key=f"optchain:{sym}:{limit}",
         )
         return js.get("results") or []
 
     async def get_option_snapshot(self, option_ticker: str) -> Dict[str, Any]:
         if not POLYGON_ENABLE_OPTIONS:
             return {}
-        key = f"optsnap:{option_ticker}"
-        js = await self._get_soft_dedup(
-            inflight_key=key,
-            path=f"/v3/snapshot/options/{option_ticker}",
+        js = await self._get_soft(
+            f"/v3/snapshot/options/{option_ticker}",
             timeout=8.0,
             symbol=None,
             log_prefix="[polygon] options/snap",
             cache_ttl_s=5.0,
-            cache_key=key,
+            cache_key=f"optsnap:{option_ticker}",
         )
         return js.get("results") or {}
-
-    async def get_targeted_option_context(
-        self,
-        symbol: str,
-        *,
-        expiry_iso: Optional[str],
-        side: Optional[str],
-        strike: Optional[float],
-    ) -> Dict[str, Any]:
-        if not POLYGON_ENABLE_OPTIONS:
-            return {}
-        if not expiry_iso or strike is None:
-            return {}
-
-        sym = symbol.upper()
-        try:
-            opt = build_option_contract(sym, expiry_iso, side or "CALL", float(strike))
-            snap = await self.get_option_snapshot(opt)
-
-            q = snap.get("last_quote") or {}
-            details = snap.get("details") or {}
-            greeks = snap.get("greeks") or {}
-            day = snap.get("day") or {}
-
-            bid = q.get("bid")
-            ask = q.get("ask")
-
-            mid = (
-                ((bid + ask) / 2.0)
-                if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and (bid + ask) > 0
-                else None
-            )
-            spr = (
-                ((ask - bid) / max(mid, 1e-9) * 100.0)
-                if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and mid
-                else None
-            )
-
-            return {
-                "option_ticker": opt,
-                "bid": bid,
-                "ask": ask,
-                "mid": mid,
-                "option_spread_pct": spr,
-                "oi": details.get("open_interest") or day.get("open_interest"),
-                "vol": day.get("volume"),
-                "delta": greeks.get("delta"),
-                "gamma": greeks.get("gamma"),
-                "theta": greeks.get("theta"),
-                "vega": greeks.get("vega"),
-                "iv": greeks.get("implied_volatility"),
-            }
-        except Exception as e:
-            logger.debug("[polygon] targeted option context failed for %s: %r", sym, e)
-            return {}
 
 
 def polygon_enabled() -> bool:
