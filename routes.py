@@ -158,7 +158,7 @@ def bind_lifecycle(app: FastAPI) -> None:
 @router.get("/health")
 async def health() -> Dict[str, Any]:
     # If engine has net_debug_info, include it (nice for Render checks)
-    info = {}
+    info: Dict[str, Any] = {}
     if hasattr(engine, "net_debug_info") and callable(getattr(engine, "net_debug_info")):
         with suppress(Exception):
             info = await engine.net_debug_info()  # type: ignore
@@ -187,21 +187,25 @@ async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONR
             return JSONResponse({"ok": False, "blocked": "outside_window", "bypass_window": False}, status_code=403)
 
     # ---- enqueue into engine worker ----
-    # Engine contract used by your logs: engine.enqueue(...) then worker processes job dict
-    # Job shape expected by engine_processor.process_tradingview_job(): {"alert_text": <dict>}
+    # Job shape expected by engine_processor.process_tradingview_job(): {"alert_text": <dict>, "flags": {...}}
     job = {"alert_text": payload, "flags": flags}
 
-    # Pick the enqueue function that exists
-    enqueue_fn = None
-    for name in ("enqueue", "enqueue_job", "enqueue_alert", "submit"):
-        fn = getattr(engine, name, None)
-        if callable(fn):
-            enqueue_fn = fn
-            break
+    # Prefer the canonical function if it exists
+    enqueue_fn = getattr(engine, "enqueue_webhook_job", None)
+    if not callable(enqueue_fn):
+        # Fall back to common aliases
+        enqueue_fn = None
+        for name in ("enqueue", "enqueue_job", "enqueue_alert", "submit"):
+            fn = getattr(engine, name, None)
+            if callable(fn):
+                enqueue_fn = fn
+                break
 
     if enqueue_fn is None:
-        # This is the ONLY hard requirement: engine must expose an enqueue function.
-        raise HTTPException(status_code=500, detail="Engine enqueue function not found (expected enqueue/enqueue_job/enqueue_alert/submit)")
+        raise HTTPException(
+            status_code=500,
+            detail="Engine enqueue function not found (expected enqueue_webhook_job or enqueue/enqueue_job/enqueue_alert/submit)",
+        )
 
     try:
         await enqueue_fn(job)  # type: ignore
