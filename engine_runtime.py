@@ -48,7 +48,7 @@ def _preview(obj: Any, n: int = 200) -> str:
     return s[:n]
 
 
-def enqueue_webhook_job(alert_text: Any, flags: Dict[str, Any]) -> bool:
+def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
     """
     Enqueue a webhook job.
 
