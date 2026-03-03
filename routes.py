@@ -10,7 +10,6 @@ from fastapi import APIRouter, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 # ---- Project imports (match your repo) ----
-# If any of these module names differ in your tree, adjust the import line(s) only.
 from config import CDT_TZ, allowed_now_cdt
 import trading_engine as engine
 
@@ -110,7 +109,6 @@ async def _scanner_window_controller() -> None:
 
             await asyncio.sleep(poll_s)
     except asyncio.CancelledError:
-        # controller cancelled at shutdown: stop scanner
         with suppress(asyncio.CancelledError):
             await _stop_uvscan_task()
         raise
@@ -193,32 +191,32 @@ async def webhook_tradingview(request: Request) -> JSONResponse:
     """
     Accepts TradingView webhook. Supports either JSON payload or raw text.
     Enforces CDT alert window via config.allowed_now_cdt() unless bypass_window=1.
+
+    IMPORTANT: We enqueue a STRING (either plain text or compact JSON) into the engine queue,
+    because the worker pipeline expects alert_text.
     """
     bypass = _bypass_requested(request)
 
     if (not bypass) and (not allowed_now_cdt()):
-        raise HTTPException(status_code=403, detail="Outside allowed alert window (CDT). Use ?bypass_window=1 to test.")
+        raise HTTPException(
+            status_code=403,
+            detail="Outside allowed alert window (CDT). Use ?bypass_window=1 to test.",
+        )
 
-    # Try JSON first; fallback to raw body text
-    payload = None
-    body_text = ""
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = None
+    # Your engine already has this helper; it returns JSON string if request is JSON,
+    # otherwise returns body text.
+    alert_text = await engine.get_alert_text_from_request(request)
 
-    if payload is None:
-        raw = await request.body()
-        body_text = (raw or b"").decode("utf-8", errors="ignore").strip()
-        payload = {"text": body_text} if body_text else {}
+    flags = {
+        "bypass_window": bypass,
+        "ip": request.client.host if request.client else None,
+        "ua": request.headers.get("user-agent", ""),
+        "path": str(request.url.path),
+    }
 
-    # Hand off to your engine. Your engine can decide how to parse this.
-    try:
-        await engine.enqueue_alert(payload)
-    except AttributeError:
-        # If your engine uses a different entrypoint, replace this line.
-        # In your repo, you may have engine.process_webhook(payload) or similar.
-        await engine.process_webhook(payload)
+    ok = engine.enqueue_webhook_job(alert_text, flags)
+    if not ok:
+        raise HTTPException(status_code=429, detail="Queue full, try again")
 
     return JSONResponse({"ok": True, "bypass_window": bypass})
 
