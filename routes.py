@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# ---- Project imports (match your repo) ----
+# ---- Project imports ----
 from config import CDT_TZ, allowed_now_cdt
 import trading_engine as engine
 
@@ -141,7 +141,6 @@ async def _daily_report_scheduler() -> None:
             now = datetime.now(tz)
             key = now.strftime("%Y-%m-%d")
 
-            # send once per day when we cross HH:MM
             if now.hour == hour and now.minute == minute and last_sent_key != key:
                 try:
                     report = await build_daily_report()
@@ -161,7 +160,6 @@ async def _daily_report_scheduler() -> None:
 # =========================
 @router.get("/healthz")
 async def healthz() -> dict:
-    st = {}
     try:
         st = uvscan_state() or {}
     except Exception:
@@ -189,11 +187,10 @@ async def uvscan_status() -> dict:
 @router.post("/webhook/tradingview")
 async def webhook_tradingview(request: Request) -> JSONResponse:
     """
-    Accepts TradingView webhook. Supports either JSON payload or raw text.
-    Enforces CDT alert window via config.allowed_now_cdt() unless bypass_window=1.
-
-    IMPORTANT: We enqueue a STRING (either plain text or compact JSON) into the engine queue,
-    because the worker pipeline expects alert_text.
+    Accepts TradingView webhook. Supports:
+      - JSON payload (application/json)
+      - raw text body
+    Enforces CDT window via allowed_now_cdt() unless bypass_window=1.
     """
     bypass = _bypass_requested(request)
 
@@ -203,20 +200,29 @@ async def webhook_tradingview(request: Request) -> JSONResponse:
             detail="Outside allowed alert window (CDT). Use ?bypass_window=1 to test.",
         )
 
-    # Your engine already has this helper; it returns JSON string if request is JSON,
-    # otherwise returns body text.
-    alert_text = await engine.get_alert_text_from_request(request)
+    payload: dict
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+    except Exception:
+        raw = await request.body()
+        body_text = (raw or b"").decode("utf-8", errors="ignore").strip()
+        payload = {"text": body_text} if body_text else {}
 
-    flags = {
+    # Add request flags so engine can log/debug
+    payload["_flags"] = {
         "bypass_window": bypass,
-        "ip": request.client.host if request.client else None,
+        "ip": (request.client.host if request.client else None),
         "ua": request.headers.get("user-agent", ""),
         "path": str(request.url.path),
     }
 
-    ok = engine.enqueue_webhook_job(alert_text, flags)
-    if not ok:
-        raise HTTPException(status_code=429, detail="Queue full, try again")
+    # Hand off to engine
+    try:
+        await engine.enqueue_alert(payload)
+    except AttributeError:
+        await engine.process_webhook(payload)
 
     return JSONResponse({"ok": True, "bypass_window": bypass})
 
@@ -227,11 +233,9 @@ async def webhook_tradingview(request: Request) -> JSONResponse:
 def bind_lifecycle(app: FastAPI) -> None:
     @app.on_event("startup")
     async def _startup() -> None:
-        # engine startup
         with suppress(Exception):
             await engine.startup()
 
-        # background tasks
         global _scanner_ctrl_task, _daily_task
         _scanner_ctrl_task = asyncio.create_task(_scanner_window_controller(), name="uvscan-controller")
         _daily_task = asyncio.create_task(_daily_report_scheduler(), name="daily-reporter")
@@ -240,13 +244,11 @@ def bind_lifecycle(app: FastAPI) -> None:
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
-        # Cancel controllers first (they will stop scanner)
         global _scanner_ctrl_task, _daily_task
         for t in (_daily_task, _scanner_ctrl_task):
             if t and not t.done():
                 t.cancel()
 
-        # Await tasks (CancelledError is expected)
         for t in (_daily_task, _scanner_ctrl_task):
             if t:
                 with suppress(asyncio.CancelledError):
@@ -255,11 +257,9 @@ def bind_lifecycle(app: FastAPI) -> None:
         _daily_task = None
         _scanner_ctrl_task = None
 
-        # Ensure scanner is stopped even if controller didn’t run
         with suppress(asyncio.CancelledError):
             await _stop_uvscan_task()
 
-        # engine shutdown
         with suppress(Exception):
             await engine.shutdown()
 
