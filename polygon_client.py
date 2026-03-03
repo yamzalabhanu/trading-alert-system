@@ -18,6 +18,14 @@ log = logger
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
 POLYGON_BASE_URL = (os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/"))
 
+# Endpoint toggles (set in Render env to silence blocked endpoints)
+POLYGON_ENABLE_SNAPSHOT = os.getenv("POLYGON_ENABLE_SNAPSHOT", "1") == "1"
+POLYGON_ENABLE_NBBO = os.getenv("POLYGON_ENABLE_NBBO", "1") == "1"
+POLYGON_ENABLE_LAST_TRADE = os.getenv("POLYGON_ENABLE_LAST_TRADE", "0") == "1"
+POLYGON_ENABLE_INDICATORS = os.getenv("POLYGON_ENABLE_INDICATORS", "1") == "1"
+POLYGON_ENABLE_AGGS = os.getenv("POLYGON_ENABLE_AGGS", "1") == "1"
+POLYGON_ENABLE_OPTIONS = os.getenv("POLYGON_ENABLE_OPTIONS", "1") == "1"
+
 
 @dataclass
 class _CacheItem:
@@ -33,6 +41,7 @@ class PolygonClient:
       - in-memory TTL caching to reduce rate limit pressure
       - per-client concurrency limiting (semaphore)
       - "blocked endpoint cooldown" so we don't spam 403 endpoints
+      - in-flight de-dupe so concurrent identical requests share one await
     """
 
     def __init__(self, http_client: httpx.AsyncClient, api_key: Optional[str] = None) -> None:
@@ -41,10 +50,13 @@ class PolygonClient:
         self.base = POLYGON_BASE_URL
 
         # keep calls under control
-        self._sem = asyncio.Semaphore(int(os.getenv("POLYGON_MAX_CONCURRENCY", "3").strip() or 3))
+        self._sem = asyncio.Semaphore(int(os.getenv("POLYGON_MAX_CONCURRENCY", "2").strip() or 2))
 
         # simple in-memory cache (per process)
         self._cache: Dict[str, _CacheItem] = {}
+
+        # in-flight de-dupe
+        self._inflight: Dict[str, asyncio.Task] = {}
 
         # cooldown for plan-blocked endpoints (403/401)
         self._blocked_until: Dict[str, float] = {}
@@ -181,14 +193,56 @@ class PolygonClient:
                 logger.warning("%s exception for %s path=%s err=%r", log_prefix, sym, path, e)
                 return {}
 
+    async def _get_soft_dedup(
+        self,
+        *,
+        inflight_key: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 6.0,
+        log_prefix: str = "[polygon]",
+        symbol: Optional[str] = None,
+        cache_ttl_s: float = 0.0,
+        cache_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        In-flight de-dupe: if an identical request is already in progress,
+        await it instead of issuing a second HTTP call.
+        """
+        t = self._inflight.get(inflight_key)
+        if t and not t.done():
+            return await t
+
+        async def _run() -> Dict[str, Any]:
+            return await self._get_soft(
+                path,
+                params=params,
+                timeout=timeout,
+                log_prefix=log_prefix,
+                symbol=symbol,
+                cache_ttl_s=cache_ttl_s,
+                cache_key=cache_key,
+            )
+
+        task = asyncio.create_task(_run(), name=f"polygon:{inflight_key}")
+        self._inflight[inflight_key] = task
+        try:
+            return await task
+        finally:
+            if self._inflight.get(inflight_key) is task:
+                self._inflight.pop(inflight_key, None)
+
     # -----------------------------
     # Stocks
     # -----------------------------
     async def get_stock_snapshot(self, symbol: str) -> Dict[str, Any]:
+        if not POLYGON_ENABLE_SNAPSHOT:
+            return {}
         sym = symbol.upper()
         path = f"/v2/snapshot/locale/us/markets/stocks/tickers/{sym}"
-        js = await self._get_soft(
-            path,
+        js = await self._get_soft_dedup(
+            inflight_key=f"snap:{sym}",
+            path=path,
             symbol=sym,
             log_prefix="[polygon] snapshot",
             cache_ttl_s=8.0,
@@ -201,10 +255,13 @@ class PolygonClient:
         Correct endpoint for last quote is NBBO:
           /v2/last/nbbo/{ticker}
         """
+        if not POLYGON_ENABLE_NBBO:
+            return {}
         sym = symbol.upper()
         path = f"/v2/last/nbbo/{sym}"
-        js = await self._get_soft(
-            path,
+        js = await self._get_soft_dedup(
+            inflight_key=f"nbbo:{sym}",
+            path=path,
             symbol=sym,
             log_prefix="[polygon] nbbo",
             cache_ttl_s=3.0,
@@ -213,10 +270,13 @@ class PolygonClient:
         return js.get("results") or {}
 
     async def get_last_trade(self, symbol: str) -> Dict[str, Any]:
+        if not POLYGON_ENABLE_LAST_TRADE:
+            return {}
         sym = symbol.upper()
         path = f"/v2/last/trade/{sym}"
-        js = await self._get_soft(
-            path,
+        js = await self._get_soft_dedup(
+            inflight_key=f"trade:{sym}",
+            path=path,
             symbol=sym,
             log_prefix="[polygon] last/trade",
             cache_ttl_s=3.0,
@@ -240,16 +300,20 @@ class PolygonClient:
         sort: str = "asc",
         cache_ttl_s: float = 0.0,
     ) -> List[Dict[str, Any]]:
+        if not POLYGON_ENABLE_AGGS:
+            return []
         sym = symbol.upper()
         path = f"/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}/{from_}/{to}"
-        js = await self._get_soft(
-            path,
+        key = f"aggs:{sym}:{multiplier}:{timespan}:{from_}:{to}:{limit}"
+        js = await self._get_soft_dedup(
+            inflight_key=key,
+            path=path,
             params={"adjusted": "true" if adjusted else "false", "sort": sort, "limit": limit},
             timeout=10.0 if timespan == "day" else 8.0,
             symbol=sym,
             log_prefix="[polygon] aggs",
             cache_ttl_s=cache_ttl_s,
-            cache_key=f"aggs:{sym}:{multiplier}:{timespan}:{from_}:{to}:{limit}",
+            cache_key=key if cache_ttl_s > 0 else None,
         )
         return js.get("results") or []
 
@@ -270,6 +334,8 @@ class PolygonClient:
         macd_signal: int = 9,
         cache_ttl_s: float = 0.0,
     ) -> Dict[str, Any]:
+        if not POLYGON_ENABLE_INDICATORS:
+            return {}
         sym = symbol.upper()
         path = f"/v1/indicators/{kind}/{sym}"
         params: Dict[str, Any] = {
@@ -283,13 +349,16 @@ class PolygonClient:
         if kind == "macd":
             params.update({"short_window": macd_short, "long_window": macd_long, "signal_window": macd_signal})
 
-        return await self._get_soft(
-            path,
+        inflight_key = f"ind:{sym}:{kind}:{timespan}:{window}:{series_type}:{limit}:{macd_short}:{macd_long}:{macd_signal}"
+
+        return await self._get_soft_dedup(
+            inflight_key=inflight_key,
+            path=path,
             params=params,
             symbol=sym,
             log_prefix=f"[polygon] indicators/{kind}",
             cache_ttl_s=cache_ttl_s,
-            cache_key=f"ind:{sym}:{kind}:{timespan}:{window}:{series_type}:{limit}:{macd_short}:{macd_long}:{macd_signal}",
+            cache_key=inflight_key if cache_ttl_s > 0 else None,
         )
 
     @staticmethod
@@ -305,6 +374,9 @@ class PolygonClient:
         Indicator bundle.
         MACD is fetched ONCE and we extract (value, signal, histogram) from the same response.
         """
+        if not POLYGON_ENABLE_INDICATORS:
+            return {}
+
         ttl = 60.0 if timespan == "minute" else 900.0
 
         sma_js, ema20_js, ema50_js, rsi_js, macd_js = await asyncio.gather(
@@ -341,26 +413,34 @@ class PolygonClient:
     # Options snapshots
     # -----------------------------
     async def get_options_chain_snapshot(self, symbol: str, limit: int = 250) -> List[Dict[str, Any]]:
+        if not POLYGON_ENABLE_OPTIONS:
+            return []
         sym = symbol.upper()
-        js = await self._get_soft(
-            "/v3/snapshot/options",
+        key = f"optchain:{sym}:{limit}"
+        js = await self._get_soft_dedup(
+            inflight_key=key,
+            path="/v3/snapshot/options",
             params={"underlying_ticker": sym, "limit": limit},
             timeout=8.0,
             symbol=sym,
             log_prefix="[polygon] options/chain",
             cache_ttl_s=20.0,
-            cache_key=f"optchain:{sym}:{limit}",
+            cache_key=key,
         )
         return js.get("results") or []
 
     async def get_option_snapshot(self, option_ticker: str) -> Dict[str, Any]:
-        js = await self._get_soft(
-            f"/v3/snapshot/options/{option_ticker}",
+        if not POLYGON_ENABLE_OPTIONS:
+            return {}
+        key = f"optsnap:{option_ticker}"
+        js = await self._get_soft_dedup(
+            inflight_key=key,
+            path=f"/v3/snapshot/options/{option_ticker}",
             timeout=8.0,
             symbol=None,
             log_prefix="[polygon] options/snap",
             cache_ttl_s=5.0,
-            cache_key=f"optsnap:{option_ticker}",
+            cache_key=key,
         )
         return js.get("results") or {}
 
@@ -372,6 +452,8 @@ class PolygonClient:
         side: Optional[str],
         strike: Optional[float],
     ) -> Dict[str, Any]:
+        if not POLYGON_ENABLE_OPTIONS:
+            return {}
         if not expiry_iso or strike is None:
             return {}
 
