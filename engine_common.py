@@ -213,16 +213,112 @@ def _as_float(v: Any) -> Optional[float]:
 
 
 def _norm_side(side_raw: str) -> Optional[str]:
+    """
+    Normalize side/bias inputs to internal "CALL" / "PUT".
+    Supports Pine formats (CALLS/PUTS) and legacy synonyms.
+    """
     s = (side_raw or "").upper().strip()
-    if s in ("CALL", "BUY", "LONG", "BULL"):
+
+    # Pine plural forms
+    if s in ("CALLS", "CALL"):
         return "CALL"
-    if s in ("PUT", "SELL", "SHORT", "BEAR"):
+    if s in ("PUTS", "PUT"):
         return "PUT"
+
+    # Legacy synonyms
+    if s in ("BUY", "LONG", "BULL", "BULLISH"):
+        return "CALL"
+    if s in ("SELL", "SHORT", "BEAR", "BEARISH"):
+        return "PUT"
+
     return None
 
 
 def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # Support: original schema + scalper_v4_2 schema
+    """
+    Normalizes multiple TradingView/Pine schemas into your internal alert dict.
+
+    Required output keys (engine expects these):
+      - side: "CALL" or "PUT"
+      - symbol: underlying symbol
+      - underlying_price_from_alert: float
+
+    Optional:
+      - strike, expiry (YYYY-MM-DD)
+      - plus pass-through fields used by LLM/telegram
+    """
+
+    # -----------------------------
+    # tv_pine schema (new format)
+    # -----------------------------
+    src = str(payload.get("src") or payload.get("source") or "").strip().lower()
+    if src == "tv_pine" or ("optionType" in payload and "symbol" in payload and "price" in payload):
+        side = _norm_side(str(payload.get("optionType") or ""))
+        symbol = str(payload.get("symbol") or "").upper().strip()
+        px = _as_float(payload.get("price"))
+
+        if not side or not symbol or px is None:
+            return None
+
+        out: Dict[str, Any] = {
+            "side": side,
+            "symbol": symbol,
+            "underlying_price_from_alert": px,
+            "source": payload.get("src") or payload.get("source") or "tv_pine",
+            "chart_tf": str(payload.get("tf") or "").strip() or None,
+            "bias": payload.get("bias"),
+            "score": payload.get("score"),
+            "tier": payload.get("tier"),
+            "tv_time": payload.get("time"),  # raw TV timestamp (ms)
+        }
+
+        # optionsHint -> strike/expiry (best-effort)
+        hint = payload.get("optionsHint") or {}
+        if isinstance(hint, dict):
+            strike = _as_float(hint.get("strike"))
+            if strike is not None:
+                out["strike"] = strike
+
+            expiry_mode = str(hint.get("expiryMode") or "").strip().lower()
+            try:
+                today = market_now().date()
+                if "next friday" in expiry_mode:
+                    out["expiry"] = str(_next_friday(today))
+                elif "same week" in expiry_mode:
+                    out["expiry"] = str(same_week_friday(today))
+                elif "two week" in expiry_mode or "2 week" in expiry_mode:
+                    out["expiry"] = str(two_weeks_friday(today))
+            except Exception:
+                # don't fail parsing if date math fails
+                pass
+
+            # delta bounds are useful for LLM context
+            if hint.get("deltaMin") is not None:
+                out["deltaMin"] = hint.get("deltaMin")
+            if hint.get("deltaMax") is not None:
+                out["deltaMax"] = hint.get("deltaMax")
+
+        # Pass-through Pine fields (great for LLM + Telegram context)
+        passthru_keys = [
+            "vwap", "ema9", "ema21", "adx", "volSpike",
+            "orbH", "orbL", "orbRange", "atr",
+            "sl", "tp", "rr",
+            "mtfMode", "mtfExecTF", "mtfConfTF",
+            "mtfExecLong", "mtfConfLong", "mtfExecShort", "mtfConfShort",
+        ]
+        for k in passthru_keys:
+            if k in payload:
+                out[k] = payload.get(k)
+
+        # Enforce strike if configured (options-only mode)
+        if out.get("strike") is None and not ALLOW_NO_STRIKE_JSON:
+            return None
+
+        return out
+
+    # -----------------------------
+    # Existing/legacy schemas (original behavior)
+    # -----------------------------
     side = _norm_side(str(payload.get("side") or payload.get("type") or payload.get("signal") or ""))
     symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("underlying") or "").upper().strip()
 
@@ -593,5 +689,5 @@ __all__ = [
     "_occ_meta",
     "_ticker_matches_side",
     "preflight_ok",
-    "compose_telegram_text",  
+    "compose_telegram_text",
 ]
