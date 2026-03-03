@@ -1,13 +1,11 @@
 # engine_common.py
 import os
 import re
-import math
 import json
-from typing import List
 import logging
 from urllib.parse import quote
 from typing import Dict, Any, Optional, Tuple
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timedelta, date
 
 from fastapi import HTTPException, Request
 from config import CDT_TZ, MAX_LLM_PER_DAY, POLYGON_API_KEY as CFG_POLYGON_API_KEY
@@ -33,13 +31,12 @@ def _env_truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
 
 
-IBKR_ENABLED = False  # IBKR integration removed
+IBKR_ENABLED = False
 IBKR_DEFAULT_QTY = 0
 IBKR_TIF = "DAY"
 IBKR_ORDER_MODE = "disabled"
 IBKR_USE_MID_AS_LIMIT = False
 
-# Trading thresholds (tunable)
 TARGET_DELTA_CALL = float(os.getenv("TARGET_DELTA_CALL", "0.35"))
 TARGET_DELTA_PUT = float(os.getenv("TARGET_DELTA_PUT", "-0.35"))
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "6.0"))
@@ -49,19 +46,17 @@ MIN_OI = int(os.getenv("MIN_OI", "200"))
 MIN_DTE = int(os.getenv("MIN_DTE", "3"))
 MAX_DTE = int(os.getenv("MAX_DTE", "45"))
 
-# Optional scan knobs (RTH vs AH)
 SCAN_MIN_VOL_RTH = int(os.getenv("SCAN_MIN_VOL_RTH", os.getenv("SCAN_MIN_VOL", "500")))
 SCAN_MIN_OI_RTH = int(os.getenv("SCAN_MIN_OI_RTH", os.getenv("SCAN_MIN_OI", "500")))
 SCAN_MIN_VOL_AH = int(os.getenv("SCAN_MIN_VOL_AH", "0"))
 SCAN_MIN_OI_AH = int(os.getenv("SCAN_MIN_OI_AH", "100"))
 
-# Keep these env toggles defined
 SEND_CHAIN_SCAN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_ALERTS", "0"))
 SEND_CHAIN_SCAN_TOPN_ALERTS = _env_truthy(os.getenv("SEND_CHAIN_SCAN_TOPN_ALERTS", "0"))
 REPLACE_IF_NO_NBBO = _env_truthy(os.getenv("REPLACE_IF_NO_NBBO", "1"))
 
-# Allow enriched JSON alerts without strike/expiry (equity-only ok)
 ALLOW_NO_STRIKE_JSON = _env_truthy(os.getenv("ALLOW_NO_STRIKE_JSON", "1"))
+
 
 # =========================
 # Small helpers / time & quota
@@ -106,17 +101,13 @@ ALERT_RE_NO_EXP = re.compile(
     re.IGNORECASE,
 )
 
-# -----------------------------
-# Robust JSON salvage helpers
-# -----------------------------
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
-_NA_TOKEN_RE = re.compile(r":\s*na(\s*[,}])", re.IGNORECASE)  # :na, or :na}
-_DOUBLE_COMMA_RE = re.compile(r",\s*,+")  # ",," or ", ,"
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # invalid JSON control chars
+_NA_TOKEN_RE = re.compile(r":\s*na(\s*[,}])", re.IGNORECASE)
+_DOUBLE_COMMA_RE = re.compile(r",\s*,+")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def _extract_json_object(s: str) -> Optional[str]:
-    """Return the outermost {...} slice if present, else None."""
     a = s.find("{")
     b = s.rfind("}")
     if a == -1 or b == -1 or b <= a:
@@ -125,11 +116,6 @@ def _extract_json_object(s: str) -> Optional[str]:
 
 
 def _maybe_unwrap_json_string(text: str) -> str:
-    """
-    If the payload is a JSON string containing JSON (double-encoded),
-    decode it once:
-      "\"{\\\"a\\\":1}\""  ->  "{\"a\":1}"
-    """
     t = (text or "").strip()
     if (len(t) >= 2) and ((t[0] == '"' and t[-1] == '"') or (t[0] == "'" and t[-1] == "'")):
         try:
@@ -142,10 +128,6 @@ def _maybe_unwrap_json_string(text: str) -> str:
 
 
 def _balance_braces(s: str) -> str:
-    """
-    Best-effort fix for truncated JSON missing one or more closing braces.
-    Only used as a last-resort before json.loads().
-    """
     s = (s or "").strip()
     o = s.count("{")
     c = s.count("}")
@@ -155,14 +137,6 @@ def _balance_braces(s: str) -> str:
 
 
 def _salvage_json_text(s: str) -> str:
-    """
-    Fix common TradingView/Pine JSON issues:
-      - extra prefix/suffix text around JSON
-      - Pine 'na' token => JSON null
-      - trailing commas before } or ]
-      - accidental double commas:  "tp1":null,, "x":1
-      - stray control chars
-    """
     s = (s or "").strip()
     obj = _extract_json_object(s)
     if obj is not None:
@@ -171,24 +145,17 @@ def _salvage_json_text(s: str) -> str:
     s = _CONTROL_CHARS_RE.sub("", s)
     s = _NA_TOKEN_RE.sub(r": null\1", s)
 
-    # Fix double commas anywhere
     while True:
         s2 = _DOUBLE_COMMA_RE.sub(",", s)
         if s2 == s:
             break
         s = s2
 
-    # Remove trailing commas before closing braces/brackets
     s = _TRAILING_COMMA_RE.sub(r"\1", s)
     return s
 
 
 async def get_alert_text_from_request(request: Request) -> str:
-    """
-    Returns:
-      - plain text if client posted text/plain
-      - a JSON string if client posted application/json
-    """
     try:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -212,144 +179,164 @@ def _as_float(v: Any) -> Optional[float]:
         return None
 
 
+def _as_int(v: Any) -> Optional[int]:
+    try:
+        if v is None or v == "":
+            return None
+        return int(float(v))
+    except Exception:
+        return None
+
+
 def _norm_side(side_raw: str) -> Optional[str]:
-    """
-    Normalize side/bias inputs to internal "CALL" / "PUT".
-    Supports Pine formats (CALLS/PUTS) and legacy synonyms.
-    """
     s = (side_raw or "").upper().strip()
-
-    # Pine plural forms
-    if s in ("CALLS", "CALL"):
+    if s in ("CALL", "CALLS", "BUY", "LONG", "BULL"):
         return "CALL"
-    if s in ("PUTS", "PUT"):
+    if s in ("PUT", "PUTS", "SELL", "SHORT", "BEAR"):
         return "PUT"
+    return None
 
-    # Legacy synonyms
-    if s in ("BUY", "LONG", "BULL", "BULLISH"):
-        return "CALL"
-    if s in ("SELL", "SHORT", "BEAR", "BEARISH"):
-        return "PUT"
+
+def _next_friday(d: date) -> date:
+    return d + timedelta(days=(4 - d.weekday()) % 7)
+
+
+def same_week_friday(d: date) -> date:
+    base_monday = d - timedelta(days=d.weekday())
+    return base_monday + timedelta(days=4)
+
+
+def two_weeks_friday(d: date) -> date:
+    return _next_friday(d) + timedelta(days=7)
+
+
+def _expiry_from_mode(mode: str, *, ref_dt: Optional[datetime] = None) -> Optional[str]:
+    m = (mode or "").strip().lower()
+    now = (ref_dt or market_now()).date()
+
+    if not m:
+        return None
+
+    if "next friday" in m:
+        return _next_friday(now).isoformat()
+    if "same week" in m and "friday" in m:
+        return same_week_friday(now).isoformat()
+    if "two weeks" in m and "friday" in m:
+        return two_weeks_friday(now).isoformat()
+
+    # direct ISO date?
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", mode.strip()):
+        return mode.strip()
+
+    return None
+
+
+def _time_to_iso(payload_time: Any) -> Optional[str]:
+    """
+    Accept TradingView 'time' as:
+      - epoch millis string/number: "1709857200000"
+      - epoch seconds: 1709857200
+      - already ISO string
+    """
+    if payload_time is None:
+        return None
+
+    if isinstance(payload_time, str) and re.match(r"^\d{10,13}$", payload_time.strip()):
+        n = int(payload_time.strip())
+        if n > 10_000_000_000:  # millis
+            dt = datetime.fromtimestamp(n / 1000.0, tz=timezone.utc)
+        else:  # seconds
+            dt = datetime.fromtimestamp(n, tz=timezone.utc)
+        return dt.isoformat()
+
+    if isinstance(payload_time, (int, float)):
+        n = int(payload_time)
+        if n > 10_000_000_000:
+            dt = datetime.fromtimestamp(n / 1000.0, tz=timezone.utc)
+        else:
+            dt = datetime.fromtimestamp(n, tz=timezone.utc)
+        return dt.isoformat()
+
+    if isinstance(payload_time, str):
+        s = payload_time.strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}T", s):
+            return s
 
     return None
 
 
 def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normalizes multiple TradingView/Pine schemas into your internal alert dict.
+    Normalizes multiple webhook schemas into the engine's internal alert shape.
 
-    Required output keys (engine expects these):
-      - side: "CALL" or "PUT"
-      - symbol: underlying symbol
-      - underlying_price_from_alert: float
-
-    Optional:
-      - strike, expiry (YYYY-MM-DD)
-      - plus pass-through fields used by LLM/telegram
+    Supports your new TradingView JSON:
+      {
+        "src":"tv_pine",
+        "symbol":"SPY",
+        "optionType":"PUTS",
+        "price":512.34,
+        "time":"1709857200000",
+        "optionsHint": { "strike":512, "expiryMode":"Next Friday" },
+        ...
+      }
     """
-
-    # -----------------------------
-    # tv_pine schema (new format)
-    # -----------------------------
-    src = str(payload.get("src") or payload.get("source") or "").strip().lower()
-    if src == "tv_pine" or ("optionType" in payload and "symbol" in payload and "price" in payload):
-        side = _norm_side(str(payload.get("optionType") or ""))
-        symbol = str(payload.get("symbol") or "").upper().strip()
-        px = _as_float(payload.get("price"))
-
-        if not side or not symbol or px is None:
-            return None
-
-        out: Dict[str, Any] = {
-            "side": side,
-            "symbol": symbol,
-            "underlying_price_from_alert": px,
-            "source": payload.get("src") or payload.get("source") or "tv_pine",
-            "chart_tf": str(payload.get("tf") or "").strip() or None,
-            "bias": payload.get("bias"),
-            "score": payload.get("score"),
-            "tier": payload.get("tier"),
-            "tv_time": payload.get("time"),  # raw TV timestamp (ms)
-        }
-
-        # optionsHint -> strike/expiry (best-effort)
-        hint = payload.get("optionsHint") or {}
-        if isinstance(hint, dict):
-            strike = _as_float(hint.get("strike"))
-            if strike is not None:
-                out["strike"] = strike
-
-            expiry_mode = str(hint.get("expiryMode") or "").strip().lower()
-            try:
-                today = market_now().date()
-                if "next friday" in expiry_mode:
-                    out["expiry"] = str(_next_friday(today))
-                elif "same week" in expiry_mode:
-                    out["expiry"] = str(same_week_friday(today))
-                elif "two week" in expiry_mode or "2 week" in expiry_mode:
-                    out["expiry"] = str(two_weeks_friday(today))
-            except Exception:
-                # don't fail parsing if date math fails
-                pass
-
-            # delta bounds are useful for LLM context
-            if hint.get("deltaMin") is not None:
-                out["deltaMin"] = hint.get("deltaMin")
-            if hint.get("deltaMax") is not None:
-                out["deltaMax"] = hint.get("deltaMax")
-
-        # Pass-through Pine fields (great for LLM + Telegram context)
-        passthru_keys = [
-            "vwap", "ema9", "ema21", "adx", "volSpike",
-            "orbH", "orbL", "orbRange", "atr",
-            "sl", "tp", "rr",
-            "mtfMode", "mtfExecTF", "mtfConfTF",
-            "mtfExecLong", "mtfConfLong", "mtfExecShort", "mtfConfShort",
-        ]
-        for k in passthru_keys:
-            if k in payload:
-                out[k] = payload.get(k)
-
-        # Enforce strike if configured (options-only mode)
-        if out.get("strike") is None and not ALLOW_NO_STRIKE_JSON:
-            return None
-
-        return out
-
-    # -----------------------------
-    # Existing/legacy schemas (original behavior)
-    # -----------------------------
-    side = _norm_side(str(payload.get("side") or payload.get("type") or payload.get("signal") or ""))
     symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("underlying") or "").upper().strip()
+    if not symbol:
+        return None
 
+    # side from either old keys or your new key "optionType"
+    side = _norm_side(str(payload.get("side") or payload.get("type") or payload.get("signal") or payload.get("optionType") or ""))
     px = _as_float(payload.get("price") if payload.get("price") is not None else payload.get("last"))
-    strike = _as_float(payload.get("strike"))
-    expiry = str(payload.get("expiry") or "").strip()
 
-    # must have at least side+symbol+price
-    if not side or not symbol or px is None:
+    if not side or px is None:
         return None
 
     out: Dict[str, Any] = {
         "side": side,
         "symbol": symbol,
         "underlying_price_from_alert": px,
+        "src": payload.get("src") or "webhook",
     }
 
-    # Optional options fields
+    # --- strike/expiry: support direct + optionsHint ---
+    strike = _as_float(payload.get("strike"))
+    expiry = str(payload.get("expiry") or "").strip()
+
+    options_hint = payload.get("optionsHint") if isinstance(payload.get("optionsHint"), dict) else {}
+    if strike is None and isinstance(options_hint, dict):
+        strike = _as_float(options_hint.get("strike"))
+    if (not expiry) and isinstance(options_hint, dict):
+        expiry = str(_expiry_from_mode(str(options_hint.get("expiryMode") or "")) or "").strip()
+
     if strike is not None:
         out["strike"] = strike
     if re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
         out["expiry"] = expiry
 
-    # IMPORTANT: keep meta keys in the same names your processor/llm expect
-    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
-        if payload.get(k) is not None:
+    # --- normalize TV time ---
+    t_iso = _time_to_iso(payload.get("time"))
+    if t_iso:
+        out["time_iso"] = t_iso
+    if payload.get("time") is not None:
+        out["time"] = payload.get("time")
+
+    # --- keep important TV fields for LLM + Telegram ---
+    passthru_keys = [
+        "bias", "tf", "score", "tier",
+        "vwap", "ema9", "ema21", "adx", "volSpike",
+        "orbH", "orbL", "orbRange", "atr",
+        "sl", "tp", "rr",
+        "mtfMode", "mtfExecTF", "mtfConfTF",
+        "mtfExecLong", "mtfConfLong", "mtfExecShort", "mtfConfShort",
+        "optionsHint",
+    ]
+    for k in passthru_keys:
+        if k in payload:
             out[k] = payload.get(k)
 
-    # pass-through other useful fields (if present)
-    for k in ("adx", "relVol", "relvol", "chop", "tp1", "tp2", "tp3", "trail", "fast_stop", "ason", "bp", "ats"):
-        if k in payload:
+    # Back-compat meta keys your engine might already use
+    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
+        if payload.get(k) is not None:
             out[k] = payload.get(k)
 
     if out.get("strike") is None and not ALLOW_NO_STRIKE_JSON:
@@ -359,11 +346,9 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
 
 
 def parse_alert_text(text: str) -> Dict[str, Any]:
-    # 0) unwrap if the payload is a JSON string containing JSON (double-encoded)
     text = _maybe_unwrap_json_string(text)
     text = (text or "").strip()
 
-    # 1) Plain-text patterns first
     m = ALERT_RE_WITH_EXP.match(text)
     if m:
         side, symbol, ul, strike, exp = m.groups()
@@ -384,17 +369,13 @@ def parse_alert_text(text: str) -> Dict[str, Any]:
             "strike": float(strike),
         }
 
-    # 2) Accept JSON payloads from TradingView/Pine webhook directly (with salvage).
-    # NOTE: don't require '}' because some payloads are double-encoded or truncated in logs.
     if "{" in text:
         try:
             fixed = _salvage_json_text(_balance_braces(text))
             payload = json.loads(fixed)
 
-            # If we got a JSON string (double-encoded) even after unwrap, decode once more.
             if isinstance(payload, str):
-                payload2 = json.loads(_salvage_json_text(_balance_braces(payload)))
-                payload = payload2
+                payload = json.loads(_salvage_json_text(_balance_braces(payload)))
 
             if isinstance(payload, dict):
                 parsed = _parse_alert_json_payload(payload)
@@ -419,19 +400,6 @@ def round_strike_to_common_increment(val: float) -> float:
     else:
         step = 10
     return round(round(val / step) * step, 2)
-
-
-def _next_friday(d: date) -> date:
-    return d + timedelta(days=(4 - d.weekday()) % 7)
-
-
-def same_week_friday(d: date) -> date:
-    base_monday = d - timedelta(days=d.weekday())
-    return base_monday + timedelta(days=4)
-
-
-def two_weeks_friday(d: date) -> date:
-    return _next_friday(d) + timedelta(days=7)
 
 
 def is_same_week(a: date, b: date) -> bool:
@@ -502,7 +470,7 @@ def preflight_ok(f: Dict[str, Any]) -> Tuple[bool, Dict[str, bool]]:
 
 
 # =========================
-# Telegram composition (restored)
+# Telegram composition
 # =========================
 def _fmt(v: Any, nd: int = 2) -> str:
     if v is None:
@@ -540,36 +508,31 @@ def compose_telegram_text(
     rating: Optional[str] = None,
     diff_note: str = "",
 ) -> str:
-    """
-    Backward-compatible Telegram composer expected by engine_logic/engine_processor.
-
-    Works for:
-      - option alerts (strike/expiry present)
-      - equity-only alerts (strike/expiry missing)
-      - enriched TV JSON (event/model/reason/etc.)
-    """
     sym = str(alert.get("symbol") or alert.get("ticker") or "").upper()
     side = str(alert.get("side") or "").upper()
-    event = str(alert.get("event") or alert.get("alert_event") or "").strip().lower()
-    model = str(alert.get("model") or alert.get("alert_model") or "").strip()
 
-    ul_px = alert.get("underlying_price_from_alert") or alert.get("price") or f.get("last") or f.get("mid")
-    strike = alert.get("strike")
-    expiry = alert.get("expiry")
+    # Prefer TV schema fields if present
+    bias = str(alert.get("bias") or "").upper().strip()
+    tier = str(alert.get("tier") or "").upper().strip()
+    tv_score = alert.get("score")
 
     decision = str(llm.get("decision") or "wait").upper()
     conf = llm.get("confidence")
     reason = (llm.get("reason") or llm_reason or "").strip()
 
-    # Core header
+    ul_px = alert.get("underlying_price_from_alert") or alert.get("price") or f.get("last") or f.get("mid")
+    strike = alert.get("strike")
+    expiry = alert.get("expiry")
+
     hdr_bits = [decision, sym, side]
-    if event:
-        hdr_bits.append(f"({event})")
+    if bias:
+        hdr_bits.append(f"({bias})")
+    if tier:
+        hdr_bits.append(f"[{tier}]")
     if rating:
         hdr_bits.append(f"[{rating}]")
     header = " ".join([x for x in hdr_bits if x])
 
-    # Price/contract line
     contract_bits = [f"Price: {_fmt(ul_px, 2)}"]
     if strike is not None:
         contract_bits.append(f"Strike: {_fmt(strike, 2)}")
@@ -579,60 +542,35 @@ def compose_telegram_text(
         contract_bits.append(f"OCC: {option_ticker}")
     contract_line = " | ".join(contract_bits)
 
-    # Market/TA snippets (best effort)
-    last_ = f.get("last", ul_px)
-    bid = f.get("bid")
-    ask = f.get("ask")
-    mid = f.get("mid")
-    spr = f.get("option_spread_pct")
-    chg = f.get("quote_change_pct")
-    rsi = f.get("rsi14")
-    ema20, ema50 = f.get("ema20"), f.get("ema50")
-    vwap = f.get("vwap")
-    vwap_dist = f.get("vwap_dist")
-    orb_h, orb_l = f.get("orb15_high"), f.get("orb15_low")
-    mtf = f.get("mtf_align")
-    regime = f.get("regime_flag")
+    score_line_bits = []
+    if tv_score is not None:
+        score_line_bits.append(f"TVScore: {_fmt(tv_score, 0)}")
+    if score is not None:
+        score_line_bits.append(f"Score: {_fmt(score, 1)}")
+    if conf is not None:
+        score_line_bits.append(f"Conf: {_fmt(conf, 2)}")
+    score_line = " | ".join(score_line_bits) if score_line_bits else ""
 
-    mkt_parts = []
-    if bid is not None and ask is not None:
-        mkt_parts.append(f"Bid/Ask: {_fmt(bid,2)}/{_fmt(ask,2)}")
-    if mid is not None:
-        mkt_parts.append(f"Mid: {_fmt(mid,2)}")
-    if spr is not None:
-        mkt_parts.append(f"Spr: {_fmt_pct(spr,2)}")
-    if chg is not None:
-        mkt_parts.append(f"Δ%: {_fmt(chg,2)}")
-    mkt_line = " | ".join(mkt_parts) if mkt_parts else ""
+    # add TV indicators if present
+    tv_bits = []
+    for k, label, nd in [
+        ("vwap", "VWAP", 2),
+        ("ema9", "EMA9", 2),
+        ("ema21", "EMA21", 2),
+        ("adx", "ADX", 1),
+        ("atr", "ATR", 2),
+    ]:
+        if alert.get(k) is not None:
+            tv_bits.append(f"{label}: {_fmt(float(alert.get(k)), nd)}")
+    if isinstance(alert.get("volSpike"), bool):
+        tv_bits.append(f"VolSpike: {'YES' if alert.get('volSpike') else 'NO'}")
+    tv_line = " | ".join(tv_bits) if tv_bits else ""
 
-    ta_parts = []
-    if rsi is not None:
-        ta_parts.append(f"RSI14: {_fmt(rsi,1)}")
-    if ema20 is not None and ema50 is not None and last_ is not None:
-        ta_parts.append(f"EMA20/50: {_fmt(ema20,2)}/{_fmt(ema50,2)}")
-    if vwap is not None:
-        ta_parts.append(f"VWAP: {_fmt(vwap,2)}")
-    if vwap_dist is not None:
-        ta_parts.append(f"VWAPΔ: {_fmt(vwap_dist,2)}%")
-    if orb_h is not None or orb_l is not None:
-        ta_parts.append(f"ORB15 H/L: {_fmt(orb_h,2)}/{_fmt(orb_l,2)}")
-    if isinstance(mtf, bool):
-        ta_parts.append(f"MTF: {'OK' if mtf else 'NO'}")
-    if regime:
-        ta_parts.append(f"Regime: {regime}")
-    ta_line = " | ".join(ta_parts) if ta_parts else ""
-
-    # Score line (optional)
-    score_line = ""
-    if score is not None or conf is not None or model:
-        bits = []
-        if score is not None:
-            bits.append(f"Score: {_fmt(score,1)}")
-        if conf is not None:
-            bits.append(f"Conf: {_fmt(conf,2)}")
-        if model:
-            bits.append(f"Model: {model}")
-        score_line = " | ".join(bits)
+    risk_bits = []
+    for k, label in [("sl", "SL"), ("tp", "TP"), ("rr", "RR")]:
+        if alert.get(k) is not None:
+            risk_bits.append(f"{label}: {_fmt(alert.get(k), 2)}")
+    risk_line = " | ".join(risk_bits) if risk_bits else ""
 
     note = diff_note.strip()
     if note:
@@ -641,10 +579,10 @@ def compose_telegram_text(
     lines = [header, contract_line]
     if score_line:
         lines.append(score_line)
-    if mkt_line:
-        lines.append(mkt_line)
-    if ta_line:
-        lines.append(ta_line)
+    if tv_line:
+        lines.append(tv_line)
+    if risk_line:
+        lines.append(risk_line)
     if reason:
         lines.append(reason)
 
