@@ -5,17 +5,19 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import httpx
 
-log = logging.getLogger("trading_engine.data")
+from engine_common import build_option_contract  # uses your existing helper
+
+# Use BOTH names so existing code that expects logger/log works
+logger = logging.getLogger("trading_engine.polygon")
+log = logger
 
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
 POLYGON_BASE_URL = (os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/"))
 
-MASSIVE_API_KEY = (os.getenv("MASSIVE_API_KEY", "") or "").strip()
-MASSIVE_BASE_URL = (os.getenv("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/"))
 
 @dataclass
 class _CacheItem:
@@ -36,10 +38,10 @@ class PolygonClient:
     def __init__(self, http_client: httpx.AsyncClient, api_key: Optional[str] = None) -> None:
         self.http = http_client
         self.api_key = (api_key or POLYGON_API_KEY or "").strip()
-        self.base = "https://api.polygon.io"
+        self.base = POLYGON_BASE_URL
 
         # keep calls under control
-        self._sem = asyncio.Semaphore(int((__import__("os").getenv("POLYGON_MAX_CONCURRENCY", "3")).strip() or 3))
+        self._sem = asyncio.Semaphore(int(os.getenv("POLYGON_MAX_CONCURRENCY", "3").strip() or 3))
 
         # simple in-memory cache (per process)
         self._cache: Dict[str, _CacheItem] = {}
@@ -48,9 +50,9 @@ class PolygonClient:
         self._blocked_until: Dict[str, float] = {}
 
         # retry config
-        self._max_429_retries = int((__import__("os").getenv("POLYGON_429_RETRIES", "4")).strip() or 4)
-        self._base_backoff = float((__import__("os").getenv("POLYGON_429_BACKOFF", "0.7")).strip() or 0.7)
-        self._block_cooldown_s = float((__import__("os").getenv("POLYGON_403_COOLDOWN", "1800")).strip() or 1800.0)
+        self._max_429_retries = int(os.getenv("POLYGON_429_RETRIES", "4").strip() or 4)
+        self._base_backoff = float(os.getenv("POLYGON_429_BACKOFF", "0.7").strip() or 0.7)
+        self._block_cooldown_s = float(os.getenv("POLYGON_403_COOLDOWN", "1800").strip() or 1800.0)
 
     @property
     def enabled(self) -> bool:
@@ -74,7 +76,6 @@ class PolygonClient:
 
     def _blocked_key(self, path: str, symbol: Optional[str]) -> str:
         sym = (symbol or "").upper()
-        # group by endpoint type, not by full query string
         return f"{sym}:{path}"
 
     def _is_blocked(self, path: str, symbol: Optional[str]) -> bool:
@@ -105,7 +106,8 @@ class PolygonClient:
         async with self._sem:
             r = await self.http.get(url, params=q, timeout=timeout)
         r.raise_for_status()
-        return r.json()
+        js = r.json()
+        return js if isinstance(js, dict) else {}
 
     async def _get_soft(
         self,
@@ -128,9 +130,8 @@ class PolygonClient:
         if self._is_blocked(path, sym):
             return {}
 
-        ck = cache_key
-        if cache_ttl_s > 0 and ck:
-            hit = self._cache_get(ck)
+        if cache_ttl_s > 0 and cache_key:
+            hit = self._cache_get(cache_key)
             if hit is not None:
                 return hit
 
@@ -139,8 +140,8 @@ class PolygonClient:
             attempt += 1
             try:
                 js = await self._get(path, params=params, timeout=timeout)
-                if cache_ttl_s > 0 and ck:
-                    return self._cache_set(ck, js, cache_ttl_s)
+                if cache_ttl_s > 0 and cache_key:
+                    return self._cache_set(cache_key, js, cache_ttl_s)
                 return js
 
             except httpx.HTTPStatusError as e:
@@ -160,10 +161,16 @@ class PolygonClient:
                 # rate limit retry
                 if code == 429:
                     if attempt >= self._max_429_retries:
-                        logger.warning("%s 429 rate limited (attempt=%d/%d) path=%s", log_prefix, attempt, self._max_429_retries, path)
+                        logger.warning(
+                            "%s 429 rate limited (attempt=%d/%d) path=%s",
+                            log_prefix, attempt, self._max_429_retries, path,
+                        )
                         return {}
                     sleep_s = (self._base_backoff * (2 ** (attempt - 1))) + random.uniform(0.0, 0.35)
-                    logger.warning("%s 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs", log_prefix, attempt, self._max_429_retries, path, sleep_s)
+                    logger.warning(
+                        "%s 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs",
+                        log_prefix, attempt, self._max_429_retries, path, sleep_s,
+                    )
                     await asyncio.sleep(sleep_s)
                     continue
 
@@ -184,7 +191,7 @@ class PolygonClient:
             path,
             symbol=sym,
             log_prefix="[polygon] snapshot",
-            cache_ttl_s=8.0,  # snapshot can be cached briefly
+            cache_ttl_s=8.0,
             cache_key=f"snap:{sym}",
         )
         return js.get("ticker") or {}
@@ -233,9 +240,6 @@ class PolygonClient:
         sort: str = "asc",
         cache_ttl_s: float = 0.0,
     ) -> List[Dict[str, Any]]:
-        """
-        Windowed aggs fetch. Use this instead of the huge 2020-2100 range.
-        """
         sym = symbol.upper()
         path = f"/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}/{from_}/{to}"
         js = await self._get_soft(
@@ -246,27 +250,6 @@ class PolygonClient:
             log_prefix="[polygon] aggs",
             cache_ttl_s=cache_ttl_s,
             cache_key=f"aggs:{sym}:{multiplier}:{timespan}:{from_}:{to}:{limit}",
-        )
-        return js.get("results") or []
-
-    async def get_aggregates(
-        self,
-        symbol: str,
-        multiplier: int = 5,
-        timespan: str = "minute",
-        limit: int = 5000,
-    ) -> List[Dict[str, Any]]:
-        """
-        Kept for compatibility, but internally should prefer get_aggs_window().
-        """
-        sym = symbol.upper()
-        path = f"/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}/2020-01-01/2100-01-01"
-        js = await self._get_soft(
-            path,
-            params={"adjusted": "true", "sort": "asc", "limit": limit},
-            timeout=8.0,
-            symbol=sym,
-            log_prefix="[polygon] aggs_wide",
         )
         return js.get("results") or []
 
@@ -317,18 +300,10 @@ class PolygonClient:
         v = vals[0].get(field)
         return float(v) if isinstance(v, (int, float)) else None
 
-    async def get_technicals_bundle(
-        self,
-        symbol: str,
-        *,
-        timespan: str = "minute",
-    ) -> Dict[str, Optional[float]]:
+    async def get_technicals_bundle(self, symbol: str, *, timespan: str = "minute") -> Dict[str, Optional[float]]:
         """
         Indicator bundle.
-        ✅ MACD is fetched ONCE and we extract (value, signal, histogram) from the same response.
-        Caching:
-          - minute: ~60s
-          - day:    ~15m
+        MACD is fetched ONCE and we extract (value, signal, histogram) from the same response.
         """
         ttl = 60.0 if timespan == "minute" else 900.0
 
@@ -441,25 +416,7 @@ class PolygonClient:
         except Exception as e:
             logger.debug("[polygon] targeted option context failed for %s: %r", sym, e)
             return {}
-        p = dict(params or {})
-        p["apiKey"] = MASSIVE_API_KEY
-        url = f"{MASSIVE_BASE_URL}{path}"
-        r = await self.http.get(url, params=p, timeout=timeout)
-        r.raise_for_status()
-        js = r.json()
-        return js if isinstance(js, dict) else {}
 
-    async def get_last_trade(self, symbol: str) -> Dict[str, Any]:
-        # Example (you already tried):
-        # GET /v2/last/trade/NVDA?apiKey=...
-        js = await self._get(f"/v2/last/trade/{symbol}")
-        # Normalize
-        # Try common shapes:
-        # { "symbol":"NVDA","price":..., "timestamp":... } OR { "results": { "p": ... } }
-        if "price" in js:
-            return {"price": js.get("price"), "ts": js.get("timestamp")}
-        res = js.get("results") or js.get("result") or {}
-        return {"price": res.get("p") or res.get("price"), "ts": res.get("t")}
 
 def polygon_enabled() -> bool:
     return bool((POLYGON_API_KEY or "").strip())
