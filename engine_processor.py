@@ -56,11 +56,13 @@ def _cache_set(key: str, val: Any, ttl_s: float) -> Any:
     return val
 
 
-async def _cached(key: str, ttl_s: float, coro: Awaitable[Any]) -> Any:
+# ✅ IMPORTANT FIX:
+# Accept a coroutine *factory* so we don't create an un-awaited coroutine on cache hit.
+async def _cached(key: str, ttl_s: float, coro_factory: Callable[[], Awaitable[Any]]) -> Any:
     hit = _cache_get(key)
     if hit is not None:
         return hit
-    val = await coro
+    val = await coro_factory()
     return _cache_set(key, val, ttl_s)
 
 
@@ -349,17 +351,12 @@ async def _fetch_polygon_features(
     to_iso = (today + timedelta(days=2)).isoformat()
 
     # ---- tight windows (reduce load + reduce 429 chance) ----
-    # 5m bars: last ~7 trading days is enough for intraday context
     from_5m = (today - timedelta(days=10)).isoformat()
-    # 15m bars: last ~14 days
     from_15m = (today - timedelta(days=18)).isoformat()
-    # 1h bars: last ~35 days
     from_h1 = (today - timedelta(days=40)).isoformat()
-    # daily: last ~260 trading days (you were already doing ~220)
     from_d = (today - timedelta(days=320)).isoformat()
 
     # ---- engine TTL cache keys (avoid refetching on repeated alerts) ----
-    # minute indicators are already cached inside PolygonClient, but caching here prevents even trying again on bursts
     k_snap = f"poly:snap:{sym}"
     k_quote = f"poly:quote:{sym}"
     k_trade = f"poly:trade:{sym}"
@@ -382,17 +379,25 @@ async def _fetch_polygon_features(
     TTL_TECH_D = 900.0
 
     # ---- tasks (each guarded + cached) ----
-    snap_task = _safe_call("snapshot", _cached(k_snap, TTL_SNAP, pc.get_stock_snapshot(sym)), {})
-    quote_task = _safe_call("last_quote", _cached(k_quote, TTL_QUOTE, pc.get_last_quote(sym)), {})
-    trade_task = _safe_call("last_trade", _cached(k_trade, TTL_TRADE, pc.get_last_trade(sym)), {})
+    # ✅ FIXED: pass coroutine factories to _cached()
+    snap_task = _safe_call("snapshot", _cached(k_snap, TTL_SNAP, lambda: pc.get_stock_snapshot(sym)), {})
+    quote_task = _safe_call("last_quote", _cached(k_quote, TTL_QUOTE, lambda: pc.get_last_quote(sym)), {})
+    trade_task = _safe_call("last_trade", _cached(k_trade, TTL_TRADE, lambda: pc.get_last_trade(sym)), {})
 
-    # ✅ windowed aggs
     agg5m_task = _safe_call(
         "aggs_5m",
         _cached(
             k_aggs5m,
             TTL_AGGS_5M,
-            pc.get_aggs_window(sym, multiplier=5, timespan="minute", from_=from_5m, to=to_iso, limit=600, cache_ttl_s=20.0),
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=5,
+                timespan="minute",
+                from_=from_5m,
+                to=to_iso,
+                limit=600,
+                cache_ttl_s=20.0,
+            ),
         ),
         [],
     )
@@ -401,7 +406,15 @@ async def _fetch_polygon_features(
         _cached(
             k_aggs15m,
             TTL_AGGS_15M,
-            pc.get_aggs_window(sym, multiplier=15, timespan="minute", from_=from_15m, to=to_iso, limit=1200, cache_ttl_s=60.0),
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=15,
+                timespan="minute",
+                from_=from_15m,
+                to=to_iso,
+                limit=1200,
+                cache_ttl_s=60.0,
+            ),
         ),
         [],
     )
@@ -410,7 +423,15 @@ async def _fetch_polygon_features(
         _cached(
             k_aggsh1,
             TTL_AGGS_H1,
-            pc.get_aggs_window(sym, multiplier=1, timespan="hour", from_=from_h1, to=to_iso, limit=800, cache_ttl_s=300.0),
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=1,
+                timespan="hour",
+                from_=from_h1,
+                to=to_iso,
+                limit=800,
+                cache_ttl_s=300.0,
+            ),
         ),
         [],
     )
@@ -419,21 +440,40 @@ async def _fetch_polygon_features(
         _cached(
             k_aggsd,
             TTL_AGGS_D,
-            pc.get_aggs_window(sym, multiplier=1, timespan="day", from_=from_d, to=to_iso, limit=260, cache_ttl_s=900.0),
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=1,
+                timespan="day",
+                from_=from_d,
+                to=to_iso,
+                limit=260,
+                cache_ttl_s=900.0,
+            ),
         ),
         [],
     )
 
-    # ✅ intraday + daily technicals (cached in PolygonClient + here)
-    tech_task = _safe_call("techs_m", _cached(k_techm, TTL_TECH_M, pc.get_technicals_bundle(sym, timespan="minute")), {})
-    tech_d_task = _safe_call("techs_d", _cached(k_techd, TTL_TECH_D, pc.get_technicals_daily_bundle(sym)), {})
+    tech_task = _safe_call(
+        "techs_m",
+        _cached(k_techm, TTL_TECH_M, lambda: pc.get_technicals_bundle(sym, timespan="minute")),
+        {},
+    )
+    tech_d_task = _safe_call(
+        "techs_d",
+        _cached(k_techd, TTL_TECH_D, lambda: pc.get_technicals_daily_bundle(sym)),
+        {},
+    )
 
     # options context only when applicable
     if expiry_iso and side and (strike is not None):
         k_opt = f"poly:optctx:{sym}:{expiry_iso}:{side}:{strike}"
         opt_task: Awaitable[Dict[str, Any]] = _safe_call(
             "opt_ctx",
-            _cached(k_opt, 10.0, pc.get_targeted_option_context(sym, expiry_iso=expiry_iso, side=side, strike=strike)),
+            _cached(
+                k_opt,
+                10.0,
+                lambda: pc.get_targeted_option_context(sym, expiry_iso=expiry_iso, side=side, strike=strike),
+            ),
             {},
         )
     else:
@@ -452,7 +492,6 @@ async def _fetch_polygon_features(
         m15_task,
     )
 
-    # If literally everything failed, return {}
     if not any([stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars]):
         return {}
 
@@ -528,15 +567,12 @@ async def _fetch_polygon_features(
             except Exception:
                 pass
 
-    # merge intraday indicators
     if isinstance(techs, dict) and techs:
         out.update({k: v for k, v in techs.items() if v is not None})
 
-    # merge daily indicators (suffixed)
     if isinstance(techs_d, dict) and techs_d:
         out.update({k: v for k, v in techs_d.items() if v is not None})
 
-    # daily bias helper
     try:
         lp = float(out["last"]) if out.get("last") is not None else None
         ema20_d = out.get("ema20_d")
