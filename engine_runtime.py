@@ -2,6 +2,7 @@
 import os
 import asyncio
 import logging
+import json
 from typing import Dict, Any
 import httpx
 
@@ -20,13 +21,41 @@ HTTP: httpx.AsyncClient | None = None
 WORK_Q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1000)
 WORKER_COUNT = 0
 
+
 def get_http_client() -> httpx.AsyncClient | None:
     return HTTP
+
 
 def get_worker_stats() -> Dict[str, Any]:
     return {"queue_size": WORK_Q.qsize(), "queue_maxsize": WORK_Q.maxsize, "workers": WORKER_COUNT}
 
-def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
+
+def _preview(obj: Any, n: int = 200) -> str:
+    """
+    Safe preview for logging.
+    Handles dict/list payloads (TradingView JSON) and strings.
+    Never throws.
+    """
+    try:
+        if isinstance(obj, (dict, list)):
+            s = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        elif obj is None:
+            s = ""
+        else:
+            s = str(obj)
+    except Exception:
+        s = str(obj)
+    return s[:n]
+
+
+def enqueue_webhook_job(alert_text: Any, flags: Dict[str, Any]) -> bool:
+    """
+    Enqueue a webhook job.
+
+    NOTE:
+      - alert_text can be dict (preferred; parsed JSON), or string.
+      - returns bool (sync) so routes.py must NOT await it.
+    """
     job = {"alert_text": alert_text, "flags": flags}
     try:
         WORK_Q.put_nowait(job)
@@ -36,8 +65,9 @@ def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
         logger.warning("enqueue failed: queue full")
         return False
 
+
 # ----- lifecycle -----
-async def startup():
+async def startup() -> None:
     global HTTP, WORKER_COUNT
     HTTP = httpx.AsyncClient(
         http2=True,
@@ -49,21 +79,24 @@ async def startup():
         asyncio.create_task(_worker())
     logger.info("startup complete; HTTP ready; workers=%d", WORKER_COUNT)
 
-async def shutdown():
+
+async def shutdown() -> None:
     global HTTP
     if HTTP:
         await HTTP.aclose()
         HTTP = None
         logger.info("shutdown complete; HTTP closed")
 
+
 # ----- worker loop -----
-async def _worker():
+async def _worker() -> None:
     logger.info("worker task started")
     from engine_logic import process_tradingview_job
+
     while True:
         job = await WORK_Q.get()
         try:
-            logger.info("processing alert job: %s", (job.get("alert_text") or "")[:200])
+            logger.info("processing alert job: %s", _preview(job.get("alert_text")))
             await process_tradingview_job(job)
             logger.info("job processed")
         except Exception as e:
@@ -71,8 +104,11 @@ async def _worker():
         finally:
             WORK_Q.task_done()
 
+
 __all__ = [
-    "startup", "shutdown",
-    "enqueue_webhook_job", "get_worker_stats",
+    "startup",
+    "shutdown",
+    "enqueue_webhook_job",
+    "get_worker_stats",
     "get_http_client",
 ]
