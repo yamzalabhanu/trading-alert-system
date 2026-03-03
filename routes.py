@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 import trading_engine as engine
 
+# Optional helpers (don’t crash if not present in your repo)
 with suppress(Exception):
     from volume_scanner import run_scanner_loop  # type: ignore
 with suppress(Exception):
@@ -31,15 +32,18 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 router = APIRouter()
 
 
+# ---------------- Env helpers ----------------
 def _truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
 
 
+# ---------------- Window enforcement ----------------
 ENFORCE_WINDOW = _truthy(os.getenv("ENFORCE_WINDOW", "1"))
-WINDOW_TZ = os.getenv("WINDOW_TZ", "America/Denver")
-WINDOW_START = os.getenv("WINDOW_START", "10:30")
-WINDOW_END = os.getenv("WINDOW_END", "14:00")
+WINDOW_TZ = os.getenv("WINDOW_TZ", "America/Denver")  # MDT/Denver
+WINDOW_START = os.getenv("WINDOW_START", "10:30")     # HH:MM
+WINDOW_END = os.getenv("WINDOW_END", "14:00")         # HH:MM
 
+# Prefer shared helper if available
 with suppress(Exception):
     from engine_common import window_ok_now  # type: ignore
 with suppress(Exception):
@@ -52,9 +56,11 @@ def _window_ok() -> bool:
             return bool(window_ok_now(WINDOW_START, WINDOW_END, WINDOW_TZ))
         except Exception:
             pass
+    # Fallback: don't block if we can't compute
     return True
 
 
+# ---------------- Background controllers ----------------
 _scanner_task: Optional[asyncio.Task] = None
 _reporter_task: Optional[asyncio.Task] = None
 
@@ -122,9 +128,11 @@ async def _stop_daily_reporter() -> None:
     log.info("daily reporter stopped")
 
 
+# ---------------- Lifecycle binding ----------------
 def bind_lifecycle(app: FastAPI) -> None:
     @app.on_event("startup")
     async def _startup() -> None:
+        # engine.startup may be sync or async depending on your facade
         if hasattr(engine, "startup") and callable(getattr(engine, "startup")):
             r = engine.startup()  # type: ignore
             if asyncio.iscoroutine(r):
@@ -144,6 +152,7 @@ def bind_lifecycle(app: FastAPI) -> None:
         log.info("shutdown complete")
 
 
+# ---------------- Routes ----------------
 @router.get("/health")
 async def health() -> Dict[str, Any]:
     info: Dict[str, Any] = {}
@@ -151,11 +160,16 @@ async def health() -> Dict[str, Any]:
         with suppress(Exception):
             r = engine.net_debug_info()  # type: ignore
             info = (await r) if asyncio.iscoroutine(r) else (r or {})
+    # include queue stats if available
+    if hasattr(engine, "get_worker_stats") and callable(getattr(engine, "get_worker_stats")):
+        with suppress(Exception):
+            info["workers"] = engine.get_worker_stats()  # type: ignore
     return {"ok": True, **(info or {})}
 
 
 @router.post("/webhook/tradingview")
 async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONResponse:
+    # parse JSON
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -170,26 +184,25 @@ async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONR
         "path": str(request.url.path),
     }
 
+    # enforce window unless bypassed
     if ENFORCE_WINDOW and not flags["bypass_window"]:
         if not _window_ok():
             return JSONResponse({"ok": False, "blocked": "outside_window", "bypass_window": False}, status_code=403)
 
-    # Preferred contract: enqueue_webhook_job(alert_text, flags) BUT it might be sync or async.
+    # Preferred contract: enqueue_webhook_job(alert_text, flags)
     enqueue_webhook = getattr(engine, "enqueue_webhook_job", None)
     if callable(enqueue_webhook):
         try:
-            res = enqueue_webhook(payload, flags)  # type: ignore[arg-type]
+            res = enqueue_webhook(payload, flags)  # may be bool or coroutine
             if asyncio.iscoroutine(res):
                 res = await res
-            # res is typically bool; we don't require it, but it's useful
             return JSONResponse({"ok": True, "enqueued": bool(res), "bypass_window": bool(bypass_window)})
         except Exception as e:
             log.exception("enqueue_webhook_job failed: %r", e)
             raise HTTPException(status_code=500, detail=f"enqueue_webhook_job failed: {e}")
 
-    # Fallback to older job-dict enqueue contracts
+    # Fallback to job-dict enqueue contracts if you ever add them back
     job = {"alert_text": payload, "flags": flags}
-
     enqueue_fn = None
     for name in ("enqueue", "enqueue_job", "enqueue_alert", "submit"):
         fn = getattr(engine, name, None)
@@ -200,13 +213,13 @@ async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONR
     if enqueue_fn is None:
         raise HTTPException(
             status_code=500,
-            detail="Engine enqueue function not found (expected enqueue_webhook_job or enqueue/enqueue_job/enqueue_alert/submit)",
+            detail="Engine enqueue function not found (expected enqueue_webhook_job)",
         )
 
     try:
-        res = enqueue_fn(job)  # type: ignore[misc]
-        if asyncio.iscoroutine(res):
-            await res
+        res2 = enqueue_fn(job)
+        if asyncio.iscoroutine(res2):
+            await res2
     except Exception as e:
         log.exception("enqueue failed: %r", e)
         raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
