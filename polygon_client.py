@@ -5,7 +5,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Callable, Awaitable
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -14,13 +14,11 @@ log = logging.getLogger("trading_engine.polygon")
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
 POLYGON_BASE_URL = (os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/"))
 
-
 # -----------------------------
 # Endpoint toggles (env)
 # -----------------------------
 def _truthy(v: str) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
-
 
 POLYGON_ENABLE_SNAPSHOT = _truthy(os.getenv("POLYGON_ENABLE_SNAPSHOT", "1"))
 POLYGON_ENABLE_NBBO = _truthy(os.getenv("POLYGON_ENABLE_NBBO", "1"))
@@ -29,10 +27,14 @@ POLYGON_ENABLE_AGGS = _truthy(os.getenv("POLYGON_ENABLE_AGGS", "1"))
 POLYGON_ENABLE_INDICATORS = _truthy(os.getenv("POLYGON_ENABLE_INDICATORS", "1"))
 POLYGON_ENABLE_OPTIONS = _truthy(os.getenv("POLYGON_ENABLE_OPTIONS", "1"))
 
-# If you’re on a plan that blocks snapshot/last/nbbo, set these to 0:
-#   POLYGON_ENABLE_SNAPSHOT=0
-#   POLYGON_ENABLE_NBBO=0
-#   POLYGON_ENABLE_LAST_TRADE=0
+# NEW: Prefer local TA derived from aggs to avoid /v1/indicators 429
+# Default ON.
+POLYGON_TECH_USE_LOCAL = _truthy(os.getenv("POLYGON_TECH_USE_LOCAL", "1"))
+# If local TA fails (not enough bars), optionally fallback to Polygon indicators
+POLYGON_TECH_FALLBACK_TO_API = _truthy(os.getenv("POLYGON_TECH_FALLBACK_TO_API", "0"))
+
+# NEW: when 429 happens on a path, back off and "block" that path for a bit
+POLYGON_429_COOLDOWN = float(os.getenv("POLYGON_429_COOLDOWN", "60") or 60.0)
 
 
 @dataclass
@@ -57,17 +59,16 @@ class PolygonClient:
         self.api_key = (api_key or POLYGON_API_KEY or "").strip()
         self.base = POLYGON_BASE_URL
 
-        max_conc = int((os.getenv("POLYGON_MAX_CONCURRENCY", "3") or "3").strip() or 3)
-        self._sem = asyncio.Semaphore(max_conc)
+        self._sem = asyncio.Semaphore(int(os.getenv("POLYGON_MAX_CONCURRENCY", "3")) or 3)
 
         self._cache: Dict[str, _CacheItem] = {}
         self._blocked_until: Dict[str, float] = {}
 
-        self._max_429_retries = int((os.getenv("POLYGON_429_RETRIES", "4") or "4").strip() or 4)
-        self._base_backoff = float((os.getenv("POLYGON_429_BACKOFF", "0.7") or "0.7").strip() or 0.7)
-        self._block_cooldown_s = float((os.getenv("POLYGON_403_COOLDOWN", "1800") or "1800").strip() or 1800.0)
+        self._max_429_retries = int(os.getenv("POLYGON_429_RETRIES", "3") or 3)
+        self._base_backoff = float(os.getenv("POLYGON_429_BACKOFF", "0.7") or 0.7)
+        self._block_cooldown_s = float(os.getenv("POLYGON_403_COOLDOWN", "1800") or 1800.0)
 
-        # inflight de-dupe (per client)
+        # inflight de-dupe
         self._inflight: Dict[str, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
 
@@ -103,18 +104,14 @@ class PolygonClient:
         until = self._blocked_until.get(k)
         return bool(until and until > time.time())
 
-    def _mark_blocked(self, path: str, symbol: Optional[str]) -> None:
+    def _mark_blocked(self, path: str, symbol: Optional[str], cooldown_s: Optional[float] = None) -> None:
         k = self._blocked_key(path, symbol)
-        self._blocked_until[k] = time.time() + self._block_cooldown_s
+        self._blocked_until[k] = time.time() + float(cooldown_s or self._block_cooldown_s)
 
     # -----------------------------
     # inflight de-dupe
     # -----------------------------
-    async def _dedupe(self, key: str, coro_factory: Callable[[], Awaitable[Any]]) -> Any:
-        """
-        If same key is already in-flight, await the existing task.
-        Otherwise create a task, store it, await it, then remove.
-        """
+    async def _dedupe(self, key: str, coro_factory) -> Any:
         async with self._inflight_lock:
             t = self._inflight.get(key)
             if t and not t.done():
@@ -145,7 +142,6 @@ class PolygonClient:
         async with self._sem:
             r = await self.http.get(url, params=q, timeout=timeout)
         r.raise_for_status()
-
         js = r.json()
         return js if isinstance(js, dict) else {}
 
@@ -166,7 +162,6 @@ class PolygonClient:
         """
         sym = (symbol or "").upper()
 
-        # avoid spamming a known-blocked endpoint for this symbol
         if self._is_blocked(path, sym):
             return {}
 
@@ -189,36 +184,28 @@ class PolygonClient:
                 except httpx.HTTPStatusError as e:
                     code = getattr(e.response, "status_code", None)
 
-                    # plan blocked / not entitled
                     if code in (401, 403):
                         log.warning("%s blocked for %s (HTTP %s) path=%s", log_prefix, sym, code, path)
                         self._mark_blocked(path, sym)
                         return {}
 
-                    # missing endpoint / invalid ticker
                     if code == 404:
                         log.warning("%s not found for %s (HTTP 404) path=%s", log_prefix, sym, path)
                         return {}
 
-                    # rate limit retry
                     if code == 429:
+                        # NEW: if exhausted, block this path briefly to reduce spam
                         if attempt >= self._max_429_retries:
                             log.warning(
-                                "%s 429 rate limited (attempt=%d/%d) path=%s",
-                                log_prefix,
-                                attempt,
-                                self._max_429_retries,
-                                path,
+                                "%s 429 rate limited (attempt=%d/%d) path=%s -> cooldown %.0fs",
+                                log_prefix, attempt, self._max_429_retries, path, POLYGON_429_COOLDOWN
                             )
+                            self._mark_blocked(path, sym, cooldown_s=POLYGON_429_COOLDOWN)
                             return {}
                         sleep_s = (self._base_backoff * (2 ** (attempt - 1))) + random.uniform(0.0, 0.35)
                         log.warning(
                             "%s 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs",
-                            log_prefix,
-                            attempt,
-                            self._max_429_retries,
-                            path,
-                            sleep_s,
+                            log_prefix, attempt, self._max_429_retries, path, sleep_s
                         )
                         await asyncio.sleep(sleep_s)
                         continue
@@ -235,6 +222,85 @@ class PolygonClient:
             return await self._dedupe(f"inflight:{cache_key}", _runner)
 
         return await _runner()
+
+    # -----------------------------
+    # Local TA helpers (avoid /v1/indicators)
+    # -----------------------------
+    @staticmethod
+    def _ema_last(vals: List[float], period: int) -> Optional[float]:
+        if len(vals) < period:
+            return None
+        k = 2.0 / (period + 1.0)
+        ema = sum(vals[:period]) / period
+        for v in vals[period:]:
+            ema = (v * k) + (ema * (1.0 - k))
+        return float(ema)
+
+    @staticmethod
+    def _ema_series(vals: List[float], period: int) -> List[Optional[float]]:
+        out: List[Optional[float]] = [None] * len(vals)
+        if len(vals) < period:
+            return out
+        k = 2.0 / (period + 1.0)
+        ema = sum(vals[:period]) / period
+        out[period - 1] = float(ema)
+        for i in range(period, len(vals)):
+            ema = (vals[i] * k) + (ema * (1.0 - k))
+            out[i] = float(ema)
+        return out
+
+    @staticmethod
+    def _rsi_last(vals: List[float], period: int = 14) -> Optional[float]:
+        if len(vals) <= period:
+            return None
+        gains = 0.0
+        losses = 0.0
+        for i in range(1, period + 1):
+            d = vals[i] - vals[i - 1]
+            gains += max(d, 0.0)
+            losses += max(-d, 0.0)
+        avg_gain = gains / period
+        avg_loss = losses / period
+        for i in range(period + 1, len(vals)):
+            d = vals[i] - vals[i - 1]
+            gain = max(d, 0.0)
+            loss = max(-d, 0.0)
+            avg_gain = ((avg_gain * (period - 1)) + gain) / period
+            avg_loss = ((avg_loss * (period - 1)) + loss) / period
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def _compute_local_technicals_from_closes(self, closes: List[float]) -> Dict[str, Optional[float]]:
+        if len(closes) < 60:
+            return {}
+
+        sma20 = sum(closes[-20:]) / 20.0 if len(closes) >= 20 else None
+        ema20 = self._ema_last(closes, 20)
+        ema50 = self._ema_last(closes, 50)
+        rsi14 = self._rsi_last(closes, 14)
+
+        ema12_s = self._ema_series(closes, 12)
+        ema26_s = self._ema_series(closes, 26)
+        macd_series: List[float] = []
+        for a, b in zip(ema12_s, ema26_s):
+            if a is not None and b is not None:
+                macd_series.append(a - b)
+
+        macd_line = macd_series[-1] if macd_series else None
+        macd_signal = self._ema_last(macd_series, 9) if macd_series else None
+        macd_hist = (macd_line - macd_signal) if (macd_line is not None and macd_signal is not None) else None
+
+        return {
+            "sma20": sma20,
+            "ema20": ema20,
+            "ema50": ema50,
+            "rsi14": rsi14,
+            "macd_line": macd_line,
+            "macd_signal": macd_signal,
+            "macd_hist": macd_hist,
+        }
 
     # -----------------------------
     # Stocks
@@ -313,7 +379,7 @@ class PolygonClient:
         return js.get("results") or []
 
     # -----------------------------
-    # Indicators / Technicals
+    # Indicators / Technicals (API)
     # -----------------------------
     async def _indicator_raw(
         self,
@@ -362,17 +428,62 @@ class PolygonClient:
         return float(v) if isinstance(v, (int, float)) else None
 
     async def get_technicals_bundle(self, symbol: str, *, timespan: str = "minute") -> Dict[str, Optional[float]]:
+        """
+        Preferred behavior:
+          1) compute technicals locally from aggs (no /v1/indicators calls) when POLYGON_TECH_USE_LOCAL=1
+          2) if not enough bars and POLYGON_TECH_FALLBACK_TO_API=1, call /v1/indicators
+        """
+        sym = symbol.upper()
+
+        # 1) local compute from cached aggs (fast + avoids 429)
+        if POLYGON_TECH_USE_LOCAL:
+            # Choose bars count depending on timespan.
+            # minute -> use 5m bars window (already used by engine) so require ~60 closes
+            # day -> use daily window
+            closes: List[float] = []
+            try:
+                # The engine already pulls aggs itself; but when called standalone, we can fetch here.
+                # Cache keys/TTLs are handled by get_aggs_window().
+                if timespan == "day":
+                    # last ~260 trading days: caller supplies from/to, but here we just use a light window.
+                    # user of this bundle is engine_processor which already gets daily aggs separately;
+                    # if it still calls this, we fetch minimal.
+                    # 320 calendar days is okay for 260 bars on most symbols.
+                    from datetime import date, timedelta
+                    today = date.today()
+                    from_ = (today - timedelta(days=320)).isoformat()
+                    to = (today + timedelta(days=2)).isoformat()
+                    bars = await self.get_aggs_window(sym, multiplier=1, timespan="day", from_=from_, to=to, limit=260, cache_ttl_s=900.0)
+                else:
+                    from datetime import date, timedelta
+                    today = date.today()
+                    from_ = (today - timedelta(days=10)).isoformat()
+                    to = (today + timedelta(days=2)).isoformat()
+                    bars = await self.get_aggs_window(sym, multiplier=5, timespan="minute", from_=from_, to=to, limit=600, cache_ttl_s=60.0)
+
+                closes = [float(b.get("c")) for b in (bars or []) if isinstance(b.get("c"), (int, float))]
+                out = self._compute_local_technicals_from_closes(closes)
+
+                if out:
+                    return out
+            except Exception as e:
+                log.warning("[polygon] local technicals failed for %s timespan=%s err=%r", sym, timespan, e)
+
+            # If local failed and we don't want API fallback
+            if not POLYGON_TECH_FALLBACK_TO_API:
+                return {}
+
+        # 2) API fallback
         if not POLYGON_ENABLE_INDICATORS:
             return {}
-        ttl = 60.0 if timespan == "minute" else 900.0
 
-        # NOTE: inflight de-dupe will collapse identical requests across workers using the same PolygonClient instance
+        ttl = 60.0 if timespan == "minute" else 900.0
         sma_js, ema20_js, ema50_js, rsi_js, macd_js = await asyncio.gather(
-            self._indicator_raw("sma", symbol, timespan=timespan, window=20, cache_ttl_s=ttl),
-            self._indicator_raw("ema", symbol, timespan=timespan, window=20, cache_ttl_s=ttl),
-            self._indicator_raw("ema", symbol, timespan=timespan, window=50, cache_ttl_s=ttl),
-            self._indicator_raw("rsi", symbol, timespan=timespan, window=14, cache_ttl_s=ttl),
-            self._indicator_raw("macd", symbol, timespan=timespan, cache_ttl_s=ttl),
+            self._indicator_raw("sma", sym, timespan=timespan, window=20, cache_ttl_s=ttl),
+            self._indicator_raw("ema", sym, timespan=timespan, window=20, cache_ttl_s=ttl),
+            self._indicator_raw("ema", sym, timespan=timespan, window=50, cache_ttl_s=ttl),
+            self._indicator_raw("rsi", sym, timespan=timespan, window=14, cache_ttl_s=ttl),
+            self._indicator_raw("macd", sym, timespan=timespan, cache_ttl_s=ttl),
         )
 
         return {
