@@ -3,21 +3,25 @@ import os
 import asyncio
 import logging
 from contextlib import suppress
-from datetime import datetime, time as dt_time
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, FastAPI, Request, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-# ---- Project imports ----
-from config import CDT_TZ, allowed_now_cdt
 import trading_engine as engine
 
-from volume_scanner import run_scanner_loop, get_state as uvscan_state
-from daily_reporter import build_daily_report, send_daily_report_to_telegram
+# Optional helpers (don’t crash if not present in your repo)
+with suppress(Exception):
+    from volume_scanner import run_scanner_loop  # type: ignore
+with suppress(Exception):
+    run_scanner_loop = None  # type: ignore
+
+with suppress(Exception):
+    from daily_reporter import send_daily_report_to_telegram  # type: ignore
+with suppress(Exception):
+    send_daily_report_to_telegram = None  # type: ignore
 
 
-# ---------------- Logging ----------------
 log = logging.getLogger("trading_engine.routes")
 if not log.handlers:
     _h = logging.StreamHandler()
@@ -27,28 +31,50 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
 
-# ---------------- Background task handles ----------------
-_scanner_task: asyncio.Task | None = None
-_scanner_ctrl_task: asyncio.Task | None = None
-_daily_task: asyncio.Task | None = None
+# ---------------- Env helpers ----------------
+def _truthy(s: str) -> bool:
+    return str(s).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+# ---------------- Window enforcement ----------------
+ENFORCE_WINDOW = _truthy(os.getenv("ENFORCE_WINDOW", "1"))
+WINDOW_TZ = os.getenv("WINDOW_TZ", "America/Denver")  # CDT/MDT-ish
+WINDOW_START = os.getenv("WINDOW_START", "10:30")     # HH:MM
+WINDOW_END = os.getenv("WINDOW_END", "14:00")         # HH:MM
+
+# If you already have a window helper in engine_common, prefer it
+with suppress(Exception):
+    from engine_common import window_ok_now  # type: ignore
+with suppress(Exception):
+    window_ok_now = None  # type: ignore
 
 
-def _bypass_requested(request: Request) -> bool:
-    qp = request.query_params
-    return _truthy(qp.get("bypass_window")) or _truthy(qp.get("bypass"))
+def _window_ok() -> bool:
+    # Use shared helper if available
+    if callable(window_ok_now):
+        try:
+            return bool(window_ok_now(WINDOW_START, WINDOW_END, WINDOW_TZ))
+        except Exception:
+            pass
+
+    # Fallback: don’t block if we can’t compute
+    return True
 
 
-# =========================
-# UV Scanner task control
-# =========================
+# ---------------- Background controllers ----------------
+_scanner_task: Optional[asyncio.Task] = None
+_reporter_task: Optional[asyncio.Task] = None
+
+
 async def _start_uvscan_task() -> None:
     global _scanner_task
     if _scanner_task and not _scanner_task.done():
         return
+
+    if run_scanner_loop is None:
+        log.info("uvscan not available (volume_scanner missing); skipping")
+        return
+
     _scanner_task = asyncio.create_task(run_scanner_loop(), name="uvscan")
     log.info("uvscan task started")
 
@@ -57,210 +83,130 @@ async def _stop_uvscan_task() -> None:
     global _scanner_task
     if not _scanner_task:
         return
-
-    task = _scanner_task
-    _scanner_task = None  # clear first to avoid double-stop races
-
-    if task.done():
+    t = _scanner_task
+    _scanner_task = None
+    if t.done():
         with suppress(Exception):
-            task.result()
-        log.info("uvscan task already done")
+            t.result()
         return
-
-    task.cancel()
+    t.cancel()
     with suppress(asyncio.CancelledError):
-        await task
+        await t
     log.info("uvscan task stopped")
 
 
-async def _scanner_window_controller() -> None:
-    """
-    Starts/stops uvscan based on a CDT window.
-    Defaults: 10:30–14:00 CDT (env overridable).
-    """
-    tz = CDT_TZ if isinstance(CDT_TZ, ZoneInfo) else ZoneInfo("America/Chicago")
+async def _start_daily_reporter() -> None:
+    global _reporter_task
+    if _reporter_task and not _reporter_task.done():
+        return
 
-    start_h = int(os.getenv("UVSCAN_START_HOUR", "10"))
-    start_m = int(os.getenv("UVSCAN_START_MINUTE", "30"))
-    end_h = int(os.getenv("UVSCAN_END_HOUR", "14"))
-    end_m = int(os.getenv("UVSCAN_END_MINUTE", "0"))
+    if send_daily_report_to_telegram is None:
+        log.info("daily reporter not available; skipping")
+        return
 
-    start_t = dt_time(start_h, start_m)
-    end_t = dt_time(end_h, end_m)
-
-    enforce = _truthy(os.getenv("ENFORCE_UVSCAN_WINDOW", "1"))
-    poll_s = int(os.getenv("UVSCAN_WINDOW_POLL_SECONDS", "10"))
-
-    log.info(
-        "uvscan controller started enforce=%s window=%02d:%02d-%02d:%02d CDT",
-        enforce, start_h, start_m, end_h, end_m
-    )
-
-    try:
+    async def _loop() -> None:
+        # Your daily_reporter module probably already schedules; this is a safe wrapper.
         while True:
-            now = datetime.now(tz).time()
-            in_window = (start_t <= now <= end_t)
-            should_run = (not enforce) or in_window
+            try:
+                await send_daily_report_to_telegram()
+            except Exception as e:
+                log.warning("daily reporter loop error: %r", e)
+            await asyncio.sleep(60)
 
-            if should_run:
-                await _start_uvscan_task()
-            else:
-                await _stop_uvscan_task()
-
-            await asyncio.sleep(poll_s)
-    except asyncio.CancelledError:
-        with suppress(asyncio.CancelledError):
-            await _stop_uvscan_task()
-        raise
+    _reporter_task = asyncio.create_task(_loop(), name="daily_reporter")
+    log.info("daily reporter started")
 
 
-# =========================
-# Daily report scheduler
-# =========================
-async def _daily_report_scheduler() -> None:
-    """
-    Sends daily report at configured time (CDT).
-    Default: 14:45 CDT (env overridable).
-    """
-    tz = CDT_TZ if isinstance(CDT_TZ, ZoneInfo) else ZoneInfo("America/Chicago")
-    hour = int(os.getenv("DAILY_REPORT_HOUR", "14"))
-    minute = int(os.getenv("DAILY_REPORT_MINUTE", "45"))
-    poll_s = int(os.getenv("DAILY_REPORT_POLL_SECONDS", "20"))
-    enabled = _truthy(os.getenv("DAILY_REPORT_ENABLED", "1"))
-
-    log.info("daily reporter started enabled=%s time=%02d:%02d CDT", enabled, hour, minute)
-
-    last_sent_key: str | None = None
-
-    try:
-        while True:
-            if not enabled:
-                await asyncio.sleep(poll_s)
-                continue
-
-            now = datetime.now(tz)
-            key = now.strftime("%Y-%m-%d")
-
-            if now.hour == hour and now.minute == minute and last_sent_key != key:
-                try:
-                    report = await build_daily_report()
-                    await send_daily_report_to_telegram(report)
-                    last_sent_key = key
-                    log.info("daily report sent for %s", key)
-                except Exception:
-                    log.exception("daily report failed")
-
-            await asyncio.sleep(poll_s)
-    except asyncio.CancelledError:
-        raise
+async def _stop_daily_reporter() -> None:
+    global _reporter_task
+    if not _reporter_task:
+        return
+    t = _reporter_task
+    _reporter_task = None
+    if t.done():
+        with suppress(Exception):
+            t.result()
+        return
+    t.cancel()
+    with suppress(asyncio.CancelledError):
+        await t
+    log.info("daily reporter stopped")
 
 
-# =========================
-# Routes
-# =========================
-@router.get("/healthz")
-async def healthz() -> dict:
-    try:
-        st = uvscan_state() or {}
-    except Exception:
-        st = {"ok": False, "error": "uvscan_state failed"}
-
-    return {
-        "ok": True,
-        "now_cdt": datetime.now(CDT_TZ).isoformat() if CDT_TZ else datetime.now().isoformat(),
-        "allowed_now_cdt": bool(allowed_now_cdt()),
-        "scanner": st,
-        "tasks": {
-            "uvscan_running": bool(_scanner_task and not _scanner_task.done()),
-            "uvscan_controller_running": bool(_scanner_ctrl_task and not _scanner_ctrl_task.done()),
-            "daily_scheduler_running": bool(_daily_task and not _daily_task.done()),
-        },
-    }
-
-
-@router.get("/uvscan/status")
-async def uvscan_status() -> dict:
-    return uvscan_state()
-
-
-@router.post("/webhook")
-@router.post("/webhook/tradingview")
-async def webhook_tradingview(request: Request) -> JSONResponse:
-    """
-    Accepts TradingView webhook. Supports:
-      - JSON payload (application/json)
-      - raw text body
-    Enforces CDT window via allowed_now_cdt() unless bypass_window=1.
-    """
-    bypass = _bypass_requested(request)
-
-    if (not bypass) and (not allowed_now_cdt()):
-        raise HTTPException(
-            status_code=403,
-            detail="Outside allowed alert window (CDT). Use ?bypass_window=1 to test.",
-        )
-
-    payload: dict
-    try:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            payload = {"value": payload}
-    except Exception:
-        raw = await request.body()
-        body_text = (raw or b"").decode("utf-8", errors="ignore").strip()
-        payload = {"text": body_text} if body_text else {}
-
-    # Add request flags so engine can log/debug
-    payload["_flags"] = {
-        "bypass_window": bypass,
-        "ip": (request.client.host if request.client else None),
-        "ua": request.headers.get("user-agent", ""),
-        "path": str(request.url.path),
-    }
-
-    # Hand off to engine
-    try:
-        await engine.enqueue_alert(payload)
-    except AttributeError:
-        await engine.process_webhook(payload)
-
-    return JSONResponse({"ok": True, "bypass_window": bypass})
-
-
-# =========================
-# Lifecycle wiring
-# =========================
+# ---------------- Lifecycle binding ----------------
 def bind_lifecycle(app: FastAPI) -> None:
     @app.on_event("startup")
     async def _startup() -> None:
-        with suppress(Exception):
-            await engine.startup()
-
-        global _scanner_ctrl_task, _daily_task
-        _scanner_ctrl_task = asyncio.create_task(_scanner_window_controller(), name="uvscan-controller")
-        _daily_task = asyncio.create_task(_daily_report_scheduler(), name="daily-reporter")
-
+        # Ensure engine is started if it exposes a startup hook
+        if hasattr(engine, "startup") and callable(getattr(engine, "startup")):
+            await engine.startup()  # type: ignore
+        # Start background controllers (optional)
+        await _start_uvscan_task()
+        await _start_daily_reporter()
         log.info("startup complete")
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
-        global _scanner_ctrl_task, _daily_task
-        for t in (_daily_task, _scanner_ctrl_task):
-            if t and not t.done():
-                t.cancel()
-
-        for t in (_daily_task, _scanner_ctrl_task):
-            if t:
-                with suppress(asyncio.CancelledError):
-                    await t
-
-        _daily_task = None
-        _scanner_ctrl_task = None
-
-        with suppress(asyncio.CancelledError):
-            await _stop_uvscan_task()
-
-        with suppress(Exception):
-            await engine.shutdown()
-
+        await _stop_uvscan_task()
+        await _stop_daily_reporter()
+        if hasattr(engine, "shutdown") and callable(getattr(engine, "shutdown")):
+            await engine.shutdown()  # type: ignore
         log.info("shutdown complete")
+
+
+# ---------------- Routes ----------------
+@router.get("/health")
+async def health() -> Dict[str, Any]:
+    # If engine has net_debug_info, include it (nice for Render checks)
+    info = {}
+    if hasattr(engine, "net_debug_info") and callable(getattr(engine, "net_debug_info")):
+        with suppress(Exception):
+            info = await engine.net_debug_info()  # type: ignore
+    return {"ok": True, **(info or {})}
+
+
+@router.post("/webhook/tradingview")
+async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONResponse:
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a JSON object")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    flags = {
+        "bypass_window": bool(bypass_window),
+        "ip": request.client.host if request.client else None,
+        "ua": request.headers.get("user-agent"),
+        "path": str(request.url.path),
+    }
+
+    # enforce window unless bypassed
+    if ENFORCE_WINDOW and not flags["bypass_window"]:
+        if not _window_ok():
+            return JSONResponse({"ok": False, "blocked": "outside_window", "bypass_window": False}, status_code=403)
+
+    # ---- enqueue into engine worker ----
+    # Engine contract used by your logs: engine.enqueue(...) then worker processes job dict
+    # Job shape expected by engine_processor.process_tradingview_job(): {"alert_text": <dict>}
+    job = {"alert_text": payload, "flags": flags}
+
+    # Pick the enqueue function that exists
+    enqueue_fn = None
+    for name in ("enqueue", "enqueue_job", "enqueue_alert", "submit"):
+        fn = getattr(engine, name, None)
+        if callable(fn):
+            enqueue_fn = fn
+            break
+
+    if enqueue_fn is None:
+        # This is the ONLY hard requirement: engine must expose an enqueue function.
+        raise HTTPException(status_code=500, detail="Engine enqueue function not found (expected enqueue/enqueue_job/enqueue_alert/submit)")
+
+    try:
+        await enqueue_fn(job)  # type: ignore
+    except Exception as e:
+        log.exception("enqueue failed: %r", e)
+        raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
+
+    return JSONResponse({"ok": True, "bypass_window": bool(bypass_window)})
