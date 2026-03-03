@@ -7,6 +7,10 @@ from urllib.parse import quote
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta, date
 
+from __future__ import annotations
+
+from typing import Any, Dict
+
 from fastapi import HTTPException, Request
 from config import CDT_TZ, MAX_LLM_PER_DAY, POLYGON_API_KEY as CFG_POLYGON_API_KEY
 
@@ -345,48 +349,47 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
     return out
 
 
-def parse_alert_text(text: str) -> Dict[str, Any]:
-    text = _maybe_unwrap_json_string(text)
-    text = (text or "").strip()
+def parse_alert_text(alert_text: Any) -> Dict[str, Any]:
+    """
+    Accepts:
+      - dict: TradingView webhook JSON payload (preferred) -> returned as-is
+      - str: JSON string payload -> json.loads
+      - bytes: decoded then treated as str
+    Returns:
+      dict
+    Raises:
+      ValueError if cannot produce dict
+    """
+    if isinstance(alert_text, dict):
+        return alert_text
 
-    m = ALERT_RE_WITH_EXP.match(text)
-    if m:
-        side, symbol, ul, strike, exp = m.groups()
-        return {
-            "side": side.upper(),
-            "symbol": symbol.upper(),
-            "underlying_price_from_alert": float(ul),
-            "strike": float(strike),
-            "expiry": exp,
-        }
-    m = ALERT_RE_NO_EXP.match(text)
-    if m:
-        side, symbol, ul, strike = m.groups()
-        return {
-            "side": side.upper(),
-            "symbol": symbol.upper(),
-            "underlying_price_from_alert": float(ul),
-            "strike": float(strike),
-        }
+    if alert_text is None:
+        raise ValueError("alert_text is None")
 
-    if "{" in text:
+    if isinstance(alert_text, (bytes, bytearray)):
+        alert_text = alert_text.decode("utf-8", errors="replace")
+
+    if not isinstance(alert_text, str):
+        # last resort: stringify (keeps system from crashing, but may not parse)
+        alert_text = str(alert_text)
+
+    s = alert_text.strip()
+    if not s:
+        raise ValueError("empty alert_text")
+
+    # If it's JSON, decode it
+    if s.startswith("{") and s.endswith("}"):
         try:
-            fixed = _salvage_json_text(_balance_braces(text))
-            payload = json.loads(fixed)
-
-            if isinstance(payload, str):
-                payload = json.loads(_salvage_json_text(_balance_braces(payload)))
-
-            if isinstance(payload, dict):
-                parsed = _parse_alert_json_payload(payload)
-                if parsed:
-                    return parsed
+            obj = json.loads(s)
         except Exception as e:
-            logger.debug("JSON parse failed: %s", e)
+            raise ValueError(f"alert_text JSON parse failed: {e}") from e
+        if not isinstance(obj, dict):
+            raise ValueError("alert_text JSON must be an object")
+        return obj
 
-    raise HTTPException(status_code=400, detail="Unrecognized alert format")
-
-
+    # If you ever send non-JSON strings, fail loudly (better than silent junk)
+    raise ValueError("alert_text must be a dict or a JSON object string")
+    
 # =========================
 # Misc utils
 # =========================
