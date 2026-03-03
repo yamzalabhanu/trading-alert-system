@@ -5,7 +5,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable, Awaitable
 
 import httpx
 
@@ -14,11 +14,13 @@ log = logging.getLogger("trading_engine.polygon")
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
 POLYGON_BASE_URL = (os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/"))
 
+
 # -----------------------------
 # Endpoint toggles (env)
 # -----------------------------
 def _truthy(v: str) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
 
 POLYGON_ENABLE_SNAPSHOT = _truthy(os.getenv("POLYGON_ENABLE_SNAPSHOT", "1"))
 POLYGON_ENABLE_NBBO = _truthy(os.getenv("POLYGON_ENABLE_NBBO", "1"))
@@ -27,7 +29,7 @@ POLYGON_ENABLE_AGGS = _truthy(os.getenv("POLYGON_ENABLE_AGGS", "1"))
 POLYGON_ENABLE_INDICATORS = _truthy(os.getenv("POLYGON_ENABLE_INDICATORS", "1"))
 POLYGON_ENABLE_OPTIONS = _truthy(os.getenv("POLYGON_ENABLE_OPTIONS", "1"))
 
-# If you’re on a plan that blocks snapshot/last/nbbo, set these to 0 in Render env:
+# If you’re on a plan that blocks snapshot/last/nbbo, set these to 0:
 #   POLYGON_ENABLE_SNAPSHOT=0
 #   POLYGON_ENABLE_NBBO=0
 #   POLYGON_ENABLE_LAST_TRADE=0
@@ -55,16 +57,17 @@ class PolygonClient:
         self.api_key = (api_key or POLYGON_API_KEY or "").strip()
         self.base = POLYGON_BASE_URL
 
-        self._sem = asyncio.Semaphore(int(os.getenv("POLYGON_MAX_CONCURRENCY", "3")) or 3)
+        max_conc = int((os.getenv("POLYGON_MAX_CONCURRENCY", "3") or "3").strip() or 3)
+        self._sem = asyncio.Semaphore(max_conc)
 
         self._cache: Dict[str, _CacheItem] = {}
         self._blocked_until: Dict[str, float] = {}
 
-        self._max_429_retries = int(os.getenv("POLYGON_429_RETRIES", "4") or 4)
-        self._base_backoff = float(os.getenv("POLYGON_429_BACKOFF", "0.7") or 0.7)
-        self._block_cooldown_s = float(os.getenv("POLYGON_403_COOLDOWN", "1800") or 1800.0)
+        self._max_429_retries = int((os.getenv("POLYGON_429_RETRIES", "4") or "4").strip() or 4)
+        self._base_backoff = float((os.getenv("POLYGON_429_BACKOFF", "0.7") or "0.7").strip() or 0.7)
+        self._block_cooldown_s = float((os.getenv("POLYGON_403_COOLDOWN", "1800") or "1800").strip() or 1800.0)
 
-        # inflight de-dupe
+        # inflight de-dupe (per client)
         self._inflight: Dict[str, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
 
@@ -107,7 +110,7 @@ class PolygonClient:
     # -----------------------------
     # inflight de-dupe
     # -----------------------------
-    async def _dedupe(self, key: str, coro_factory) -> Any:
+    async def _dedupe(self, key: str, coro_factory: Callable[[], Awaitable[Any]]) -> Any:
         """
         If same key is already in-flight, await the existing task.
         Otherwise create a task, store it, await it, then remove.
@@ -142,6 +145,7 @@ class PolygonClient:
         async with self._sem:
             r = await self.http.get(url, params=q, timeout=timeout)
         r.raise_for_status()
+
         js = r.json()
         return js if isinstance(js, dict) else {}
 
@@ -162,6 +166,7 @@ class PolygonClient:
         """
         sym = (symbol or "").upper()
 
+        # avoid spamming a known-blocked endpoint for this symbol
         if self._is_blocked(path, sym):
             return {}
 
@@ -184,21 +189,37 @@ class PolygonClient:
                 except httpx.HTTPStatusError as e:
                     code = getattr(e.response, "status_code", None)
 
+                    # plan blocked / not entitled
                     if code in (401, 403):
                         log.warning("%s blocked for %s (HTTP %s) path=%s", log_prefix, sym, code, path)
                         self._mark_blocked(path, sym)
                         return {}
 
+                    # missing endpoint / invalid ticker
                     if code == 404:
                         log.warning("%s not found for %s (HTTP 404) path=%s", log_prefix, sym, path)
                         return {}
 
+                    # rate limit retry
                     if code == 429:
                         if attempt >= self._max_429_retries:
-                            log.warning("%s 429 rate limited (attempt=%d/%d) path=%s", log_prefix, attempt, self._max_429_retries, path)
+                            log.warning(
+                                "%s 429 rate limited (attempt=%d/%d) path=%s",
+                                log_prefix,
+                                attempt,
+                                self._max_429_retries,
+                                path,
+                            )
                             return {}
                         sleep_s = (self._base_backoff * (2 ** (attempt - 1))) + random.uniform(0.0, 0.35)
-                        log.warning("%s 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs", log_prefix, attempt, self._max_429_retries, path, sleep_s)
+                        log.warning(
+                            "%s 429 rate limited (attempt=%d/%d) path=%s sleeping=%.2fs",
+                            log_prefix,
+                            attempt,
+                            self._max_429_retries,
+                            path,
+                            sleep_s,
+                        )
                         await asyncio.sleep(sleep_s)
                         continue
 
@@ -345,6 +366,7 @@ class PolygonClient:
             return {}
         ttl = 60.0 if timespan == "minute" else 900.0
 
+        # NOTE: inflight de-dupe will collapse identical requests across workers using the same PolygonClient instance
         sma_js, ema20_js, ema50_js, rsi_js, macd_js = await asyncio.gather(
             self._indicator_raw("sma", symbol, timespan=timespan, window=20, cache_ttl_s=ttl),
             self._indicator_raw("ema", symbol, timespan=timespan, window=20, cache_ttl_s=ttl),
