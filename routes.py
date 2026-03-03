@@ -50,13 +50,11 @@ with suppress(Exception):
 
 
 def _window_ok() -> bool:
-    # Use shared helper if available
     if callable(window_ok_now):
         try:
             return bool(window_ok_now(WINDOW_START, WINDOW_END, WINDOW_TZ))
         except Exception:
             pass
-
     # Fallback: don’t block if we can’t compute
     return True
 
@@ -105,7 +103,6 @@ async def _start_daily_reporter() -> None:
         return
 
     async def _loop() -> None:
-        # Your daily_reporter module probably already schedules; this is a safe wrapper.
         while True:
             try:
                 await send_daily_report_to_telegram()
@@ -137,10 +134,9 @@ async def _stop_daily_reporter() -> None:
 def bind_lifecycle(app: FastAPI) -> None:
     @app.on_event("startup")
     async def _startup() -> None:
-        # Ensure engine is started if it exposes a startup hook
         if hasattr(engine, "startup") and callable(getattr(engine, "startup")):
             await engine.startup()  # type: ignore
-        # Start background controllers (optional)
+
         await _start_uvscan_task()
         await _start_daily_reporter()
         log.info("startup complete")
@@ -149,6 +145,7 @@ def bind_lifecycle(app: FastAPI) -> None:
     async def _shutdown() -> None:
         await _stop_uvscan_task()
         await _stop_daily_reporter()
+
         if hasattr(engine, "shutdown") and callable(getattr(engine, "shutdown")):
             await engine.shutdown()  # type: ignore
         log.info("shutdown complete")
@@ -157,7 +154,6 @@ def bind_lifecycle(app: FastAPI) -> None:
 # ---------------- Routes ----------------
 @router.get("/health")
 async def health() -> Dict[str, Any]:
-    # If engine has net_debug_info, include it (nice for Render checks)
     info: Dict[str, Any] = {}
     if hasattr(engine, "net_debug_info") and callable(getattr(engine, "net_debug_info")):
         with suppress(Exception):
@@ -174,32 +170,36 @@ async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONR
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
-    flags = {
+    flags: Dict[str, Any] = {
         "bypass_window": bool(bypass_window),
         "ip": request.client.host if request.client else None,
         "ua": request.headers.get("user-agent"),
         "path": str(request.url.path),
     }
 
-    # enforce window unless bypassed
     if ENFORCE_WINDOW and not flags["bypass_window"]:
         if not _window_ok():
             return JSONResponse({"ok": False, "blocked": "outside_window", "bypass_window": False}, status_code=403)
 
-    # ---- enqueue into engine worker ----
-    # Job shape expected by engine_processor.process_tradingview_job(): {"alert_text": <dict>, "flags": {...}}
+    # Preferred new-engine contract: enqueue_webhook_job(alert_text, flags)
+    enqueue_webhook = getattr(engine, "enqueue_webhook_job", None)
+    if callable(enqueue_webhook):
+        try:
+            await enqueue_webhook(payload, flags)  # type: ignore[arg-type]
+            return JSONResponse({"ok": True, "bypass_window": bool(bypass_window)})
+        except Exception as e:
+            log.exception("enqueue_webhook_job failed: %r", e)
+            raise HTTPException(status_code=500, detail=f"enqueue_webhook_job failed: {e}")
+
+    # Fallback to older job-dict enqueue contracts
     job = {"alert_text": payload, "flags": flags}
 
-    # Prefer the canonical function if it exists
-    enqueue_fn = getattr(engine, "enqueue_webhook_job", None)
-    if not callable(enqueue_fn):
-        # Fall back to common aliases
-        enqueue_fn = None
-        for name in ("enqueue", "enqueue_job", "enqueue_alert", "submit"):
-            fn = getattr(engine, name, None)
-            if callable(fn):
-                enqueue_fn = fn
-                break
+    enqueue_fn = None
+    for name in ("enqueue", "enqueue_job", "enqueue_alert", "submit"):
+        fn = getattr(engine, name, None)
+        if callable(fn):
+            enqueue_fn = fn
+            break
 
     if enqueue_fn is None:
         raise HTTPException(
@@ -208,7 +208,7 @@ async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONR
         )
 
     try:
-        await enqueue_fn(job)  # type: ignore
+        await enqueue_fn(job)  # type: ignore[misc]
     except Exception as e:
         log.exception("enqueue failed: %r", e)
         raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
