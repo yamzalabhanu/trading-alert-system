@@ -6,6 +6,7 @@ import json
 from typing import Dict, Any
 import httpx
 
+from typing import Dict, Any
 from config import CDT_TZ  # indirectly used via engine_logic.market_now
 
 # ----- logger -----
@@ -47,9 +48,8 @@ def _preview(obj: Any, n: int = 200) -> str:
         s = str(obj)
     return s[:n]
 
-
-def enqueue_webhook_job(alert_text: str, flags: Dict[str, Any]) -> bool:
-    """
+def enqueue_webhook_job(alert_text: Any, flags: Dict[str, Any]) -> bool:
+    job = {"alert_text": alert_text, "flags": flags}
     Enqueue a webhook job.
 
     NOTE:
