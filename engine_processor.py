@@ -32,6 +32,7 @@ NY_TZ = ZoneInfo("America/New_York")
 
 DATA_PROVIDER = os.getenv("DATA_PROVIDER", "polygon").strip().lower()  # polygon|hybrid
 USE_YAHOO_FALLBACK = str(os.getenv("USE_YAHOO_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
+MIN_TV_SCORE_TO_SEND = float(os.getenv("MIN_TV_SCORE_TO_SEND", "95"))
 
 
 # ---------------------------------------------------------------------
@@ -159,6 +160,33 @@ def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
     if len(trs) < 15:
         return None
     return sum(trs[-14:]) / 14.0
+
+
+def _extract_tv_score(alert: Dict[str, Any], llm: Dict[str, Any]) -> float:
+    candidates = [
+        alert.get("tvScore"),
+        alert.get("tv_score"),
+        alert.get("TVScore"),
+        alert.get("score_tv"),
+        alert.get("tvscore"),
+        llm.get("tvScore") if isinstance(llm, dict) else None,
+        llm.get("tv_score") if isinstance(llm, dict) else None,
+    ]
+    for val in candidates:
+        try:
+            if val is not None:
+                return float(val)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _should_send_telegram_alert(*, live_data_available: bool, tv_score: float) -> Tuple[bool, str]:
+    if not live_data_available:
+        return False, "Live Polygon data unavailable"
+    if tv_score < MIN_TV_SCORE_TO_SEND:
+        return False, f"TV score {tv_score:.2f} below minimum {MIN_TV_SCORE_TO_SEND:.2f}"
+    return True, "Eligible to send"
 
 
 # ---------------------------------------------------------------------
@@ -675,6 +703,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "fast_stop",
         "ason",
         "adx",
+        "tvScore",
+        "tv_score",
+        "TVScore",
     ]
     tv_meta: Dict[str, Any] = {k: alert.get(k) for k in tv_meta_keys if alert.get(k) is not None}
 
@@ -736,6 +767,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         score, rating = None, None
 
+    tv_score = _extract_tv_score(alert, llm)
+    live_data_available = bool(live) and str(f.get("data_provider") or "").lower() == "polygon"
+
     try:
         src = str(f.get("ta_src") or "unknown")
         provider = str(f.get("data_provider") or "unknown")
@@ -749,13 +783,15 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             meta_bits.append(f"model={tv_meta.get('model')}")
         if tv_meta.get("reason"):
             meta_bits.append(f"reason={tv_meta.get('reason')}")
+        if tv_score > 0:
+            meta_bits.append(f"tvScore={tv_score:.2f}")
 
         meta_note = (" | " + ", ".join(meta_bits)) if meta_bits else ""
 
-        if live:
+        if live_data_available:
             data_note = f"📊 Data: {provider} ({src}){meta_note}"
         else:
-            data_note = f"⚠️ Live data unavailable; using alert baseline{meta_note}"
+            data_note = f"⚠️ Live Polygon data unavailable; using alert baseline{meta_note}"
 
         tg_text = compose_telegram_text(
             alert=alert,
@@ -769,12 +805,28 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             diff_note=data_note,
         )
 
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        send_ok, skip_reason = _should_send_telegram_alert(
+            live_data_available=live_data_available,
+            tv_score=tv_score,
+        )
+
+        if not send_ok:
             logger.info(
-                "[tg] send attempt: chat_id=%s len=%d decision=%s",
+                "[tg] skip: symbol=%s reason=%s live_data=%s provider=%s tv_score=%.2f threshold=%.2f",
+                str(alert.get("symbol") or ""),
+                skip_reason,
+                live_data_available,
+                provider,
+                tv_score,
+                MIN_TV_SCORE_TO_SEND,
+            )
+        elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            logger.info(
+                "[tg] send attempt: chat_id=%s len=%d decision=%s tv_score=%.2f",
                 str(TELEGRAM_CHAT_ID),
                 len(tg_text or ""),
                 str(llm.get("decision")),
+                tv_score,
             )
             await send_telegram(tg_text)
             logger.info("[tg] send done")
@@ -805,6 +857,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "preflight_checks": pf_checks,
             "ibkr": {"enabled": False, "attempted": False, "result": None},
             "tv_meta": tv_meta,
+            "telegram_gate": {
+                "live_data_available": live_data_available,
+                "tv_score": tv_score,
+                "min_tv_score_to_send": MIN_TV_SCORE_TO_SEND,
+            },
         }
     )
 
