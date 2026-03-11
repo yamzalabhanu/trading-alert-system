@@ -36,7 +36,7 @@ MIN_TV_SCORE_TO_SEND = float(os.getenv("MIN_TV_SCORE_TO_SEND", "95"))
 
 
 # ---------------------------------------------------------------------
-# Engine-level micro cache (reduces repeated Polygon calls per symbol)
+# Engine-level micro cache (reduces repeated calls per symbol)
 # ---------------------------------------------------------------------
 _ENGINE_CACHE: Dict[str, Tuple[float, Any]] = {}
 
@@ -57,8 +57,6 @@ def _cache_set(key: str, val: Any, ttl_s: float) -> Any:
     return val
 
 
-# ✅ IMPORTANT FIX:
-# Accept a coroutine *factory* so we don't create an un-awaited coroutine on cache hit.
 async def _cached(key: str, ttl_s: float, coro_factory: Callable[[], Awaitable[Any]]) -> Any:
     hit = _cache_get(key)
     if hit is not None:
@@ -190,27 +188,41 @@ def _should_send_telegram_alert(*, live_data_available: bool, tv_score: float) -
 
 
 # ---------------------------------------------------------------------
-# Yahoo fallback (unchanged)
+# Yahoo chart helpers (NEW)
 # ---------------------------------------------------------------------
-async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
+async def _fetch_yahoo_chart_payload(symbol: str) -> Dict[str, Any]:
     cli = get_http_client()
     if cli is None:
         return {}
 
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "5d", "interval": "5m", "includePrePost": "true", "events": "div,splits"}
-    try:
-        r = await cli.get(url, params=params, timeout=8.0)
-        r.raise_for_status()
-        js = r.json()
-    except Exception as e:
-        logger.warning("[features] yahoo fetch failed for %s: %r", symbol, e)
+    sym = (symbol or "").upper().strip()
+    if not sym:
         return {}
 
+    async def _do_fetch() -> Dict[str, Any]:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        params = {
+            "range": "5d",
+            "interval": "5m",
+            "includePrePost": "true",
+            "events": "div,splits",
+        }
+        try:
+            r = await cli.get(url, params=params, timeout=8.0)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.warning("[yahoo] chart fetch failed for %s: %r", sym, e)
+            return {}
+
+    return await _cached(f"yahoo:chart_payload:{sym}", 30.0, _do_fetch)
+
+
+def _parse_yahoo_rows(js: Dict[str, Any]) -> List[Tuple[datetime, float, float, float, float, float]]:
     try:
         res = (js.get("chart") or {}).get("result") or []
         if not res:
-            return {}
+            return []
 
         node = res[0]
         ts = node.get("timestamp") or []
@@ -227,10 +239,201 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
                 continue
             dt = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(NY_TZ)
             rows.append((dt, float(o), float(h), float(l), float(c), float(v or 0.0)))
+        return rows
+    except Exception as e:
+        logger.warning("[yahoo] row parse failed: %r", e)
+        return []
 
-        if len(rows) < 30:
-            return {}
 
+def _build_yahoo_intraday_context(
+    symbol: str,
+    rows: List[Tuple[datetime, float, float, float, float, float]],
+) -> Dict[str, Any]:
+    if len(rows) < 30:
+        return {}
+
+    closes = [r[4] for r in rows]
+    highs = [r[2] for r in rows]
+    lows = [r[3] for r in rows]
+    vols = [r[5] for r in rows]
+
+    day_key = rows[-1][0].date()
+    day_rows = [r for r in rows if r[0].date() == day_key]
+    prev_rows = [r for r in rows if r[0].date() < day_key]
+
+    if not day_rows:
+        return {}
+
+    last_px = day_rows[-1][4]
+    day_open = day_rows[0][1]
+    day_high = max(r[2] for r in day_rows)
+    day_low = min(r[3] for r in day_rows)
+    day_vol = sum(r[5] for r in day_rows)
+
+    rth = [
+        r for r in day_rows
+        if (r[0].hour > 9 or (r[0].hour == 9 and r[0].minute >= 30))
+        and (r[0].hour < 16)
+    ]
+    pm = [
+        r for r in day_rows
+        if (r[0].hour > 4 or (r[0].hour == 4 and r[0].minute >= 0))
+        and (r[0].hour < 9 or (r[0].hour == 9 and r[0].minute < 30))
+    ]
+
+    prev_day = prev_rows[-78:] if prev_rows else []
+    prev_close = prev_day[-1][4] if prev_day else None
+    prev_high = max((r[2] for r in prev_day), default=None)
+    prev_low = min((r[3] for r in prev_day), default=None)
+
+    ema9 = _ema_last(closes, 9)
+    ema20 = _ema_last(closes, 20)
+    ema50 = _ema_last(closes, 50)
+    rsi14 = _rsi_last(closes, 14)
+
+    vwap = None
+    if rth:
+        try:
+            vwap_num = sum((((r[2] + r[3] + r[4]) / 3.0) * r[5]) for r in rth)
+            vwap_den = sum(r[5] for r in rth)
+            if vwap_den > 0:
+                vwap = vwap_num / vwap_den
+        except Exception:
+            vwap = None
+
+    last3 = rth[-3:] if len(rth) >= 3 else day_rows[-3:]
+    last3_dir = []
+    for r in last3:
+        o, c = r[1], r[4]
+        if c > o:
+            last3_dir.append("up")
+        elif c < o:
+            last3_dir.append("down")
+        else:
+            last3_dir.append("flat")
+
+    green_count = sum(1 for d in last3_dir if d == "up")
+    red_count = sum(1 for d in last3_dir if d == "down")
+    if green_count >= 2:
+        last3_bias = "bullish"
+    elif red_count >= 2:
+        last3_bias = "bearish"
+    else:
+        last3_bias = "mixed"
+
+    pm_high = max((r[2] for r in pm), default=None)
+    pm_low = min((r[3] for r in pm), default=None)
+
+    if len(rth) >= 3:
+        orb15 = rth[:3]
+        orb15_high = max(r[2] for r in orb15)
+        orb15_low = min(r[3] for r in orb15)
+    else:
+        orb15_high = None
+        orb15_low = None
+
+    five_day_high = max(highs) if highs else None
+    five_day_low = min(lows) if lows else None
+    five_day_return_pct = _safe_pct(closes[-1], closes[0]) if len(closes) >= 2 else None
+    day_change_pct = _safe_pct(last_px, day_open)
+    gap_pct = _safe_pct(day_open, prev_close) if prev_close is not None else None
+    vwap_dist_pct = _safe_pct(last_px, vwap) if vwap is not None else None
+
+    intraday_bias = "neutral"
+    if vwap is not None and ema9 is not None and ema20 is not None:
+        if last_px > vwap and ema9 > ema20:
+            intraday_bias = "bullish"
+        elif last_px < vwap and ema9 < ema20:
+            intraday_bias = "bearish"
+
+    breakout_state = "inside"
+    if orb15_high is not None and last_px > orb15_high:
+        breakout_state = "above_orb15"
+    elif orb15_low is not None and last_px < orb15_low:
+        breakout_state = "below_orb15"
+
+    sr_state = "inside_prev_day"
+    if prev_high is not None and last_px > prev_high:
+        sr_state = "above_prev_high"
+    elif prev_low is not None and last_px < prev_low:
+        sr_state = "below_prev_low"
+
+    summary_parts = [
+        f"{symbol} Yahoo 5d/5m context",
+        f"intraday_bias={intraday_bias}",
+        f"last3_candles={last3_bias}",
+    ]
+    if vwap is not None:
+        summary_parts.append(f"vs_vwap={vwap_dist_pct:.2f}%")
+    if day_change_pct is not None:
+        summary_parts.append(f"day_change={day_change_pct:.2f}%")
+    if gap_pct is not None:
+        summary_parts.append(f"gap={gap_pct:.2f}%")
+    if five_day_return_pct is not None:
+        summary_parts.append(f"5d_return={five_day_return_pct:.2f}%")
+    summary_parts.append(f"orb_state={breakout_state}")
+    summary_parts.append(f"sr_state={sr_state}")
+
+    return {
+        "yahoo_ctx_available": True,
+        "yahoo_symbol": symbol,
+        "yahoo_chart_range": "5d",
+        "yahoo_chart_interval": "5m",
+        "yahoo_last": last_px,
+        "yahoo_day_open": day_open,
+        "yahoo_day_high": day_high,
+        "yahoo_day_low": day_low,
+        "yahoo_day_volume": day_vol,
+        "yahoo_prev_close": prev_close,
+        "yahoo_prev_high": prev_high,
+        "yahoo_prev_low": prev_low,
+        "yahoo_premarket_high": pm_high,
+        "yahoo_premarket_low": pm_low,
+        "yahoo_orb15_high": orb15_high,
+        "yahoo_orb15_low": orb15_low,
+        "yahoo_ema9": ema9,
+        "yahoo_ema20": ema20,
+        "yahoo_ema50": ema50,
+        "yahoo_rsi14": rsi14,
+        "yahoo_vwap": vwap,
+        "yahoo_vwap_dist_pct": vwap_dist_pct,
+        "yahoo_intraday_bias": intraday_bias,
+        "yahoo_last3_candle_bias": last3_bias,
+        "yahoo_last3_sequence": ",".join(last3_dir) if last3_dir else None,
+        "yahoo_day_change_pct": day_change_pct,
+        "yahoo_gap_pct": gap_pct,
+        "yahoo_5d_high": five_day_high,
+        "yahoo_5d_low": five_day_low,
+        "yahoo_5d_return_pct": five_day_return_pct,
+        "yahoo_orb_break_state": breakout_state,
+        "yahoo_prev_day_sr_state": sr_state,
+        "yahoo_llm_summary": " | ".join(summary_parts),
+    }
+
+
+async def _fetch_yahoo_chart_context(symbol: str) -> Dict[str, Any]:
+    js = await _fetch_yahoo_chart_payload(symbol)
+    if not js:
+        return {}
+    rows = _parse_yahoo_rows(js)
+    if not rows:
+        return {}
+    return _build_yahoo_intraday_context(symbol, rows)
+
+
+# ---------------------------------------------------------------------
+# Yahoo fallback (generic market features)
+# ---------------------------------------------------------------------
+async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
+    js = await _fetch_yahoo_chart_payload(symbol)
+    if not js:
+        return {}
+
+    rows = _parse_yahoo_rows(js)
+    if len(rows) < 30:
+        return {}
+
+    try:
         closes = [rr[4] for rr in rows]
         vols = [rr[5] for rr in rows]
         last_px = closes[-1]
@@ -338,12 +541,12 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
             "data_provider": "yahoo",
         }
     except Exception as e:
-        logger.warning("[features] parse error for %s: %r", symbol, e)
+        logger.warning("[features] yahoo parse error for %s: %r", symbol, e)
         return {}
 
 
 # ---------------------------------------------------------------------
-# Polygon features (updated)
+# Polygon features
 # ---------------------------------------------------------------------
 async def _fetch_polygon_features(
     symbol: str,
@@ -366,9 +569,6 @@ async def _fetch_polygon_features(
         return {}
 
     async def _safe_call(name: str, coro: Awaitable[Any], default: Any) -> Any:
-        """
-        Prevent one Polygon error (429/403/etc) from wiping out ALL feature collection.
-        """
         try:
             return await coro
         except Exception as e:
@@ -378,13 +578,11 @@ async def _fetch_polygon_features(
     today = date.today()
     to_iso = (today + timedelta(days=2)).isoformat()
 
-    # ---- tight windows (reduce load + reduce 429 chance) ----
     from_5m = (today - timedelta(days=10)).isoformat()
     from_15m = (today - timedelta(days=18)).isoformat()
     from_h1 = (today - timedelta(days=40)).isoformat()
     from_d = (today - timedelta(days=320)).isoformat()
 
-    # ---- engine TTL cache keys (avoid refetching on repeated alerts) ----
     k_snap = f"poly:snap:{sym}"
     k_quote = f"poly:quote:{sym}"
     k_trade = f"poly:trade:{sym}"
@@ -395,7 +593,6 @@ async def _fetch_polygon_features(
     k_techm = f"poly:techm:{sym}"
     k_techd = f"poly:techd:{sym}"
 
-    # TTLs (tune if you want)
     TTL_SNAP = 10.0
     TTL_QUOTE = 5.0
     TTL_TRADE = 5.0
@@ -406,8 +603,6 @@ async def _fetch_polygon_features(
     TTL_TECH_M = 60.0
     TTL_TECH_D = 900.0
 
-    # ---- tasks (each guarded + cached) ----
-    # ✅ FIXED: pass coroutine factories to _cached()
     snap_task = _safe_call("snapshot", _cached(k_snap, TTL_SNAP, lambda: pc.get_stock_snapshot(sym)), {})
     quote_task = _safe_call("last_quote", _cached(k_quote, TTL_QUOTE, lambda: pc.get_last_quote(sym)), {})
     trade_task = _safe_call("last_trade", _cached(k_trade, TTL_TRADE, lambda: pc.get_last_trade(sym)), {})
@@ -492,7 +687,6 @@ async def _fetch_polygon_features(
         {},
     )
 
-    # options context only when applicable
     if expiry_iso and side and (strike is not None):
         k_opt = f"poly:optctx:{sym}:{expiry_iso}:{side}:{strike}"
         opt_task: Awaitable[Dict[str, Any]] = _safe_call(
@@ -682,6 +876,8 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] bad alert payload: %s", e)
         return
 
+    symbol = str(alert.get("symbol") or "").upper()
+
     tv_meta_keys = [
         "source",
         "model",
@@ -732,13 +928,21 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "tv_meta": tv_meta,
     }
 
-    live = await _fetch_equity_features(
-        str(alert.get("symbol") or "").upper(),
-        expiry_iso=alert.get("expiry"),
-        side=alert.get("side"),
-        strike=alert.get("strike"),
+    live, yahoo_ctx = await asyncio.gather(
+        _fetch_equity_features(
+            symbol,
+            expiry_iso=alert.get("expiry"),
+            side=alert.get("side"),
+            strike=alert.get("strike"),
+        ),
+        _fetch_yahoo_chart_context(symbol),
     )
+
     for k, v in live.items():
+        if v is not None:
+            f[k] = v
+
+    for k, v in yahoo_ctx.items():
         if v is not None:
             f[k] = v
 
@@ -785,13 +989,17 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             meta_bits.append(f"reason={tv_meta.get('reason')}")
         if tv_score > 0:
             meta_bits.append(f"tvScore={tv_score:.2f}")
+        if f.get("yahoo_intraday_bias"):
+            meta_bits.append(f"yahooBias={f.get('yahoo_intraday_bias')}")
+        if f.get("yahoo_last3_candle_bias"):
+            meta_bits.append(f"yahooLast3={f.get('yahoo_last3_candle_bias')}")
 
         meta_note = (" | " + ", ".join(meta_bits)) if meta_bits else ""
 
         if live_data_available:
-            data_note = f"📊 Data: {provider} ({src}){meta_note}"
+            data_note = f"📊 Data: {provider} ({src}) + Yahoo chart context{meta_note}"
         else:
-            data_note = f"⚠️ Live Polygon data unavailable; using alert baseline{meta_note}"
+            data_note = f"⚠️ Live Polygon data unavailable; using alert baseline + Yahoo chart context{meta_note}"
 
         tg_text = compose_telegram_text(
             alert=alert,
@@ -813,7 +1021,7 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         if not send_ok:
             logger.info(
                 "[tg] skip: symbol=%s reason=%s live_data=%s provider=%s tv_score=%.2f threshold=%.2f",
-                str(alert.get("symbol") or ""),
+                symbol,
                 skip_reason,
                 live_data_available,
                 provider,
@@ -822,11 +1030,12 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             )
         elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             logger.info(
-                "[tg] send attempt: chat_id=%s len=%d decision=%s tv_score=%.2f",
+                "[tg] send attempt: chat_id=%s len=%d decision=%s tv_score=%.2f yahoo_ctx=%s",
                 str(TELEGRAM_CHAT_ID),
                 len(tg_text or ""),
                 str(llm.get("decision")),
                 tv_score,
+                bool(f.get("yahoo_ctx_available")),
             )
             await send_telegram(tg_text)
             logger.info("[tg] send done")
