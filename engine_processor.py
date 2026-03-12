@@ -32,7 +32,7 @@ NY_TZ = ZoneInfo("America/New_York")
 
 DATA_PROVIDER = os.getenv("DATA_PROVIDER", "polygon").strip().lower()  # polygon|hybrid
 USE_YAHOO_FALLBACK = str(os.getenv("USE_YAHOO_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
-MIN_TV_SCORE_TO_SEND = float(os.getenv("MIN_TV_SCORE_TO_SEND", "75"))
+MIN_TV_SCORE_TO_SEND = float(os.getenv("MIN_TV_SCORE_TO_SEND", "0"))
 
 
 # ---------------------------------------------------------------------
