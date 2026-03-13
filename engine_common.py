@@ -1,6 +1,4 @@
 # engine_common.py
-
-# engine_common.py
 from __future__ import annotations
 
 """
@@ -14,10 +12,9 @@ import re
 import json
 import logging
 from datetime import datetime, timezone, timedelta, date
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, Tuple, List
-
-from typing import Any, Dict
 
 from fastapi import HTTPException, Request
 from config import CDT_TZ, MAX_LLM_PER_DAY, POLYGON_API_KEY as CFG_POLYGON_API_KEY
@@ -235,6 +232,10 @@ def _expiry_from_mode(mode: str, *, ref_dt: Optional[datetime] = None) -> Option
         return same_week_friday(now).isoformat()
     if "two weeks" in m and "friday" in m:
         return two_weeks_friday(now).isoformat()
+    if "this week" in m:
+        return same_week_friday(now).isoformat()
+    if "0dte" in m:
+        return now.isoformat()
 
     # direct ISO date?
     if re.match(r"^\d{4}-\d{2}-\d{2}$", mode.strip()):
@@ -279,77 +280,222 @@ def _time_to_iso(payload_time: Any) -> Optional[str]:
 
 def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normalizes multiple webhook schemas into the engine's internal alert shape.
+    Support:
+      1) legacy plain JSON webhook schema
+      2) older TradingView scalper schema
+      3) new v6.1 Pine webhook schema
 
-    Supports your new TradingView JSON:
-      {
-        "src":"tv_pine",
-        "symbol":"SPY",
-        "optionType":"PUTS",
-        "price":512.34,
-        "time":"1709857200000",
-        "optionsHint": { "strike":512, "expiryMode":"Next Friday" },
-        ...
-      }
+    Normalized output keeps legacy keys the engine expects, while preserving
+    richer Pine metadata for downstream scoring / Telegram / LLM use.
     """
-    symbol = str(payload.get("symbol") or payload.get("ticker") or payload.get("underlying") or "").upper().strip()
-    if not symbol:
-        return None
 
-    # side from either old keys or your new key "optionType"
-    side = _norm_side(str(payload.get("side") or payload.get("type") or payload.get("signal") or payload.get("optionType") or ""))
-    px = _as_float(payload.get("price") if payload.get("price") is not None else payload.get("last"))
+    # -----------------------------
+    # Side normalization
+    # -----------------------------
+    option_type = str(payload.get("optionType") or "").upper().strip()
+    signal_side = str(payload.get("signalSide") or "").upper().strip()
 
-    if not side or px is None:
+    side = _norm_side(
+        str(
+            payload.get("side")
+            or payload.get("type")
+            or payload.get("signal")
+            or ("CALL" if option_type == "CALLS" else "PUT" if option_type == "PUTS" else "")
+            or ("CALL" if "LONG_CALL" in signal_side else "PUT" if "LONG_PUT" in signal_side else "")
+        )
+    )
+
+    # -----------------------------
+    # Core symbol / price
+    # -----------------------------
+    symbol = str(
+        payload.get("symbol")
+        or payload.get("ticker")
+        or payload.get("underlying")
+        or ""
+    ).upper().strip()
+
+    px = _as_float(
+        payload.get("price")
+        if payload.get("price") is not None
+        else payload.get("last")
+    )
+
+    # -----------------------------
+    # Strike / expiry
+    # -----------------------------
+    strike = _as_float(payload.get("strike"))
+    expiry = str(payload.get("expiry") or "").strip()
+
+    # Support nested optionsHint from Pine v6.1
+    options_hint = payload.get("optionsHint") if isinstance(payload.get("optionsHint"), dict) else {}
+    if strike is None:
+        strike = _as_float(options_hint.get("strike"))
+
+    if not expiry:
+        expiry = str(_expiry_from_mode(str(options_hint.get("expiryMode") or payload.get("expiryMode") or "")) or "").strip()
+
+    expiry_mode = str(options_hint.get("expiryMode") or payload.get("expiryMode") or "").strip()
+    contract_style_hint = str(options_hint.get("contractStyleHint") or payload.get("contractStyleHint") or "").strip()
+    delta_min = _as_float(options_hint.get("deltaMin"))
+    delta_max = _as_float(options_hint.get("deltaMax"))
+
+    # must have at least side + symbol + price
+    if not side or not symbol or px is None:
         return None
 
     out: Dict[str, Any] = {
         "side": side,
         "symbol": symbol,
+        "ticker": symbol,
+        "underlying": symbol,
         "underlying_price_from_alert": px,
-        "src": payload.get("src") or "webhook",
+        "price": px,
+        "last": px,
     }
 
-    # --- strike/expiry: support direct + optionsHint ---
-    strike = _as_float(payload.get("strike"))
-    expiry = str(payload.get("expiry") or "").strip()
-
-    options_hint = payload.get("optionsHint") if isinstance(payload.get("optionsHint"), dict) else {}
-    if strike is None and isinstance(options_hint, dict):
-        strike = _as_float(options_hint.get("strike"))
-    if (not expiry) and isinstance(options_hint, dict):
-        expiry = str(_expiry_from_mode(str(options_hint.get("expiryMode") or "")) or "").strip()
-
+    # Optional option contract fields
     if strike is not None:
         out["strike"] = strike
     if re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
         out["expiry"] = expiry
 
-    # --- normalize TV time ---
+    # -----------------------------
+    # Time normalization
+    # -----------------------------
     t_iso = _time_to_iso(payload.get("time"))
     if t_iso:
         out["time_iso"] = t_iso
     if payload.get("time") is not None:
         out["time"] = payload.get("time")
 
-    # --- keep important TV fields for LLM + Telegram ---
-    passthru_keys = [
-        "bias", "tf", "score", "tier",
-        "vwap", "ema9", "ema21", "adx", "volSpike",
-        "orbH", "orbL", "orbRange", "atr",
-        "sl", "tp", "rr",
-        "mtfMode", "mtfExecTF", "mtfConfTF",
-        "mtfExecLong", "mtfConfLong", "mtfExecShort", "mtfConfShort",
-        "optionsHint",
-    ]
-    for k in passthru_keys:
+    ex_time_iso = _time_to_iso(payload.get("execTime"))
+    if ex_time_iso:
+        out["execTimeIso"] = ex_time_iso
+    if payload.get("execTime") is not None:
+        out["execTime"] = payload.get("execTime")
+
+    # -----------------------------
+    # Legacy / engine-expected meta
+    # -----------------------------
+    if payload.get("src") is not None and payload.get("source") is None:
+        out["source"] = payload.get("src")
+        out["src"] = payload.get("src")
+    elif payload.get("source") is not None:
+        out["source"] = payload.get("source")
+        out["src"] = payload.get("source")
+    else:
+        out["source"] = "webhook"
+        out["src"] = "webhook"
+
+    for k in ("model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
+        if payload.get(k) is not None:
+            out[k] = payload.get(k)
+
+    # -----------------------------
+    # New Pine v6.1 fields
+    # -----------------------------
+    passthrough_keys = (
+        "optionType",
+        "signalSide",
+        "bias",
+        "tf",
+        "score",
+        "oppositeScore",
+        "tier",
+        "entryType",
+        "sessionPhase",
+        "scalpMode",
+        "levelRulesActive",
+        "nearKeyLevel",
+        "vwap",
+        "ema9",
+        "ema21",
+        "adx",
+        "volRatio",
+        "volSpike",
+        "bodyPct",
+        "distFromVWAPAtr",
+        "pmHigh",
+        "pmLow",
+        "prevDayHigh",
+        "prevDayLow",
+        "or15High",
+        "or15Low",
+        "sessionHigh",
+        "sessionLow",
+        "pmCallReclaim",
+        "pmPutBreak",
+        "pdCallReclaim",
+        "pdPutBreak",
+        "or15CallReclaim",
+        "or15PutBreak",
+        "orbH",
+        "orbL",
+        "orbRange",
+        "orbMode",
+        "orbBarsSinceBreak",
+        "orbHoldCount",
+        "atr",
+        "sl",
+        "tp",
+        "rr",
+        "mtfMode",
+        "mtfExecTF",
+        "mtfConfTF",
+        "mtfExecLong",
+        "mtfConfLong",
+        "mtfExecShort",
+        "mtfConfShort",
+        "confSlopeUp",
+        "confSlopeDown",
+        "regimeSymbol",
+        "regimeBull",
+        "regimeBear",
+    )
+
+    for k in passthrough_keys:
         if k in payload:
             out[k] = payload.get(k)
 
-    # Back-compat meta keys your engine might already use
-    for k in ("source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level"):
-        if payload.get(k) is not None:
+    # Nested objects from Pine
+    if isinstance(payload.get("scoreBreakdown"), dict):
+        out["scoreBreakdown"] = payload["scoreBreakdown"]
+
+    if isinstance(options_hint, dict) and options_hint:
+        out["optionsHint"] = options_hint
+        if expiry_mode:
+            out["expiryMode"] = expiry_mode
+        if contract_style_hint:
+            out["contractStyleHint"] = contract_style_hint
+        if delta_min is not None:
+            out["deltaMin"] = delta_min
+        if delta_max is not None:
+            out["deltaMax"] = delta_max
+
+    # -----------------------------
+    # Backward-compatible aliases
+    # -----------------------------
+    if payload.get("adx") is not None:
+        out["adx"] = payload.get("adx")
+
+    if payload.get("volRatio") is not None:
+        out["relVol"] = payload.get("volRatio")
+        out["relvol"] = payload.get("volRatio")
+
+    for k in ("chop", "tp1", "tp2", "tp3", "trail", "fast_stop", "ason", "bp", "ats"):
+        if k in payload:
             out[k] = payload.get(k)
+
+    # Convenience flags derived from Pine fields
+    if "score" in out:
+        try:
+            out["confidence"] = float(out["score"])
+        except Exception:
+            pass
+
+    if "tier" in out and out.get("rating") is None:
+        out["rating"] = out["tier"]
 
     if out.get("strike") is None and not ALLOW_NO_STRIKE_JSON:
         return None
@@ -360,16 +506,19 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
 def parse_alert_text(alert_text: Any) -> Dict[str, Any]:
     """
     Accepts:
-      - dict: TradingView webhook JSON payload (preferred) -> returned as-is
-      - str: JSON string payload -> json.loads
+      - dict: TradingView webhook JSON payload
+      - str: JSON string payload
       - bytes: decoded then treated as str
+
     Returns:
-      dict
+      normalized dict
+
     Raises:
       ValueError if cannot produce dict
     """
     if isinstance(alert_text, dict):
-        return alert_text
+        normalized = _parse_alert_json_payload(alert_text)
+        return normalized if normalized is not None else alert_text
 
     if alert_text is None:
         raise ValueError("alert_text is None")
@@ -378,14 +527,16 @@ def parse_alert_text(alert_text: Any) -> Dict[str, Any]:
         alert_text = alert_text.decode("utf-8", errors="replace")
 
     if not isinstance(alert_text, str):
-        # last resort: stringify (keeps system from crashing, but may not parse)
         alert_text = str(alert_text)
 
     s = alert_text.strip()
     if not s:
         raise ValueError("empty alert_text")
 
-    # If it's JSON, decode it
+    s = _maybe_unwrap_json_string(s)
+    s = _balance_braces(s)
+    s = _salvage_json_text(s)
+
     if s.startswith("{") and s.endswith("}"):
         try:
             obj = json.loads(s)
@@ -393,11 +544,12 @@ def parse_alert_text(alert_text: Any) -> Dict[str, Any]:
             raise ValueError(f"alert_text JSON parse failed: {e}") from e
         if not isinstance(obj, dict):
             raise ValueError("alert_text JSON must be an object")
-        return obj
+        normalized = _parse_alert_json_payload(obj)
+        return normalized if normalized is not None else obj
 
-    # If you ever send non-JSON strings, fail loudly (better than silent junk)
     raise ValueError("alert_text must be a dict or a JSON object string")
-    
+
+
 # =========================
 # Misc utils
 # =========================
@@ -526,6 +678,10 @@ def compose_telegram_text(
     bias = str(alert.get("bias") or "").upper().strip()
     tier = str(alert.get("tier") or "").upper().strip()
     tv_score = alert.get("score")
+    entry_type = str(alert.get("entryType") or "").strip()
+    session_phase = str(alert.get("sessionPhase") or "").strip()
+    scalp_mode = str(alert.get("scalpMode") or "").strip()
+    near_key = alert.get("nearKeyLevel")
 
     decision = str(llm.get("decision") or "wait").upper()
     conf = llm.get("confidence")
@@ -562,6 +718,17 @@ def compose_telegram_text(
         score_line_bits.append(f"Conf: {_fmt(conf, 2)}")
     score_line = " | ".join(score_line_bits) if score_line_bits else ""
 
+    context_bits = []
+    if entry_type:
+        context_bits.append(f"Entry: {entry_type}")
+    if session_phase:
+        context_bits.append(f"Session: {session_phase}")
+    if scalp_mode:
+        context_bits.append(f"Mode: {scalp_mode}")
+    if isinstance(near_key, bool):
+        context_bits.append(f"NearKey: {'YES' if near_key else 'NO'}")
+    context_line = " | ".join(context_bits) if context_bits else ""
+
     # add TV indicators if present
     tv_bits = []
     for k, label, nd in [
@@ -570,9 +737,15 @@ def compose_telegram_text(
         ("ema21", "EMA21", 2),
         ("adx", "ADX", 1),
         ("atr", "ATR", 2),
+        ("volRatio", "VolRatio", 2),
+        ("bodyPct", "BodyPct", 2),
+        ("distFromVWAPAtr", "VWAPDistATR", 2),
     ]:
         if alert.get(k) is not None:
-            tv_bits.append(f"{label}: {_fmt(float(alert.get(k)), nd)}")
+            try:
+                tv_bits.append(f"{label}: {_fmt(float(alert.get(k)), nd)}")
+            except Exception:
+                tv_bits.append(f"{label}: {_fmt(alert.get(k), nd)}")
     if isinstance(alert.get("volSpike"), bool):
         tv_bits.append(f"VolSpike: {'YES' if alert.get('volSpike') else 'NO'}")
     tv_line = " | ".join(tv_bits) if tv_bits else ""
@@ -590,6 +763,8 @@ def compose_telegram_text(
     lines = [header, contract_line]
     if score_line:
         lines.append(score_line)
+    if context_line:
+        lines.append(context_line)
     if tv_line:
         lines.append(tv_line)
     if risk_line:
