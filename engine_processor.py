@@ -3,9 +3,10 @@ import os
 import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional, Tuple, Awaitable
+from typing import Dict, Any, List, Optional, Tuple, Awaitable, Callable
 
 from engine_runtime import get_http_client
 from engine_common import (
@@ -31,8 +32,42 @@ NY_TZ = ZoneInfo("America/New_York")
 
 DATA_PROVIDER = os.getenv("DATA_PROVIDER", "polygon").strip().lower()  # polygon|hybrid
 USE_YAHOO_FALLBACK = str(os.getenv("USE_YAHOO_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
+MIN_TV_SCORE_TO_SEND = float(os.getenv("MIN_TV_SCORE_TO_SEND", "0"))
 
 
+# ---------------------------------------------------------------------
+# Engine-level micro cache (reduces repeated calls per symbol)
+# ---------------------------------------------------------------------
+_ENGINE_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+
+def _cache_get(key: str) -> Optional[Any]:
+    it = _ENGINE_CACHE.get(key)
+    if not it:
+        return None
+    exp, val = it
+    if exp <= time.time():
+        _ENGINE_CACHE.pop(key, None)
+        return None
+    return val
+
+
+def _cache_set(key: str, val: Any, ttl_s: float) -> Any:
+    _ENGINE_CACHE[key] = (time.time() + ttl_s, val)
+    return val
+
+
+async def _cached(key: str, ttl_s: float, coro_factory: Callable[[], Awaitable[Any]]) -> Any:
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    val = await coro_factory()
+    return _cache_set(key, val, ttl_s)
+
+
+# ---------------------------------------------------------------------
+# math helpers
+# ---------------------------------------------------------------------
 def _ema_last(vals: List[float], period: int) -> Optional[float]:
     if len(vals) < period:
         return None
@@ -111,7 +146,9 @@ def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
         c = b.get("c")
         if not all(isinstance(x, (int, float)) for x in (h, l, c)):
             continue
-        h = float(h); l = float(l); c = float(c)
+        h = float(h)
+        l = float(l)
+        c = float(c)
         if prev_c is None:
             tr = h - l
         else:
@@ -123,25 +160,69 @@ def _atr14_from_daily(daily_bars: List[Dict[str, Any]]) -> Optional[float]:
     return sum(trs[-14:]) / 14.0
 
 
-async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
+def _extract_tv_score(alert: Dict[str, Any], llm: Dict[str, Any]) -> float:
+    candidates = [
+        alert.get("tvScore"),
+        alert.get("tv_score"),
+        alert.get("TVScore"),
+        alert.get("score_tv"),
+        alert.get("tvscore"),
+        llm.get("tvScore") if isinstance(llm, dict) else None,
+        llm.get("tv_score") if isinstance(llm, dict) else None,
+    ]
+    for val in candidates:
+        try:
+            if val is not None:
+                return float(val)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _should_send_telegram_alert(*, live_data_available: bool, tv_score: float) -> Tuple[bool, str]:
+    if not live_data_available:
+        return False, "Live Polygon data unavailable"
+    if tv_score < MIN_TV_SCORE_TO_SEND:
+        return False, f"TV score {tv_score:.2f} below minimum {MIN_TV_SCORE_TO_SEND:.2f}"
+    return True, "Eligible to send"
+
+
+# ---------------------------------------------------------------------
+# Yahoo chart helpers (NEW)
+# ---------------------------------------------------------------------
+async def _fetch_yahoo_chart_payload(symbol: str) -> Dict[str, Any]:
     cli = get_http_client()
     if cli is None:
         return {}
 
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "5d", "interval": "5m", "includePrePost": "true", "events": "div,splits"}
-    try:
-        r = await cli.get(url, params=params, timeout=8.0)
-        r.raise_for_status()
-        js = r.json()
-    except Exception as e:
-        logger.warning("[features] yahoo fetch failed for %s: %r", symbol, e)
+    sym = (symbol or "").upper().strip()
+    if not sym:
         return {}
 
+    async def _do_fetch() -> Dict[str, Any]:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        params = {
+            "range": "5d",
+            "interval": "5m",
+            "includePrePost": "true",
+            "events": "div,splits",
+        }
+        try:
+            r = await cli.get(url, params=params, timeout=8.0)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.warning("[yahoo] chart fetch failed for %s: %r", sym, e)
+            return {}
+
+    return await _cached(f"yahoo:chart_payload:{sym}", 30.0, _do_fetch)
+
+
+def _parse_yahoo_rows(js: Dict[str, Any]) -> List[Tuple[datetime, float, float, float, float, float]]:
     try:
         res = (js.get("chart") or {}).get("result") or []
         if not res:
-            return {}
+            return []
 
         node = res[0]
         ts = node.get("timestamp") or []
@@ -158,10 +239,201 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
                 continue
             dt = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(NY_TZ)
             rows.append((dt, float(o), float(h), float(l), float(c), float(v or 0.0)))
+        return rows
+    except Exception as e:
+        logger.warning("[yahoo] row parse failed: %r", e)
+        return []
 
-        if len(rows) < 30:
-            return {}
 
+def _build_yahoo_intraday_context(
+    symbol: str,
+    rows: List[Tuple[datetime, float, float, float, float, float]],
+) -> Dict[str, Any]:
+    if len(rows) < 30:
+        return {}
+
+    closes = [r[4] for r in rows]
+    highs = [r[2] for r in rows]
+    lows = [r[3] for r in rows]
+    vols = [r[5] for r in rows]
+
+    day_key = rows[-1][0].date()
+    day_rows = [r for r in rows if r[0].date() == day_key]
+    prev_rows = [r for r in rows if r[0].date() < day_key]
+
+    if not day_rows:
+        return {}
+
+    last_px = day_rows[-1][4]
+    day_open = day_rows[0][1]
+    day_high = max(r[2] for r in day_rows)
+    day_low = min(r[3] for r in day_rows)
+    day_vol = sum(r[5] for r in day_rows)
+
+    rth = [
+        r for r in day_rows
+        if (r[0].hour > 9 or (r[0].hour == 9 and r[0].minute >= 30))
+        and (r[0].hour < 16)
+    ]
+    pm = [
+        r for r in day_rows
+        if (r[0].hour > 4 or (r[0].hour == 4 and r[0].minute >= 0))
+        and (r[0].hour < 9 or (r[0].hour == 9 and r[0].minute < 30))
+    ]
+
+    prev_day = prev_rows[-78:] if prev_rows else []
+    prev_close = prev_day[-1][4] if prev_day else None
+    prev_high = max((r[2] for r in prev_day), default=None)
+    prev_low = min((r[3] for r in prev_day), default=None)
+
+    ema9 = _ema_last(closes, 9)
+    ema20 = _ema_last(closes, 20)
+    ema50 = _ema_last(closes, 50)
+    rsi14 = _rsi_last(closes, 14)
+
+    vwap = None
+    if rth:
+        try:
+            vwap_num = sum((((r[2] + r[3] + r[4]) / 3.0) * r[5]) for r in rth)
+            vwap_den = sum(r[5] for r in rth)
+            if vwap_den > 0:
+                vwap = vwap_num / vwap_den
+        except Exception:
+            vwap = None
+
+    last3 = rth[-3:] if len(rth) >= 3 else day_rows[-3:]
+    last3_dir = []
+    for r in last3:
+        o, c = r[1], r[4]
+        if c > o:
+            last3_dir.append("up")
+        elif c < o:
+            last3_dir.append("down")
+        else:
+            last3_dir.append("flat")
+
+    green_count = sum(1 for d in last3_dir if d == "up")
+    red_count = sum(1 for d in last3_dir if d == "down")
+    if green_count >= 2:
+        last3_bias = "bullish"
+    elif red_count >= 2:
+        last3_bias = "bearish"
+    else:
+        last3_bias = "mixed"
+
+    pm_high = max((r[2] for r in pm), default=None)
+    pm_low = min((r[3] for r in pm), default=None)
+
+    if len(rth) >= 3:
+        orb15 = rth[:3]
+        orb15_high = max(r[2] for r in orb15)
+        orb15_low = min(r[3] for r in orb15)
+    else:
+        orb15_high = None
+        orb15_low = None
+
+    five_day_high = max(highs) if highs else None
+    five_day_low = min(lows) if lows else None
+    five_day_return_pct = _safe_pct(closes[-1], closes[0]) if len(closes) >= 2 else None
+    day_change_pct = _safe_pct(last_px, day_open)
+    gap_pct = _safe_pct(day_open, prev_close) if prev_close is not None else None
+    vwap_dist_pct = _safe_pct(last_px, vwap) if vwap is not None else None
+
+    intraday_bias = "neutral"
+    if vwap is not None and ema9 is not None and ema20 is not None:
+        if last_px > vwap and ema9 > ema20:
+            intraday_bias = "bullish"
+        elif last_px < vwap and ema9 < ema20:
+            intraday_bias = "bearish"
+
+    breakout_state = "inside"
+    if orb15_high is not None and last_px > orb15_high:
+        breakout_state = "above_orb15"
+    elif orb15_low is not None and last_px < orb15_low:
+        breakout_state = "below_orb15"
+
+    sr_state = "inside_prev_day"
+    if prev_high is not None and last_px > prev_high:
+        sr_state = "above_prev_high"
+    elif prev_low is not None and last_px < prev_low:
+        sr_state = "below_prev_low"
+
+    summary_parts = [
+        f"{symbol} Yahoo 5d/5m context",
+        f"intraday_bias={intraday_bias}",
+        f"last3_candles={last3_bias}",
+    ]
+    if vwap is not None:
+        summary_parts.append(f"vs_vwap={vwap_dist_pct:.2f}%")
+    if day_change_pct is not None:
+        summary_parts.append(f"day_change={day_change_pct:.2f}%")
+    if gap_pct is not None:
+        summary_parts.append(f"gap={gap_pct:.2f}%")
+    if five_day_return_pct is not None:
+        summary_parts.append(f"5d_return={five_day_return_pct:.2f}%")
+    summary_parts.append(f"orb_state={breakout_state}")
+    summary_parts.append(f"sr_state={sr_state}")
+
+    return {
+        "yahoo_ctx_available": True,
+        "yahoo_symbol": symbol,
+        "yahoo_chart_range": "5d",
+        "yahoo_chart_interval": "5m",
+        "yahoo_last": last_px,
+        "yahoo_day_open": day_open,
+        "yahoo_day_high": day_high,
+        "yahoo_day_low": day_low,
+        "yahoo_day_volume": day_vol,
+        "yahoo_prev_close": prev_close,
+        "yahoo_prev_high": prev_high,
+        "yahoo_prev_low": prev_low,
+        "yahoo_premarket_high": pm_high,
+        "yahoo_premarket_low": pm_low,
+        "yahoo_orb15_high": orb15_high,
+        "yahoo_orb15_low": orb15_low,
+        "yahoo_ema9": ema9,
+        "yahoo_ema20": ema20,
+        "yahoo_ema50": ema50,
+        "yahoo_rsi14": rsi14,
+        "yahoo_vwap": vwap,
+        "yahoo_vwap_dist_pct": vwap_dist_pct,
+        "yahoo_intraday_bias": intraday_bias,
+        "yahoo_last3_candle_bias": last3_bias,
+        "yahoo_last3_sequence": ",".join(last3_dir) if last3_dir else None,
+        "yahoo_day_change_pct": day_change_pct,
+        "yahoo_gap_pct": gap_pct,
+        "yahoo_5d_high": five_day_high,
+        "yahoo_5d_low": five_day_low,
+        "yahoo_5d_return_pct": five_day_return_pct,
+        "yahoo_orb_break_state": breakout_state,
+        "yahoo_prev_day_sr_state": sr_state,
+        "yahoo_llm_summary": " | ".join(summary_parts),
+    }
+
+
+async def _fetch_yahoo_chart_context(symbol: str) -> Dict[str, Any]:
+    js = await _fetch_yahoo_chart_payload(symbol)
+    if not js:
+        return {}
+    rows = _parse_yahoo_rows(js)
+    if not rows:
+        return {}
+    return _build_yahoo_intraday_context(symbol, rows)
+
+
+# ---------------------------------------------------------------------
+# Yahoo fallback (generic market features)
+# ---------------------------------------------------------------------
+async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
+    js = await _fetch_yahoo_chart_payload(symbol)
+    if not js:
+        return {}
+
+    rows = _parse_yahoo_rows(js)
+    if len(rows) < 30:
+        return {}
+
+    try:
         closes = [rr[4] for rr in rows]
         vols = [rr[5] for rr in rows]
         last_px = closes[-1]
@@ -197,7 +469,8 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         prev_open = prev_day[0][1] if prev_day else None
 
         pm = [
-            rr for rr in day_rows
+            rr
+            for rr in day_rows
             if (rr[0].hour > 4 or (rr[0].hour == 4 and rr[0].minute >= 0))
             and (rr[0].hour < 9 or (rr[0].hour == 9 and rr[0].minute < 30))
         ]
@@ -205,9 +478,9 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         pm_low = min((rr[3] for rr in pm), default=None)
 
         rth = [
-            rr for rr in day_rows
-            if (rr[0].hour > 9 or (rr[0].hour == 9 and rr[0].minute >= 30))
-            and (rr[0].hour < 16)
+            rr
+            for rr in day_rows
+            if (rr[0].hour > 9 or (rr[0].hour == 9 and rr[0].minute >= 30)) and (rr[0].hour < 16)
         ]
         orb15 = [rr for rr in rth if (rr[0].hour == 9 and rr[0].minute < 45)]
         orb15_high = max((rr[2] for rr in orb15), default=None)
@@ -220,9 +493,11 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
         vol_now = day_rows[-1][5] if day_rows else vols[-1]
         qchg = _safe_pct(last_px, prev_close)
 
-        regime_flag = "trending" if (
-            ema20 is not None and ema50 is not None and abs(ema20 - ema50) / max(last_px, 1e-9) > 0.002
-        ) else "choppy"
+        regime_flag = (
+            "trending"
+            if (ema20 is not None and ema50 is not None and abs(ema20 - ema50) / max(last_px, 1e-9) > 0.002)
+            else "choppy"
+        )
 
         mtf_align = bool(
             ema20 is not None and ema50 is not None and ((last_px > ema20 > ema50) or (last_px < ema20 < ema50))
@@ -266,10 +541,13 @@ async def _fetch_yahoo_features(symbol: str) -> Dict[str, Any]:
             "data_provider": "yahoo",
         }
     except Exception as e:
-        logger.warning("[features] parse error for %s: %r", symbol, e)
+        logger.warning("[features] yahoo parse error for %s: %r", symbol, e)
         return {}
 
 
+# ---------------------------------------------------------------------
+# Polygon features
+# ---------------------------------------------------------------------
 async def _fetch_polygon_features(
     symbol: str,
     *,
@@ -285,42 +563,158 @@ async def _fetch_polygon_features(
     if not pc.enabled:
         return {}
 
+    sym = (symbol or "").upper()
+
     async def _empty_dict() -> Dict[str, Any]:
         return {}
 
-    async def _aggs_window(sym: str, multiplier: int, timespan: str, from_: str, to: str, limit: int) -> List[Dict[str, Any]]:
-        if hasattr(pc, "get_aggs_window"):
-            return await pc.get_aggs_window(sym, multiplier=multiplier, timespan=timespan, from_=from_, to=to, limit=limit)
-        if timespan in ("minute", "hour", "day"):
-            return await pc.get_aggregates(sym, multiplier=multiplier, timespan=timespan, limit=limit)
-        return []
+    async def _safe_call(name: str, coro: Awaitable[Any], default: Any) -> Any:
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning("[features] polygon subcall failed (%s) for %s: %r", name, sym, e)
+            return default
 
-    try:
-        snap_task = pc.get_stock_snapshot(symbol)
-        quote_task = pc.get_last_quote(symbol)
-        trade_task = pc.get_last_trade(symbol)
-        agg5m_task = pc.get_aggregates(symbol, multiplier=5, timespan="minute", limit=600)
-        tech_task = pc.get_technicals_bundle(symbol)
+    today = date.today()
+    to_iso = (today + timedelta(days=2)).isoformat()
 
-        # Only fetch option context when we have option identifiers
-        if expiry_iso and side and (strike is not None):
-            opt_task: Awaitable[Dict[str, Any]] = pc.get_targeted_option_context(
-                symbol, expiry_iso=expiry_iso, side=side, strike=strike
-            )
-        else:
-            opt_task = _empty_dict()
+    from_5m = (today - timedelta(days=10)).isoformat()
+    from_15m = (today - timedelta(days=18)).isoformat()
+    from_h1 = (today - timedelta(days=40)).isoformat()
+    from_d = (today - timedelta(days=320)).isoformat()
 
-        today = date.today()
-        to_iso = (today + timedelta(days=2)).isoformat()
-        daily_task = _aggs_window(symbol, 1, "day", (today - timedelta(days=220)).isoformat(), to_iso, limit=260)
-        h1_task = _aggs_window(symbol, 1, "hour", (today - timedelta(days=30)).isoformat(), to_iso, limit=800)
-        m15_task = _aggs_window(symbol, 15, "minute", (today - timedelta(days=10)).isoformat(), to_iso, limit=1200)
+    k_snap = f"poly:snap:{sym}"
+    k_quote = f"poly:quote:{sym}"
+    k_trade = f"poly:trade:{sym}"
+    k_aggs5m = f"poly:aggs5m:{sym}:{from_5m}:{to_iso}"
+    k_aggs15m = f"poly:aggs15m:{sym}:{from_15m}:{to_iso}"
+    k_aggsh1 = f"poly:aggsh1:{sym}:{from_h1}:{to_iso}"
+    k_aggsd = f"poly:aggsd:{sym}:{from_d}:{to_iso}"
+    k_techm = f"poly:techm:{sym}"
+    k_techd = f"poly:techd:{sym}"
 
-        stock_snap, last_quote, last_trade, aggs5m, techs, opt_ctx, daily_bars, h1_bars, m15_bars = await asyncio.gather(
-            snap_task, quote_task, trade_task, agg5m_task, tech_task, opt_task, daily_task, h1_task, m15_task
+    TTL_SNAP = 10.0
+    TTL_QUOTE = 5.0
+    TTL_TRADE = 5.0
+    TTL_AGGS_5M = 20.0
+    TTL_AGGS_15M = 60.0
+    TTL_AGGS_H1 = 300.0
+    TTL_AGGS_D = 900.0
+    TTL_TECH_M = 60.0
+    TTL_TECH_D = 900.0
+
+    snap_task = _safe_call("snapshot", _cached(k_snap, TTL_SNAP, lambda: pc.get_stock_snapshot(sym)), {})
+    quote_task = _safe_call("last_quote", _cached(k_quote, TTL_QUOTE, lambda: pc.get_last_quote(sym)), {})
+    trade_task = _safe_call("last_trade", _cached(k_trade, TTL_TRADE, lambda: pc.get_last_trade(sym)), {})
+
+    agg5m_task = _safe_call(
+        "aggs_5m",
+        _cached(
+            k_aggs5m,
+            TTL_AGGS_5M,
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=5,
+                timespan="minute",
+                from_=from_5m,
+                to=to_iso,
+                limit=600,
+                cache_ttl_s=20.0,
+            ),
+        ),
+        [],
+    )
+    m15_task = _safe_call(
+        "aggs_m15",
+        _cached(
+            k_aggs15m,
+            TTL_AGGS_15M,
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=15,
+                timespan="minute",
+                from_=from_15m,
+                to=to_iso,
+                limit=1200,
+                cache_ttl_s=60.0,
+            ),
+        ),
+        [],
+    )
+    h1_task = _safe_call(
+        "aggs_h1",
+        _cached(
+            k_aggsh1,
+            TTL_AGGS_H1,
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=1,
+                timespan="hour",
+                from_=from_h1,
+                to=to_iso,
+                limit=800,
+                cache_ttl_s=300.0,
+            ),
+        ),
+        [],
+    )
+    daily_task = _safe_call(
+        "aggs_daily",
+        _cached(
+            k_aggsd,
+            TTL_AGGS_D,
+            lambda: pc.get_aggs_window(
+                sym,
+                multiplier=1,
+                timespan="day",
+                from_=from_d,
+                to=to_iso,
+                limit=260,
+                cache_ttl_s=900.0,
+            ),
+        ),
+        [],
+    )
+
+    tech_task = _safe_call(
+        "techs_m",
+        _cached(k_techm, TTL_TECH_M, lambda: pc.get_technicals_bundle(sym, timespan="minute")),
+        {},
+    )
+    tech_d_task = _safe_call(
+        "techs_d",
+        _cached(k_techd, TTL_TECH_D, lambda: pc.get_technicals_daily_bundle(sym)),
+        {},
+    )
+
+    if expiry_iso and side and (strike is not None):
+        k_opt = f"poly:optctx:{sym}:{expiry_iso}:{side}:{strike}"
+        opt_task: Awaitable[Dict[str, Any]] = _safe_call(
+            "opt_ctx",
+            _cached(
+                k_opt,
+                10.0,
+                lambda: pc.get_targeted_option_context(sym, expiry_iso=expiry_iso, side=side, strike=strike),
+            ),
+            {},
         )
-    except Exception as e:
-        logger.warning("[features] polygon fetch failed for %s: %r", symbol, e)
+    else:
+        opt_task = _empty_dict()
+
+    stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars = await asyncio.gather(
+        snap_task,
+        quote_task,
+        trade_task,
+        agg5m_task,
+        tech_task,
+        tech_d_task,
+        opt_task,
+        daily_task,
+        h1_task,
+        m15_task,
+    )
+
+    if not any([stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars]):
         return {}
 
     out: Dict[str, Any] = {
@@ -333,12 +727,12 @@ async def _fetch_polygon_features(
         "mtf_align": True,
     }
 
-    q = stock_snap.get("lastQuote") or {}
-    d = stock_snap.get("day") or {}
-    pd = stock_snap.get("prevDay") or {}
+    q = (stock_snap or {}).get("lastQuote") or {}
+    d = (stock_snap or {}).get("day") or {}
+    pd = (stock_snap or {}).get("prevDay") or {}
 
-    bid = q.get("p") or last_quote.get("p")
-    ask = q.get("P") or last_quote.get("P")
+    bid = q.get("p") or (last_quote or {}).get("p")
+    ask = q.get("P") or (last_quote or {}).get("P")
 
     if isinstance(bid, (int, float)):
         out["bid"] = float(bid)
@@ -347,7 +741,7 @@ async def _fetch_polygon_features(
     if isinstance(out.get("bid"), float) and isinstance(out.get("ask"), float):
         out["mid"] = (out["bid"] + out["ask"]) / 2.0
 
-    last_trade_px = (stock_snap.get("lastTrade") or {}).get("p") or last_trade.get("p")
+    last_trade_px = ((stock_snap or {}).get("lastTrade") or {}).get("p") or (last_trade or {}).get("p")
     if isinstance(last_trade_px, (int, float)):
         out["last"] = float(last_trade_px)
 
@@ -380,8 +774,11 @@ async def _fetch_polygon_features(
                 out["vol_avg20"] = sum(vols[-20:]) / 20.0
 
             try:
-                tps = [
-                    (((float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0), float(x.get("v") or 0.0)))
+                tps: List[Tuple[float, float]] = [
+                    (
+                        (float(x.get("h")) + float(x.get("l")) + float(x.get("c"))) / 3.0,
+                        float(x.get("v") or 0.0),
+                    )
                     for x in bars
                     if all(isinstance(x.get(k), (int, float)) for k in ("h", "l", "c"))
                 ]
@@ -392,8 +789,25 @@ async def _fetch_polygon_features(
             except Exception:
                 pass
 
-    if isinstance(techs, dict):
+    if isinstance(techs, dict) and techs:
         out.update({k: v for k, v in techs.items() if v is not None})
+
+    if isinstance(techs_d, dict) and techs_d:
+        out.update({k: v for k, v in techs_d.items() if v is not None})
+
+    try:
+        lp = float(out["last"]) if out.get("last") is not None else None
+        ema20_d = out.get("ema20_d")
+        ema50_d = out.get("ema50_d")
+        if lp is not None and isinstance(ema20_d, (int, float)) and isinstance(ema50_d, (int, float)):
+            if lp > float(ema20_d) > float(ema50_d):
+                out["daily_trend_bias"] = "bull"
+            elif lp < float(ema20_d) < float(ema50_d):
+                out["daily_trend_bias"] = "bear"
+            else:
+                out["daily_trend_bias"] = "neutral"
+    except Exception:
+        pass
 
     atr14 = _atr14_from_daily(daily_bars or [])
     if atr14 is not None:
@@ -425,8 +839,8 @@ async def _fetch_polygon_features(
         else "choppy"
     )
     if out.get("ema20") is not None and out.get("ema50") is not None and out.get("last") is not None:
-        lp = float(out["last"])
-        out["mtf_align"] = bool((lp > out["ema20"] > out["ema50"]) or (lp < out["ema20"] < out["ema50"]))
+        lp2 = float(out["last"])
+        out["mtf_align"] = bool((lp2 > out["ema20"] > out["ema50"]) or (lp2 < out["ema20"] < out["ema50"]))
 
     if opt_ctx and isinstance(opt_ctx, dict) and opt_ctx:
         out.update({k: v for k, v in opt_ctx.items() if v is not None})
@@ -462,11 +876,32 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         logger.warning("[worker] bad alert payload: %s", e)
         return
 
-    # Meta extracted directly from alert (now consistent keys from engine_common.py)
+    symbol = str(alert.get("symbol") or "").upper()
+
     tv_meta_keys = [
-        "source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange",
-        "level", "ats", "bp", "tp1", "tp2", "tp3", "trail", "relvol", "relVol", "chop",
-        "fast_stop", "ason", "adx",
+        "source",
+        "model",
+        "confirm_tf",
+        "chart_tf",
+        "event",
+        "reason",
+        "exchange",
+        "level",
+        "ats",
+        "bp",
+        "tp1",
+        "tp2",
+        "tp3",
+        "trail",
+        "relvol",
+        "relVol",
+        "chop",
+        "fast_stop",
+        "ason",
+        "adx",
+        "tvScore",
+        "tv_score",
+        "TVScore",
     ]
     tv_meta: Dict[str, Any] = {k: alert.get(k) for k in tv_meta_keys if alert.get(k) is not None}
 
@@ -493,13 +928,21 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
         "tv_meta": tv_meta,
     }
 
-    live = await _fetch_equity_features(
-        str(alert.get("symbol") or "").upper(),
-        expiry_iso=alert.get("expiry"),
-        side=alert.get("side"),
-        strike=alert.get("strike"),
+    live, yahoo_ctx = await asyncio.gather(
+        _fetch_equity_features(
+            symbol,
+            expiry_iso=alert.get("expiry"),
+            side=alert.get("side"),
+            strike=alert.get("strike"),
+        ),
+        _fetch_yahoo_chart_context(symbol),
     )
+
     for k, v in live.items():
+        if v is not None:
+            f[k] = v
+
+    for k, v in yahoo_ctx.items():
         if v is not None:
             f[k] = v
 
@@ -528,6 +971,9 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
     except Exception:
         score, rating = None, None
 
+    tv_score = _extract_tv_score(alert, llm)
+    live_data_available = bool(live) and str(f.get("data_provider") or "").lower() == "polygon"
+
     try:
         src = str(f.get("ta_src") or "unknown")
         provider = str(f.get("data_provider") or "unknown")
@@ -541,13 +987,19 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             meta_bits.append(f"model={tv_meta.get('model')}")
         if tv_meta.get("reason"):
             meta_bits.append(f"reason={tv_meta.get('reason')}")
+        if tv_score > 0:
+            meta_bits.append(f"tvScore={tv_score:.2f}")
+        if f.get("yahoo_intraday_bias"):
+            meta_bits.append(f"yahooBias={f.get('yahoo_intraday_bias')}")
+        if f.get("yahoo_last3_candle_bias"):
+            meta_bits.append(f"yahooLast3={f.get('yahoo_last3_candle_bias')}")
 
         meta_note = (" | " + ", ".join(meta_bits)) if meta_bits else ""
 
-        if live:
-            data_note = f"📊 Data: {provider} ({src}){meta_note}"
+        if live_data_available:
+            data_note = f"📊 Data: {provider} ({src}) + Yahoo chart context{meta_note}"
         else:
-            data_note = f"⚠️ Live data unavailable; using alert baseline{meta_note}"
+            data_note = f"⚠️ Live Polygon data unavailable; using alert baseline + Yahoo chart context{meta_note}"
 
         tg_text = compose_telegram_text(
             alert=alert,
@@ -561,14 +1013,38 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             diff_note=data_note,
         )
 
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            logger.info("[tg] send attempt: chat_id=%s len=%d decision=%s",
-                        str(TELEGRAM_CHAT_ID), len(tg_text or ""), str(llm.get("decision")))
+        send_ok, skip_reason = _should_send_telegram_alert(
+            live_data_available=live_data_available,
+            tv_score=tv_score,
+        )
+
+        if not send_ok:
+            logger.info(
+                "[tg] skip: symbol=%s reason=%s live_data=%s provider=%s tv_score=%.2f threshold=%.2f",
+                symbol,
+                skip_reason,
+                live_data_available,
+                provider,
+                tv_score,
+                MIN_TV_SCORE_TO_SEND,
+            )
+        elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            logger.info(
+                "[tg] send attempt: chat_id=%s len=%d decision=%s tv_score=%.2f yahoo_ctx=%s",
+                str(TELEGRAM_CHAT_ID),
+                len(tg_text or ""),
+                str(llm.get("decision")),
+                tv_score,
+                bool(f.get("yahoo_ctx_available")),
+            )
             await send_telegram(tg_text)
             logger.info("[tg] send done")
         else:
-            logger.warning("[tg] missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID (token=%s chat_id=%s)",
-                           bool(TELEGRAM_BOT_TOKEN), bool(TELEGRAM_CHAT_ID))
+            logger.warning(
+                "[tg] missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID (token=%s chat_id=%s)",
+                bool(TELEGRAM_BOT_TOKEN),
+                bool(TELEGRAM_CHAT_ID),
+            )
     except Exception as e:
         logger.exception("[worker] Telegram error: %s", e)
 
@@ -590,6 +1066,11 @@ async def process_tradingview_job(job: Dict[str, Any]) -> None:
             "preflight_checks": pf_checks,
             "ibkr": {"enabled": False, "attempted": False, "result": None},
             "tv_meta": tv_meta,
+            "telegram_gate": {
+                "live_data_available": live_data_available,
+                "tv_score": tv_score,
+                "min_tv_score_to_send": MIN_TV_SCORE_TO_SEND,
+            },
         }
     )
 
