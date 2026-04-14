@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-Common helpers/config for the trading engine.
+Common helpers/config for the trading engine..
 (You can keep/remove this docstring — future import must stay above all imports.)
 """
 
