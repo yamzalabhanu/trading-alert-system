@@ -396,6 +396,7 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
     # New Pine v6.1 fields
     # -----------------------------
     passthrough_keys = (
+        "mode",
         "optionType",
         "signalSide",
         "bias",
@@ -404,6 +405,7 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         "oppositeScore",
         "tier",
         "entryType",
+        "rsi",
         "sessionPhase",
         "scalpMode",
         "levelRulesActive",
@@ -411,7 +413,10 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         "vwap",
         "ema9",
         "ema21",
+        "ema50",
+        "ema200",
         "adx",
+        "atrPct",
         "volRatio",
         "volSpike",
         "bodyPct",
@@ -430,6 +435,8 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         "pdPutBreak",
         "or15CallReclaim",
         "or15PutBreak",
+        "orbHigh",
+        "orbLow",
         "orbH",
         "orbL",
         "orbRange",
@@ -452,6 +459,8 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
         "regimeSymbol",
         "regimeBull",
         "regimeBear",
+        "htfBull",
+        "htfBear",
     )
 
     for k in passthrough_keys:
@@ -491,6 +500,8 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
     if "score" in out:
         try:
             out["confidence"] = float(out["score"])
+            out["tvScore"] = float(out["score"])
+            out["tv_score"] = float(out["score"])
         except Exception:
             pass
 

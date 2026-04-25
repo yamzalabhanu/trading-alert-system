@@ -159,7 +159,10 @@ def _alert_payload(alert: Dict[str, Any]) -> Dict[str, Any]:
     for k in (
         "source", "model", "confirm_tf", "chart_tf", "event", "reason", "exchange", "level",
         "tp1", "tp2", "tp3", "trail", "relVol", "relvol", "chop", "adx",
-        "tvScore", "tv_score", "TVScore"
+        "tvScore", "tv_score", "TVScore",
+        "mode", "tf", "score", "entryType", "rsi", "atr", "atrPct",
+        "vwap", "ema9", "ema21", "ema50", "ema200",
+        "orbHigh", "orbLow", "volSpike", "htfBull", "htfBear",
     ):
         if alert.get(k) is not None:
             out[k] = alert.get(k)
