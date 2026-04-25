@@ -11,7 +11,7 @@ import httpx
 
 log = logging.getLogger("trading_engine.polygon")
 
-POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
+POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY") or os.getenv("MASSIVE_API_KEY") or "").strip()
 POLYGON_BASE_URL = (os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/"))
 
 # -----------------------------

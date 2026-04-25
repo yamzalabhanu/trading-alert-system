@@ -1,9 +1,10 @@
 # routes.py
 import os
+import json
 import asyncio
 import logging
 from contextlib import suppress
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -30,6 +31,38 @@ if not log.handlers:
 log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 router = APIRouter()
+
+
+def _coerce_webhook_payload(raw_body: bytes, parsed_json: Any) -> List[Dict[str, Any]]:
+    """
+    Accept TradingView payload formats:
+      - single JSON object
+      - JSON array of objects
+      - comma-joined JSON objects (best-effort salvage): "{...}, {...}"
+    """
+    if isinstance(parsed_json, dict):
+        return [parsed_json]
+    if isinstance(parsed_json, list) and all(isinstance(x, dict) for x in parsed_json):
+        return parsed_json
+
+    if isinstance(parsed_json, str):
+        body_text = parsed_json.strip()
+    else:
+        body_text = (raw_body or b"").decode("utf-8", errors="replace").strip()
+
+    if not body_text:
+        raise ValueError("payload must be a JSON object or array")
+
+    # best-effort salvage for common TradingView batch shape: "{...}, {...}"
+    if body_text.startswith("{") and body_text.endswith("}") and "},{" in body_text.replace(" ", ""):
+        body_text = f"[{body_text}]"
+
+    obj = json.loads(body_text)
+    if isinstance(obj, dict):
+        return [obj]
+    if isinstance(obj, list) and all(isinstance(x, dict) for x in obj):
+        return obj
+    raise ValueError("payload must be a JSON object or array of objects")
 
 
 # ---------------- Env helpers ----------------
@@ -171,9 +204,12 @@ async def health() -> Dict[str, Any]:
 async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONResponse:
     # parse JSON
     try:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise ValueError("payload must be a JSON object")
+        raw_body = await request.body()
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+        alerts = _coerce_webhook_payload(raw_body, payload)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
@@ -193,16 +229,27 @@ async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONR
     enqueue_webhook = getattr(engine, "enqueue_webhook_job", None)
     if callable(enqueue_webhook):
         try:
-            res = enqueue_webhook(payload, flags)  # may be bool or coroutine
-            if asyncio.iscoroutine(res):
-                res = await res
-            return JSONResponse({"ok": True, "enqueued": bool(res), "bypass_window": bool(bypass_window)})
+            enqueued = 0
+            for alert in alerts:
+                res = enqueue_webhook(alert, flags)  # may be bool or coroutine
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if res:
+                    enqueued += 1
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "enqueued": enqueued,
+                    "received": len(alerts),
+                    "bypass_window": bool(bypass_window),
+                }
+            )
         except Exception as e:
             log.exception("enqueue_webhook_job failed: %r", e)
             raise HTTPException(status_code=500, detail=f"enqueue_webhook_job failed: {e}")
 
     # Fallback to job-dict enqueue contracts if you ever add them back
-    job = {"alert_text": payload, "flags": flags}
+    jobs = [{"alert_text": alert, "flags": flags} for alert in alerts]
     enqueue_fn = None
     for name in ("enqueue", "enqueue_job", "enqueue_alert", "submit"):
         fn = getattr(engine, name, None)
@@ -217,11 +264,12 @@ async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONR
         )
 
     try:
-        res2 = enqueue_fn(job)
-        if asyncio.iscoroutine(res2):
-            await res2
+        for job in jobs:
+            res2 = enqueue_fn(job)
+            if asyncio.iscoroutine(res2):
+                await res2
     except Exception as e:
         log.exception("enqueue failed: %r", e)
         raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
 
-    return JSONResponse({"ok": True, "bypass_window": bool(bypass_window)})
+    return JSONResponse({"ok": True, "enqueued": len(jobs), "received": len(alerts), "bypass_window": bool(bypass_window)})

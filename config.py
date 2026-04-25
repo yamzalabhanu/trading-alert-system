@@ -11,7 +11,7 @@ MARKET_TZ = ZoneInfo(os.getenv("MARKET_TZ", "America/New_York"))
 # Model / API keys
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY") or os.getenv("MASSIVE_API_KEY")
 
 # Limits / knobs
 MAX_LLM_PER_DAY = int(os.getenv("MAX_LLM_PER_DAY", "40"))
