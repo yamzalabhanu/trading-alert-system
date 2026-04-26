@@ -203,17 +203,42 @@ async def health() -> Dict[str, Any]:
 @router.post("/webhook")
 @router.post("/webhook/")
 async def webhook(request: Request) -> Dict[str, Any]:
-    payload = await request.json()
-    print("RAW WEBHOOK PAYLOAD:", payload)
+    try:
+        raw_body = await request.body()
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+        alerts = _coerce_webhook_payload(raw_body, payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
     process_tradingview_alert = getattr(engine, "process_tradingview_alert", None)
-    if not callable(process_tradingview_alert):
-        raise HTTPException(status_code=500, detail="Engine function process_tradingview_alert not found")
+    if callable(process_tradingview_alert):
+        results = []
+        for alert in alerts:
+            result = process_tradingview_alert(alert)
+            if asyncio.iscoroutine(result):
+                result = await result
+            results.append(result)
+        return {"ok": True, "processed": len(results), "result": results}
 
-    result = process_tradingview_alert(payload)
-    if asyncio.iscoroutine(result):
-        result = await result
-    return {"ok": True, "result": result}
+    # Backward-compatible fallback for current runtime facade.
+    enqueue_webhook = getattr(engine, "enqueue_webhook_job", None)
+    if callable(enqueue_webhook):
+        enqueued = 0
+        for alert in alerts:
+            result = enqueue_webhook(alert, {"path": str(request.url.path)})
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result:
+                enqueued += 1
+        return {"ok": True, "enqueued": enqueued, "received": len(alerts)}
+
+    raise HTTPException(
+        status_code=500,
+        detail="Engine function not found (expected process_tradingview_alert or enqueue_webhook_job)",
+    )
 
 
 @router.post("/webhook/tradingview")
