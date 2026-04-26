@@ -5,6 +5,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -26,6 +27,9 @@ POLYGON_ENABLE_LAST_TRADE = _truthy(os.getenv("POLYGON_ENABLE_LAST_TRADE", "1"))
 POLYGON_ENABLE_AGGS = _truthy(os.getenv("POLYGON_ENABLE_AGGS", "1"))
 POLYGON_ENABLE_INDICATORS = _truthy(os.getenv("POLYGON_ENABLE_INDICATORS", "1"))
 POLYGON_ENABLE_OPTIONS = _truthy(os.getenv("POLYGON_ENABLE_OPTIONS", "1"))
+POLYGON_ENABLE_TRADES = _truthy(os.getenv("POLYGON_ENABLE_TRADES", "1"))
+POLYGON_ENABLE_REFERENCE = _truthy(os.getenv("POLYGON_ENABLE_REFERENCE", "1"))
+POLYGON_ENABLE_CORP_ACTIONS = _truthy(os.getenv("POLYGON_ENABLE_CORP_ACTIONS", "1"))
 
 # NEW: Prefer local TA derived from aggs to avoid /v1/indicators 429
 # Default ON.
@@ -35,6 +39,7 @@ POLYGON_TECH_FALLBACK_TO_API = _truthy(os.getenv("POLYGON_TECH_FALLBACK_TO_API",
 
 # NEW: when 429 happens on a path, back off and "block" that path for a bit
 POLYGON_429_COOLDOWN = float(os.getenv("POLYGON_429_COOLDOWN", "60") or 60.0)
+POLYGON_OPTIONS_UNIVERSE_LIMIT = int(os.getenv("POLYGON_OPTIONS_UNIVERSE_LIMIT", "1000") or 1000)
 
 
 @dataclass
@@ -449,13 +454,11 @@ class PolygonClient:
                     # user of this bundle is engine_processor which already gets daily aggs separately;
                     # if it still calls this, we fetch minimal.
                     # 320 calendar days is okay for 260 bars on most symbols.
-                    from datetime import date, timedelta
                     today = date.today()
                     from_ = (today - timedelta(days=320)).isoformat()
                     to = (today + timedelta(days=2)).isoformat()
                     bars = await self.get_aggs_window(sym, multiplier=1, timespan="day", from_=from_, to=to, limit=260, cache_ttl_s=900.0)
                 else:
-                    from datetime import date, timedelta
                     today = date.today()
                     from_ = (today - timedelta(days=10)).isoformat()
                     to = (today + timedelta(days=2)).isoformat()
@@ -540,6 +543,196 @@ class PolygonClient:
             cache_key=f"optsnap:{option_ticker}",
         )
         return js.get("results") or {}
+
+    async def get_option_last_trade(self, option_ticker: str) -> Dict[str, Any]:
+        if not (POLYGON_ENABLE_OPTIONS and POLYGON_ENABLE_TRADES):
+            return {}
+        js = await self._get_soft(
+            f"/v3/trades/options/{option_ticker}/last",
+            timeout=8.0,
+            symbol=None,
+            log_prefix="[polygon] options/trades_last",
+            cache_ttl_s=5.0,
+            cache_key=f"opttrade:{option_ticker}",
+        )
+        return js.get("results") or {}
+
+    async def get_option_second_aggs(self, option_ticker: str, *, from_: str, to: str, limit: int = 5000) -> List[Dict[str, Any]]:
+        if not POLYGON_ENABLE_OPTIONS:
+            return []
+        path = f"/v2/aggs/ticker/{option_ticker}/range/1/second/{from_}/{to}"
+        js = await self._get_soft(
+            path,
+            params={"adjusted": "true", "sort": "asc", "limit": limit},
+            timeout=10.0,
+            symbol=None,
+            log_prefix="[polygon] options/aggs_second",
+            cache_ttl_s=8.0,
+            cache_key=f"optaggs:1s:{option_ticker}:{from_}:{to}:{limit}",
+        )
+        return js.get("results") or []
+
+    async def get_option_minute_aggs(self, option_ticker: str, *, from_: str, to: str, limit: int = 5000) -> List[Dict[str, Any]]:
+        if not POLYGON_ENABLE_OPTIONS:
+            return []
+        path = f"/v2/aggs/ticker/{option_ticker}/range/1/minute/{from_}/{to}"
+        js = await self._get_soft(
+            path,
+            params={"adjusted": "true", "sort": "asc", "limit": limit},
+            timeout=10.0,
+            symbol=None,
+            log_prefix="[polygon] options/aggs_minute",
+            cache_ttl_s=20.0,
+            cache_key=f"optaggs:1m:{option_ticker}:{from_}:{to}:{limit}",
+        )
+        return js.get("results") or []
+
+    async def get_stock_trades(self, symbol: str, *, timestamp_gte: Optional[str] = None, limit: int = 250) -> List[Dict[str, Any]]:
+        if not (POLYGON_ENABLE_TRADES and POLYGON_ENABLE_SNAPSHOT):
+            return []
+        sym = symbol.upper()
+        params: Dict[str, Any] = {"limit": max(1, min(limit, 50000))}
+        if timestamp_gte:
+            params["timestamp.gte"] = timestamp_gte
+        js = await self._get_soft(
+            f"/v3/trades/{sym}",
+            params=params,
+            timeout=8.0,
+            symbol=sym,
+            log_prefix="[polygon] stock/trades",
+            cache_ttl_s=5.0,
+            cache_key=f"trades:{sym}:{timestamp_gte}:{limit}",
+        )
+        return js.get("results") or []
+
+    async def get_ticker_details(self, symbol: str) -> Dict[str, Any]:
+        if not POLYGON_ENABLE_REFERENCE:
+            return {}
+        sym = symbol.upper()
+        js = await self._get_soft(
+            f"/v3/reference/tickers/{sym}",
+            symbol=sym,
+            timeout=8.0,
+            log_prefix="[polygon] reference/ticker",
+            cache_ttl_s=3600.0,
+            cache_key=f"ref:ticker:{sym}",
+        )
+        return js.get("results") or {}
+
+    async def get_corporate_actions(self, symbol: str, *, limit: int = 25) -> List[Dict[str, Any]]:
+        if not POLYGON_ENABLE_CORP_ACTIONS:
+            return []
+        sym = symbol.upper()
+        js = await self._get_soft(
+            "/v3/reference/corporate-actions",
+            params={"ticker": sym, "order": "desc", "limit": max(1, min(limit, 1000))},
+            symbol=sym,
+            timeout=8.0,
+            log_prefix="[polygon] corporate-actions",
+            cache_ttl_s=1800.0,
+            cache_key=f"corp_actions:{sym}:{limit}",
+        )
+        return js.get("results") or []
+
+    async def get_all_us_options_tickers(self, *, limit: int = POLYGON_OPTIONS_UNIVERSE_LIMIT) -> List[Dict[str, Any]]:
+        """
+        Pull a bounded list of active US option contracts (tickers).
+        This is intentionally bounded for runtime safety.
+        """
+        if not POLYGON_ENABLE_REFERENCE:
+            return []
+        target = max(1, min(limit, 1000))
+        js = await self._get_soft(
+            "/v3/reference/options/contracts",
+            params={"underlying_ticker.any_of": "SPY,QQQ,IWM,TSLA,NVDA,AAPL,MSFT,AMZN,META", "as_of": date.today().isoformat(), "limit": target},
+            timeout=10.0,
+            symbol=None,
+            log_prefix="[polygon] reference/options_contracts",
+            cache_ttl_s=3600.0,
+            cache_key=f"ref:options_contracts:{target}",
+        )
+        return js.get("results") or []
+
+    async def get_targeted_option_context(
+        self,
+        symbol: str,
+        *,
+        expiry_iso: str,
+        side: str,
+        strike: float,
+    ) -> Dict[str, Any]:
+        """
+        Pull option context for LLM decisions from Polygon/Massive:
+        - real-time greeks + IV + open interest (snapshot)
+        - minute + second aggregates
+        - latest option trade
+        """
+        if not POLYGON_ENABLE_OPTIONS:
+            return {}
+        sym = symbol.upper()
+        cp = "C" if str(side or "").upper().startswith("C") else "P"
+        exp = str(expiry_iso or "").replace("-", "")
+        strike_code = f"{int(round(float(strike) * 1000)):08d}"
+        option_ticker = f"O:{sym}{exp}{cp}{strike_code}"
+
+        today = date.today()
+        from_iso = (today - timedelta(days=5)).isoformat()
+        to_iso = (today + timedelta(days=1)).isoformat()
+
+        snap_task = self.get_option_snapshot(option_ticker)
+        trade_task = self.get_option_last_trade(option_ticker)
+        m1_task = self.get_option_minute_aggs(option_ticker, from_=from_iso, to=to_iso, limit=800)
+        s1_task = self.get_option_second_aggs(option_ticker, from_=today.isoformat(), to=to_iso, limit=1200)
+
+        snap, trade, m1_aggs, s1_aggs = await asyncio.gather(snap_task, trade_task, m1_task, s1_task)
+        if not any([snap, trade, m1_aggs, s1_aggs]):
+            return {}
+
+        last_quote = (snap.get("last_quote") or {}) if isinstance(snap, dict) else {}
+        day = (snap.get("day") or {}) if isinstance(snap, dict) else {}
+        details = (snap.get("details") or {}) if isinstance(snap, dict) else {}
+        greeks = (snap.get("greeks") or {}) if isinstance(snap, dict) else {}
+
+        bid = last_quote.get("bid")
+        ask = last_quote.get("ask")
+        mid = None
+        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask > 0:
+            mid = (float(bid) + float(ask)) / 2.0
+
+        out: Dict[str, Any] = {
+            "option_ticker": option_ticker,
+            "option_contract_type": details.get("contract_type"),
+            "option_expiration_date": details.get("expiration_date"),
+            "oi": day.get("open_interest"),
+            "iv": snap.get("implied_volatility"),
+            "delta": greeks.get("delta"),
+            "gamma": greeks.get("gamma"),
+            "theta": greeks.get("theta"),
+            "vega": greeks.get("vega"),
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "option_day_volume": day.get("volume"),
+            "option_underlying_price": details.get("underlying_asset", {}).get("price"),
+            "option_last_trade_price": trade.get("price"),
+            "option_last_trade_size": trade.get("size"),
+            "option_second_bars_n": len(s1_aggs or []),
+            "option_minute_bars_n": len(m1_aggs or []),
+            "option_data_delay_minutes": 15.0,
+        }
+        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and ask > 0:
+            out["option_spread_pct"] = ((float(ask) - float(bid)) / float(ask)) * 100.0
+
+        closes = [float(x.get("c")) for x in (m1_aggs or []) if isinstance(x.get("c"), (int, float))]
+        if len(closes) >= 2 and closes[0] != 0:
+            out["option_5d_return_pct"] = ((closes[-1] - closes[0]) / closes[0]) * 100.0
+        if closes:
+            out["option_last_1m_close"] = closes[-1]
+        s1_vol = [float(x.get("v")) for x in (s1_aggs or []) if isinstance(x.get("v"), (int, float))]
+        if s1_vol:
+            out["option_second_volume_sum"] = sum(s1_vol)
+
+        return out
 
 
 def polygon_enabled() -> bool:
