@@ -592,6 +592,8 @@ async def _fetch_polygon_features(
     k_aggsd = f"poly:aggsd:{sym}:{from_d}:{to_iso}"
     k_techm = f"poly:techm:{sym}"
     k_techd = f"poly:techd:{sym}"
+    k_ref = f"poly:ref:{sym}"
+    k_corp = f"poly:corp:{sym}"
 
     TTL_SNAP = 10.0
     TTL_QUOTE = 5.0
@@ -602,6 +604,8 @@ async def _fetch_polygon_features(
     TTL_AGGS_D = 900.0
     TTL_TECH_M = 60.0
     TTL_TECH_D = 900.0
+    TTL_REF = 3600.0
+    TTL_CORP = 1800.0
 
     snap_task = _safe_call("snapshot", _cached(k_snap, TTL_SNAP, lambda: pc.get_stock_snapshot(sym)), {})
     quote_task = _safe_call("last_quote", _cached(k_quote, TTL_QUOTE, lambda: pc.get_last_quote(sym)), {})
@@ -686,6 +690,16 @@ async def _fetch_polygon_features(
         _cached(k_techd, TTL_TECH_D, lambda: pc.get_technicals_daily_bundle(sym)),
         {},
     )
+    ref_task = _safe_call(
+        "reference",
+        _cached(k_ref, TTL_REF, lambda: pc.get_ticker_details(sym)),
+        {},
+    )
+    corp_task = _safe_call(
+        "corp_actions",
+        _cached(k_corp, TTL_CORP, lambda: pc.get_corporate_actions(sym, limit=8)),
+        [],
+    )
 
     if expiry_iso and side and (strike is not None):
         k_opt = f"poly:optctx:{sym}:{expiry_iso}:{side}:{strike}"
@@ -701,7 +715,7 @@ async def _fetch_polygon_features(
     else:
         opt_task = _empty_dict()
 
-    stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars = await asyncio.gather(
+    stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars, ref_details, corp_actions = await asyncio.gather(
         snap_task,
         quote_task,
         trade_task,
@@ -712,9 +726,11 @@ async def _fetch_polygon_features(
         daily_task,
         h1_task,
         m15_task,
+        ref_task,
+        corp_task,
     )
 
-    if not any([stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars]):
+    if not any([stock_snap, last_quote, last_trade, aggs5m, techs, techs_d, opt_ctx, daily_bars, h1_bars, m15_bars, ref_details, corp_actions]):
         return {}
 
     out: Dict[str, Any] = {
@@ -753,6 +769,14 @@ async def _fetch_polygon_features(
         out["prev_low"] = float(pd.get("l"))
     if isinstance(pd.get("c"), (int, float)):
         out["prev_close"] = float(pd.get("c"))
+    if isinstance(ref_details, dict) and ref_details:
+        out["reference_primary_exchange"] = ref_details.get("primary_exchange")
+        out["reference_market"] = ref_details.get("market")
+        out["reference_type"] = ref_details.get("type")
+        out["reference_name"] = ref_details.get("name")
+    if isinstance(corp_actions, list) and corp_actions:
+        out["corp_actions_recent_n"] = len(corp_actions)
+        out["corp_actions_types"] = sorted({str(x.get("type")) for x in corp_actions if isinstance(x, dict) and x.get("type")})
 
     bars = aggs5m or []
     if bars:
