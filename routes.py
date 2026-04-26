@@ -200,6 +200,14 @@ async def health() -> Dict[str, Any]:
     return {"ok": True, **(info or {})}
 
 
+@router.post("/webhook")
+@router.post("/webhook/")
+async def webhook(request: Request) -> Dict[str, Any]:
+    payload = await request.json()
+    print("RAW WEBHOOK PAYLOAD:", payload)
+    return {"ok": True, "received": payload}
+
+
 @router.post("/webhook/tradingview")
 async def webhook_tradingview(request: Request, bypass_window: int = 0) -> JSONResponse:
     # parse JSON
