@@ -205,7 +205,15 @@ async def health() -> Dict[str, Any]:
 async def webhook(request: Request) -> Dict[str, Any]:
     payload = await request.json()
     print("RAW WEBHOOK PAYLOAD:", payload)
-    return {"ok": True, "received": payload}
+
+    process_tradingview_alert = getattr(engine, "process_tradingview_alert", None)
+    if not callable(process_tradingview_alert):
+        raise HTTPException(status_code=500, detail="Engine function process_tradingview_alert not found")
+
+    result = process_tradingview_alert(payload)
+    if asyncio.iscoroutine(result):
+        result = await result
+    return {"ok": True, "result": result}
 
 
 @router.post("/webhook/tradingview")
