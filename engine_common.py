@@ -114,6 +114,11 @@ ALERT_RE_MINIMAL = re.compile(
     re.IGNORECASE,
 )
 
+ALERT_RE_ORDER_FILLED = re.compile(
+    r"^\s*(?:.*?:\s*)?order\s+(buy|sell)\s*@\s*([0-9]*\.?[0-9]+)\s*filled\s+on\s*([A-Z][A-Z0-9\.\-/:]*)\s*(?:\.|$)",
+    re.IGNORECASE,
+)
+
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 _NA_TOKEN_RE = re.compile(r":\s*na(\s*[,}])", re.IGNORECASE)
 _DOUBLE_COMMA_RE = re.compile(r",\s*,+")
@@ -528,6 +533,25 @@ def _parse_alert_plain_text(alert_text: str) -> Optional[Dict[str, Any]]:
     s = (alert_text or "").strip()
     if not s:
         return None
+
+    m = ALERT_RE_ORDER_FILLED.match(s)
+    if m:
+        side_raw, px_raw, symbol = m.groups()
+        side = side_raw.upper().strip()
+        px = _as_float(px_raw)
+        if not side or not symbol or px is None:
+            return None
+        return {
+            "side": side,
+            "symbol": symbol.upper(),
+            "ticker": symbol.upper(),
+            "underlying": symbol.upper(),
+            "underlying_price_from_alert": px,
+            "price": px,
+            "last": px,
+            "source": "webhook",
+            "src": "webhook",
+        }
 
     m = ALERT_RE_WITH_EXP.match(s)
     if m:
