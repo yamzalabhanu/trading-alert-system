@@ -109,6 +109,10 @@ ALERT_RE_NO_EXP = re.compile(
     r"Strike:\s*([0-9]*\.?[0-9]+)\s*$",
     re.IGNORECASE,
 )
+ALERT_RE_MINIMAL = re.compile(
+    r"^\s*(CALL|PUT)\s*Signal:\s*([A-Z][A-Z0-9\.\-]*)\s*at\s*([0-9]*\.?[0-9]+)\s*$",
+    re.IGNORECASE,
+)
 
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 _NA_TOKEN_RE = re.compile(r":\s*na(\s*[,}])", re.IGNORECASE)
@@ -514,6 +518,87 @@ def _parse_alert_json_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any
     return out
 
 
+def _parse_alert_plain_text(alert_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse legacy TradingView text payloads such as:
+      - CALL Signal: AAPL at 187.42 Strike: 190 Expiry: 2026-05-01
+      - PUT Signal: TSLA at 165.8 Strike: 160
+      - CALL Signal: NVDA at 912.5
+    """
+    s = (alert_text or "").strip()
+    if not s:
+        return None
+
+    m = ALERT_RE_WITH_EXP.match(s)
+    if m:
+        side_raw, symbol, px_raw, strike_raw, expiry = m.groups()
+        side = _norm_side(side_raw) or side_raw.upper().strip()
+        px = _as_float(px_raw)
+        strike = _as_float(strike_raw)
+        if not side or not symbol or px is None:
+            return None
+        out: Dict[str, Any] = {
+            "side": side,
+            "symbol": symbol.upper(),
+            "ticker": symbol.upper(),
+            "underlying": symbol.upper(),
+            "underlying_price_from_alert": px,
+            "price": px,
+            "last": px,
+            "source": "webhook",
+            "src": "webhook",
+        }
+        if strike is not None:
+            out["strike"] = strike
+        if expiry:
+            out["expiry"] = expiry
+        return out
+
+    m = ALERT_RE_NO_EXP.match(s)
+    if m:
+        side_raw, symbol, px_raw, strike_raw = m.groups()
+        side = _norm_side(side_raw) or side_raw.upper().strip()
+        px = _as_float(px_raw)
+        strike = _as_float(strike_raw)
+        if not side or not symbol or px is None:
+            return None
+        out = {
+            "side": side,
+            "symbol": symbol.upper(),
+            "ticker": symbol.upper(),
+            "underlying": symbol.upper(),
+            "underlying_price_from_alert": px,
+            "price": px,
+            "last": px,
+            "source": "webhook",
+            "src": "webhook",
+        }
+        if strike is not None:
+            out["strike"] = strike
+        return out
+
+    m = ALERT_RE_MINIMAL.match(s)
+    if m:
+        side_raw, symbol, px_raw = m.groups()
+        side = _norm_side(side_raw) or side_raw.upper().strip()
+        px = _as_float(px_raw)
+        if not side or not symbol or px is None:
+            return None
+        return {
+            "side": side,
+            "symbol": symbol.upper(),
+            "ticker": symbol.upper(),
+            "underlying": symbol.upper(),
+            "underlying_price_from_alert": px,
+            "price": px,
+            "last": px,
+            "source": "webhook",
+            "src": "webhook",
+        }
+
+    return None
+
+
 def parse_alert_text(alert_text: Any) -> Dict[str, Any]:
     """
     Accepts:
@@ -558,7 +643,11 @@ def parse_alert_text(alert_text: Any) -> Dict[str, Any]:
         normalized = _parse_alert_json_payload(obj)
         return normalized if normalized is not None else obj
 
-    raise ValueError("alert_text must be a dict or a JSON object string")
+    txt_parsed = _parse_alert_plain_text(s)
+    if txt_parsed is not None:
+        return txt_parsed
+
+    raise ValueError("alert_text must be a dict, JSON object string, or supported text alert format")
 
 
 # =========================
