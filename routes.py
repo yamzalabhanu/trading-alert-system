@@ -82,15 +82,26 @@ def _coerce_webhook_payload(raw_body: bytes, parsed_json: Any) -> List[Any]:
     if body_text.startswith("{") and body_text.endswith("}") and "},{" in body_text.replace(" ", ""):
         body_text = f"[{body_text}]"
 
-    obj = json.loads(body_text)
+    try:
+        obj = json.loads(body_text)
+    except Exception:
+        # Accept legacy/plain-text TradingView messages as-is.
+        return [body_text]
+
     if isinstance(obj, str):
         # JSON string that itself contains JSON.
-        obj = json.loads(obj)
+        try:
+            obj = json.loads(obj)
+        except Exception:
+            return [obj]
+
     if isinstance(obj, dict):
         return [obj]
     if isinstance(obj, list) and all(isinstance(x, (dict, str)) for x in obj):
         return obj
-    raise ValueError("payload must be a JSON object or array of objects")
+
+    # Last resort: keep raw text instead of failing 400.
+    return [body_text]
 
 
 # ---------------- Env helpers ----------------
@@ -214,6 +225,11 @@ def bind_lifecycle(app: FastAPI) -> None:
 
 
 # ---------------- Routes ----------------
+@router.get("/")
+async def root() -> Dict[str, Any]:
+    return {"ok": True, "service": "trading-alert-system"}
+
+
 @router.get("/health")
 async def health() -> Dict[str, Any]:
     info: Dict[str, Any] = {}
