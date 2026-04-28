@@ -5,6 +5,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, unquote_plus
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -33,16 +34,31 @@ log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 router = APIRouter()
 
 
-def _coerce_webhook_payload(raw_body: bytes, parsed_json: Any) -> List[Dict[str, Any]]:
+def _coerce_webhook_payload(raw_body: bytes, parsed_json: Any) -> List[Any]:
     """
     Accept TradingView payload formats:
       - single JSON object
       - JSON array of objects
       - comma-joined JSON objects (best-effort salvage): "{...}, {...}"
+      - JSON string containing an object/array
+      - envelope objects: {"message": ...}, {"payload": ...}, {"data": ...}, {"alert": ...}
+      - form-encoded body carrying message/payload JSON text
     """
     if isinstance(parsed_json, dict):
-        return [parsed_json]
-    if isinstance(parsed_json, list) and all(isinstance(x, dict) for x in parsed_json):
+        # Unwrap common envelopes produced by webhook relays/proxies.
+        for key in ("message", "payload", "data", "alert"):
+            if key in parsed_json:
+                inner = parsed_json.get(key)
+                if isinstance(inner, dict):
+                    return [inner]
+                if isinstance(inner, list):
+                    return inner
+                if inner is not None:
+                    parsed_json = inner
+                    break
+        else:
+            return [parsed_json]
+    if isinstance(parsed_json, list) and all(isinstance(x, (dict, str)) for x in parsed_json):
         return parsed_json
 
     if isinstance(parsed_json, str):
@@ -53,14 +69,26 @@ def _coerce_webhook_payload(raw_body: bytes, parsed_json: Any) -> List[Dict[str,
     if not body_text:
         raise ValueError("payload must be a JSON object or array")
 
+    # Handle form-encoded payloads from generic webhook tools.
+    if "=" in body_text and not body_text.lstrip().startswith(("{", "[")):
+        form = parse_qs(body_text, keep_blank_values=True)
+        for key in ("payload", "message", "data", "alert"):
+            values = form.get(key) or form.get(key.upper())
+            if values:
+                body_text = unquote_plus(values[0]).strip()
+                break
+
     # best-effort salvage for common TradingView batch shape: "{...}, {...}"
     if body_text.startswith("{") and body_text.endswith("}") and "},{" in body_text.replace(" ", ""):
         body_text = f"[{body_text}]"
 
     obj = json.loads(body_text)
+    if isinstance(obj, str):
+        # JSON string that itself contains JSON.
+        obj = json.loads(obj)
     if isinstance(obj, dict):
         return [obj]
-    if isinstance(obj, list) and all(isinstance(x, dict) for x in obj):
+    if isinstance(obj, list) and all(isinstance(x, (dict, str)) for x in obj):
         return obj
     raise ValueError("payload must be a JSON object or array of objects")
 
